@@ -5,6 +5,9 @@ use clap::{Args, Parser, Subcommand};
 use tracing::debug;
 use tracing_subscriber::EnvFilter;
 use winland_core::{Manageability, MonitorInfo, WindowInfo, tile_windows};
+use winland_ipc::{
+    DaemonStateSnapshot, IpcRequest, IpcResponseResult, decode_response, encode_request,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "winland")]
@@ -16,12 +19,21 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Inspect the running daemon through local IPC.
+    State(StateArgs),
     /// List discovered desktop windows and explain Winland's conservative filter.
     Windows(WindowsArgs),
     /// Arrange manageable windows on the primary monitor once.
     TileOnce,
     /// Inspect or validate Winland configuration.
     Config(ConfigArgs),
+}
+
+#[derive(Debug, Args)]
+struct StateArgs {
+    /// Print the daemon state snapshot as JSON.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -56,6 +68,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Command::State(args) => daemon_state(args),
         Command::Windows(args) => list_windows(args),
         Command::TileOnce => tile_once(),
         Command::Config(args) => handle_config(args),
@@ -95,6 +108,35 @@ fn validate_config(args: ConfigValidateArgs) -> Result<()> {
     match loaded.path {
         Some(path) => println!("Config is valid: {}", path.display()),
         None => println!("Config is valid: no config file found, using built-in defaults."),
+    }
+
+    Ok(())
+}
+
+fn daemon_state(args: StateArgs) -> Result<()> {
+    let request = encode_request(&IpcRequest::state())?;
+    let response =
+        match winland_win32::send_ipc_request(winland_win32::DEFAULT_IPC_PIPE_NAME, &request) {
+            Ok(response) => response,
+            Err(winland_win32::Win32Error::DaemonNotRunning { .. }) => {
+                eprintln!(
+                    "Winland daemon is not running. Start winland-daemon before using IPC commands."
+                );
+                std::process::exit(2);
+            }
+            Err(error) => return Err(error.into()),
+        };
+
+    match decode_response(&response)?.result {
+        IpcResponseResult::State(snapshot) if args.json => {
+            println!("{}", serde_json::to_string_pretty(&snapshot)?);
+        }
+        IpcResponseResult::State(snapshot) => {
+            println!("{}", format_state_snapshot(&snapshot));
+        }
+        IpcResponseResult::Error(error) => {
+            return Err(anyhow::anyhow!("daemon IPC error: {}", error.message));
+        }
     }
 
     Ok(())
@@ -306,5 +348,47 @@ fn manageability_reason(window: &WindowInfo) -> &'static str {
     match window.manageable_reason() {
         Manageability::Manageable => "-",
         Manageability::Unmanageable(reason) => reason,
+    }
+}
+
+fn format_state_snapshot(snapshot: &DaemonStateSnapshot) -> String {
+    let foreground = snapshot
+        .foreground_window
+        .map(|handle| format!("0x{handle:X}"))
+        .unwrap_or_else(|| "-".to_owned());
+
+    format!(
+        "Winland daemon is running (IPC protocol v{}).\nWindows: {} total, {} manageable, {} floating, {} temporary floating\nWorkspace: active {}\nForeground: {}",
+        winland_ipc::PROTOCOL_VERSION,
+        snapshot.total_windows,
+        snapshot.manageable_windows,
+        snapshot.floating_windows,
+        snapshot.temporary_floating_windows,
+        snapshot.active_workspace,
+        foreground
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn state_snapshot_format_is_human_readable() {
+        let snapshot = DaemonStateSnapshot {
+            total_windows: 3,
+            manageable_windows: 2,
+            floating_windows: 1,
+            temporary_floating_windows: 0,
+            active_workspace: 4,
+            foreground_window: Some(0xCAFE),
+        };
+
+        let output = format_state_snapshot(&snapshot);
+
+        assert!(output.contains("IPC protocol v1"));
+        assert!(output.contains("3 total, 2 manageable"));
+        assert!(output.contains("Workspace: active 4"));
+        assert!(output.contains("Foreground: 0xCAFE"));
     }
 }

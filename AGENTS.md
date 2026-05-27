@@ -18,6 +18,7 @@ The first priority is a correct, stable tiling core. Visual polish comes after t
 - Prefer event-driven behavior over polling.
 - Do not use undocumented or private Windows APIs unless the user explicitly asks for that.
 - Do not implement visual effects before the tiling core is stable.
+- Do not change Windows shell startup behavior, replace Explorer, or persist shell-related settings unless the user explicitly asks for that experimental path.
 
 ## Crate Boundaries
 
@@ -29,22 +30,15 @@ The first priority is a correct, stable tiling core. Visual polish comes after t
 
 If a module needs `HWND`, `RECT`, `BOOL`, raw pointers, callbacks, or Win32 handles, it belongs in `winland-win32` or behind a type exported by `winland-win32`. If a module can be tested without Windows, it probably belongs in `winland-core`.
 
-## Development Order
+## Delivery Model
 
-1. Discover and classify top-level windows.
-2. Implement a safe tile-once command that can arrange existing windows.
-3. Add an event-driven daemon that reacts to window changes.
-4. Add keyboard control through documented Win32 mechanisms.
-5. Build a real layout engine in `winland-core`.
-6. Add fake workspaces by hiding, showing, moving, or restoring window sets through documented APIs.
-7. Add the configuration system, including hotkeys, layouts, workspaces, behavior toggles, and window rules.
-8. Add automatic startup retile, dynamic retile, and drag-to-float behavior.
-9. Add opt-in hotkey override mode for conflicts that ordinary global hotkeys cannot claim.
-10. Add IPC and a stronger CLI.
-11. Add borders or visual feedback only after tiling is stable.
-12. Add optional animations only after layout, events, IPC, and rules are reliable.
-13. Add bar or status integration.
-14. Harden edge cases.
+- Work from `ROADMAP.md` as an agile backlog, not a fixed sequence.
+- Prefer thin vertical slices that deliver usable behavior end to end.
+- Keep the current focus small enough to finish, test, and explain.
+- Reorder upcoming work when user needs or implementation risks change.
+- Each slice should cover the core model, Win32 integration, config if user-facing, diagnostics or CLI hooks when useful, and tests.
+- Treat lower-level shell integration or shell swapping as research-first work with a written recovery plan before any prototype.
+- Do not start visual polish while core tiling behavior is unstable.
 
 ## Testing Rules
 
@@ -64,14 +58,14 @@ If a module needs `HWND`, `RECT`, `BOOL`, raw pointers, callbacks, or Win32 hand
 - Keep config-independent behavior in `winland-core`; do not make core layout logic read files or environment variables.
 - Treat configuration as a stable user interface. Add fields conservatively and validate them with clear errors.
 - Provide sensible defaults so Winland can run without a config file.
-- Once Phase 7 lands, user-facing workflow behavior should be configurable when practical.
+- Once the configuration system lands, user-facing workflow behavior should be configurable when practical.
 - Cover at least these config areas:
-  - Hotkeys: modifier/key combinations mapped to named commands, plus an explicit mode for normal registration versus advanced interception when that phase exists.
+  - Hotkeys: modifier/key combinations mapped to named commands, plus an explicit mode for normal registration versus advanced interception.
   - Layouts: default layout, gaps, ratios, per-monitor or per-workspace layout choices, and layout-specific options.
   - Workspaces: names, count, initial monitor assignment, and startup behavior.
   - Window rules: match criteria and actions such as manage, ignore, float, target workspace, and always-on-workspace.
   - Behavior toggles: startup retile, dynamic retile, drag-to-float, retile-on-drag-end, focus behavior, restore behavior, handling of minimized windows, and conservative safety switches.
-  - Visual feedback: border enablement, colors, widths, and related options after Phase 11 exists.
+  - Visual feedback: border enablement, colors, widths, and related options after the visual feedback backlog item is accepted.
   - Daemon and IPC: logging level, IPC endpoint selection when needed, reload behavior, and diagnostics settings.
 - Add a `winland config validate` or equivalent CLI command when config files become user-editable.
 - Config reload should be explicit at first. Automatic file watching can come later if it proves useful.

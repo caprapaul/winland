@@ -4,17 +4,27 @@ mod platform {
     use std::ffi::c_void;
     use std::mem::size_of;
     use std::os::windows::ffi::OsStringExt;
-    use std::sync::mpsc::Sender;
+    use std::sync::mpsc::{self, Sender};
     use std::sync::{Mutex, OnceLock};
-    use std::time::Instant;
+    use std::thread::{self, JoinHandle};
+    use std::time::{Duration, Instant};
 
     use tracing::{debug, warn};
     use windows::Win32::Foundation::{
-        BOOL, CloseHandle, HANDLE, HMODULE, HWND, LPARAM, LRESULT, RECT, TRUE, WPARAM,
+        BOOL, CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
+        GENERIC_READ, GENERIC_WRITE, HANDLE, HMODULE, HWND, LPARAM, LRESULT, RECT, TRUE, WPARAM,
     };
     use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
     use windows::Win32::Graphics::Gdi::{
         EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
+    };
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_MODE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
+        ReadFile, WriteFile,
+    };
+    use windows::Win32::System::Pipes::{
+        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_MESSAGE,
+        PIPE_TYPE_MESSAGE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
     };
     use windows::Win32::System::Threading::{
         GetCurrentThreadId, OpenProcess, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -38,7 +48,7 @@ mod platform {
         TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WINEVENT_OUTOFCONTEXT, WM_HOTKEY,
         WM_KEYDOWN, WM_QUIT, WM_SYSKEYDOWN, WS_EX_TOOLWINDOW,
     };
-    use windows::core::PWSTR;
+    use windows::core::{PCWSTR, PWSTR};
     use winland_core::{
         MonitorId, MonitorInfo as CoreMonitorInfo, Rect, WindowHandle, WindowInfo, WindowStyles,
     };
@@ -46,7 +56,8 @@ mod platform {
     use crate::{
         HotkeyBinding, HotkeyEvent, HotkeyInterceptionDecision, HotkeyLowLevelEvent,
         HotkeyModifierSet, HotkeyOverrideOptions, HotkeyRegistrationFailure, HotkeyWindowContext,
-        Result, VirtualKey, Win32Error, WindowEvent, WindowEventKind, classify_intercepted_hotkey,
+        IPC_BUFFER_SIZE, IpcTransportRequest, Result, VirtualKey, Win32Error, WindowEvent,
+        WindowEventKind, classify_intercepted_hotkey,
     };
 
     static EVENT_SENDER: OnceLock<Mutex<Option<Sender<WindowEvent>>>> = OnceLock::new();
@@ -340,6 +351,27 @@ mod platform {
         }
     }
 
+    pub fn spawn_ipc_server(
+        pipe_name: &'static str,
+        sender: Sender<IpcTransportRequest>,
+    ) -> Result<IpcServer> {
+        let handle = thread::Builder::new()
+            .name("winland-ipc-named-pipe".to_owned())
+            .spawn(move || ipc_server_loop(pipe_name, sender))
+            .map_err(|source| Win32Error::ThreadSpawn {
+                name: "winland-ipc-named-pipe",
+                message: source.to_string(),
+            })?;
+
+        Ok(IpcServer { _handle: handle })
+    }
+
+    pub fn send_ipc_request(pipe_name: &str, request: &[u8]) -> Result<Vec<u8>> {
+        let pipe = open_ipc_client(pipe_name)?;
+        write_pipe_message(pipe.0, request, "WriteFile(IPC request)")?;
+        read_pipe_message(pipe.0, "ReadFile(IPC response)")
+    }
+
     pub struct WindowEventSubscription {
         hooks: Vec<HWINEVENTHOOK>,
     }
@@ -384,6 +416,10 @@ mod platform {
         hook: HHOOK,
     }
 
+    pub struct IpcServer {
+        _handle: JoinHandle<()>,
+    }
+
     impl Drop for HotkeyOverrideRegistration {
         fn drop(&mut self) {
             // SAFETY: This hook handle was returned by SetWindowsHookExW for
@@ -406,6 +442,187 @@ mod platform {
         sender: Sender<HotkeyEvent>,
         bindings: Vec<HotkeyBinding>,
         options: HotkeyOverrideOptions,
+    }
+
+    struct OwnedPipe(HANDLE);
+
+    impl Drop for OwnedPipe {
+        fn drop(&mut self) {
+            // SAFETY: OwnedPipe only wraps pipe handles returned by Win32 create/open
+            // calls in this module, and Drop runs at most once for the owned value.
+            let _ = unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    fn ipc_server_loop(pipe_name: &'static str, sender: Sender<IpcTransportRequest>) {
+        loop {
+            let pipe = match create_ipc_server_pipe(pipe_name) {
+                Ok(pipe) => pipe,
+                Err(error) => {
+                    warn!(%error, "failed to create IPC named pipe");
+                    thread::sleep(Duration::from_millis(250));
+                    continue;
+                }
+            };
+
+            if let Err(error) = connect_ipc_server_pipe(pipe.0) {
+                warn!(%error, "failed to accept IPC named pipe client");
+                continue;
+            }
+
+            let request = match read_pipe_message(pipe.0, "ReadFile(IPC request)") {
+                Ok(request) => request,
+                Err(error) => {
+                    warn!(%error, "failed to read IPC request");
+                    let _ = disconnect_pipe(pipe.0);
+                    continue;
+                }
+            };
+
+            let (response_sender, response_receiver) = mpsc::channel();
+            if sender
+                .send(IpcTransportRequest {
+                    request,
+                    response: response_sender,
+                })
+                .is_err()
+            {
+                let _ = disconnect_pipe(pipe.0);
+                break;
+            }
+
+            match response_receiver.recv_timeout(Duration::from_secs(5)) {
+                Ok(response) => {
+                    if let Err(error) =
+                        write_pipe_message(pipe.0, &response, "WriteFile(IPC response)")
+                    {
+                        warn!(%error, "failed to write IPC response");
+                    }
+                }
+                Err(error) => warn!(%error, "timed out waiting for daemon IPC response"),
+            }
+
+            let _ = disconnect_pipe(pipe.0);
+        }
+    }
+
+    fn create_ipc_server_pipe(pipe_name: &str) -> Result<OwnedPipe> {
+        let name = wide_null(pipe_name);
+        // SAFETY: name is a null-terminated UTF-16 string that lives for the
+        // duration of the call. The pipe is local, message-oriented, blocking,
+        // and closed by OwnedPipe.
+        let handle = unsafe {
+            CreateNamedPipeW(
+                PCWSTR(name.as_ptr()),
+                PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+                PIPE_UNLIMITED_INSTANCES,
+                IPC_BUFFER_SIZE,
+                IPC_BUFFER_SIZE,
+                0,
+                None,
+            )
+        };
+
+        if handle.is_invalid() {
+            Err(Win32Error::last_error("CreateNamedPipeW"))
+        } else {
+            Ok(OwnedPipe(handle))
+        }
+    }
+
+    fn connect_ipc_server_pipe(handle: HANDLE) -> Result<()> {
+        // SAFETY: handle is a server pipe handle returned by CreateNamedPipeW.
+        let result = unsafe { ConnectNamedPipe(handle, None) };
+        match result {
+            Ok(()) => Ok(()),
+            Err(source) if win32_error_code(&source) == ERROR_PIPE_CONNECTED.0 => Ok(()),
+            Err(source) => Err(Win32Error::Windows {
+                context: "ConnectNamedPipe",
+                source,
+            }),
+        }
+    }
+
+    fn open_ipc_client(pipe_name: &str) -> Result<OwnedPipe> {
+        let name = wide_null(pipe_name);
+        // SAFETY: name is a null-terminated UTF-16 string that lives for the
+        // duration of the call. The returned client handle is closed by OwnedPipe.
+        let handle = unsafe {
+            CreateFileW(
+                PCWSTR(name.as_ptr()),
+                GENERIC_READ.0 | GENERIC_WRITE.0,
+                FILE_SHARE_MODE(0),
+                None,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                HANDLE::default(),
+            )
+        };
+
+        match handle {
+            Ok(handle) => Ok(OwnedPipe(handle)),
+            Err(source)
+                if matches!(
+                    win32_error_code(&source),
+                    code if code == ERROR_FILE_NOT_FOUND.0 || code == ERROR_PIPE_BUSY.0
+                ) =>
+            {
+                Err(Win32Error::DaemonNotRunning {
+                    pipe_name: pipe_name.to_owned(),
+                })
+            }
+            Err(source) => Err(Win32Error::Windows {
+                context: "CreateFileW(IPC named pipe)",
+                source,
+            }),
+        }
+    }
+
+    fn read_pipe_message(handle: HANDLE, context: &'static str) -> Result<Vec<u8>> {
+        let mut buffer = vec![0; IPC_BUFFER_SIZE as usize];
+        let mut read = 0u32;
+        // SAFETY: handle is an open pipe handle, buffer points to writable
+        // storage, and read points to valid storage for the byte count.
+        unsafe {
+            ReadFile(handle, Some(&mut buffer), Some(&mut read), None)
+                .map_err(|source| Win32Error::Windows { context, source })?;
+        }
+        buffer.truncate(read as usize);
+        Ok(buffer)
+    }
+
+    fn write_pipe_message(handle: HANDLE, message: &[u8], context: &'static str) -> Result<()> {
+        let mut written = 0u32;
+        // SAFETY: handle is an open pipe handle, message points to readable
+        // storage for the duration of the call, and written receives the count.
+        unsafe {
+            WriteFile(handle, Some(message), Some(&mut written), None)
+                .map_err(|source| Win32Error::Windows { context, source })?;
+        }
+
+        if written as usize == message.len() {
+            Ok(())
+        } else {
+            Err(Win32Error::ShortIpcWrite {
+                expected: message.len(),
+                actual: written as usize,
+            })
+        }
+    }
+
+    fn disconnect_pipe(handle: HANDLE) -> Result<()> {
+        // SAFETY: handle is a connected server pipe handle. DisconnectNamedPipe
+        // ends only this client connection and leaves other process state alone.
+        unsafe { DisconnectNamedPipe(handle).map_err(Win32Error::from) }
+    }
+
+    fn wide_null(value: &str) -> Vec<u16> {
+        value.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    fn win32_error_code(error: &windows::core::Error) -> u32 {
+        error.code().0 as u32 & 0xFFFF
     }
 
     struct EnumState<'a> {
@@ -1002,7 +1219,7 @@ mod platform {
 mod platform {
     use std::sync::mpsc::Sender;
 
-    use crate::{HotkeyBinding, HotkeyEvent, Result, Win32Error};
+    use crate::{HotkeyBinding, HotkeyEvent, IpcTransportRequest, Result, Win32Error};
     use winland_core::{MonitorInfo, Rect, WindowHandle, WindowInfo};
 
     use crate::WindowEvent;
@@ -1064,9 +1281,21 @@ mod platform {
         Err(Win32Error::UnsupportedPlatform)
     }
 
+    pub fn spawn_ipc_server(
+        _pipe_name: &'static str,
+        _sender: Sender<IpcTransportRequest>,
+    ) -> Result<IpcServer> {
+        Err(Win32Error::UnsupportedPlatform)
+    }
+
+    pub fn send_ipc_request(_pipe_name: &str, _request: &[u8]) -> Result<Vec<u8>> {
+        Err(Win32Error::UnsupportedPlatform)
+    }
+
     pub struct WindowEventSubscription;
     pub struct HotkeyRegistration;
     pub struct HotkeyOverrideRegistration;
+    pub struct IpcServer;
 
     impl HotkeyRegistration {
         pub fn failures(&self) -> &[HotkeyRegistrationFailure] {
@@ -1077,6 +1306,7 @@ mod platform {
 
 pub use platform::HotkeyOverrideRegistration;
 pub use platform::HotkeyRegistration;
+pub use platform::IpcServer;
 pub use platform::WindowEventSubscription;
 pub use platform::enumerate_monitors;
 pub use platform::enumerate_windows;
@@ -1088,11 +1318,17 @@ pub use platform::move_resize_window;
 pub use platform::register_hotkeys;
 pub use platform::request_message_loop_stop;
 pub use platform::run_message_loop;
+pub use platform::send_ipc_request;
 pub use platform::show_window_without_activate;
+pub use platform::spawn_ipc_server;
 pub use platform::subscribe_window_events;
+use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
 use winland_core::{TextMatcher, WindowHandle};
+
+pub const DEFAULT_IPC_PIPE_NAME: &str = r"\\.\pipe\winland-ipc";
+const IPC_BUFFER_SIZE: u32 = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HotkeyBinding {
@@ -1378,6 +1614,12 @@ pub struct WindowEvent {
     pub event_time: u32,
 }
 
+#[derive(Debug)]
+pub struct IpcTransportRequest {
+    pub request: Vec<u8>,
+    pub response: Sender<Vec<u8>>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum WindowEventKind {
     Created,
@@ -1432,6 +1674,14 @@ pub enum Win32Error {
     },
     #[error("hotkey sender lock is poisoned")]
     HotkeySenderLockPoisoned,
+    #[error("Winland daemon is not running on {pipe_name}")]
+    DaemonNotRunning { pipe_name: String },
+    #[cfg(windows)]
+    #[error("failed to spawn thread {name}: {message}")]
+    ThreadSpawn { name: &'static str, message: String },
+    #[cfg(windows)]
+    #[error("short IPC write: wrote {actual} of {expected} bytes")]
+    ShortIpcWrite { expected: usize, actual: usize },
     #[error("winland-win32 is only supported on Windows")]
     UnsupportedPlatform,
 }

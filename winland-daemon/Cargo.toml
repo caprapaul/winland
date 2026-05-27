@@ -10,4 +10,5 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 winland-config = { path = "../winland-config" }
 winland-core = { path = "../winland-core" }
+winland-ipc = { path = "../winland-ipc" }
 winland-win32 = { path = "../winland-win32" }

@@ -12,9 +12,13 @@ use winland_core::{
     WindowRule, WindowRuleDecision, WorkspaceId, WorkspaceManager, WorkspaceVisibilityChange,
     evaluate_window_rules, tile_windows_with_config,
 };
+use winland_ipc::{
+    DaemonStateSnapshot, IpcCommand, IpcRequest, IpcResponse, decode_request, encode_response,
+};
 use winland_win32::{
     HotkeyBinding, HotkeyBypassRules, HotkeyEvent, HotkeyId, HotkeyLowLevelEvent,
-    HotkeyModifierSet, HotkeyOverrideOptions, VirtualKey, WindowEvent, WindowEventKind,
+    HotkeyModifierSet, HotkeyOverrideOptions, IpcTransportRequest, VirtualKey, WindowEvent,
+    WindowEventKind,
 };
 
 const RECONCILE_DEBOUNCE: Duration = Duration::from_millis(50);
@@ -31,6 +35,12 @@ fn main() -> Result<()> {
         .context("install documented Win32 window event hooks")?;
     let window_bridge = spawn_window_bridge(window_receiver, daemon_sender.clone())
         .context("spawn window event bridge")?;
+    let (ipc_sender, ipc_receiver) = mpsc::channel();
+    let _ipc_server =
+        winland_win32::spawn_ipc_server(winland_win32::DEFAULT_IPC_PIPE_NAME, ipc_sender)
+            .context("start local IPC named pipe server")?;
+    let _ipc_bridge = spawn_ipc_bridge(ipc_receiver, daemon_sender.clone())
+        .context("spawn IPC request bridge")?;
 
     let (hotkey_sender, hotkey_receiver) = mpsc::channel();
     let (hotkey_bindings, hotkey_commands) = hotkey_bindings_from_config(&loaded_config.config)?;
@@ -150,6 +160,22 @@ fn spawn_hotkey_bridge(
         .map_err(Into::into)
 }
 
+fn spawn_ipc_bridge(
+    receiver: Receiver<IpcTransportRequest>,
+    sender: Sender<DaemonEvent>,
+) -> Result<JoinHandle<()>> {
+    thread::Builder::new()
+        .name("winland-ipc-bridge".to_owned())
+        .spawn(move || {
+            for request in receiver {
+                if sender.send(DaemonEvent::Ipc(request)).is_err() {
+                    break;
+                }
+            }
+        })
+        .map_err(Into::into)
+}
+
 fn join_bridge(handle: JoinHandle<()>, name: &'static str) -> Result<()> {
     handle.join().map_err(|_| anyhow!("{name} thread panicked"))
 }
@@ -164,6 +190,7 @@ fn process_daemon_events(receiver: Receiver<DaemonEvent>, mut state: DaemonState
                 state.reconcile_after_events(&batch)?;
             }
             DaemonEvent::Hotkey(event) => state.handle_hotkey(event)?,
+            DaemonEvent::Ipc(request) => state.handle_ipc(request),
         }
     }
 
@@ -182,6 +209,7 @@ fn receive_window_batch(
         match receiver.recv_timeout(RECONCILE_DEBOUNCE) {
             Ok(DaemonEvent::Window(event)) => batch.push(event),
             Ok(DaemonEvent::Hotkey(event)) => state.handle_hotkey(event)?,
+            Ok(DaemonEvent::Ipc(request)) => state.handle_ipc(request),
             Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
         }
     }
@@ -193,6 +221,7 @@ fn receive_window_batch(
 enum DaemonEvent {
     Window(WindowEvent),
     Hotkey(HotkeyEvent),
+    Ipc(IpcTransportRequest),
 }
 
 #[derive(Debug)]
@@ -315,6 +344,46 @@ impl DaemonState {
 
         info!(?command, "routing daemon hotkey command");
         self.execute_command(command)
+    }
+
+    fn handle_ipc(&mut self, transport: IpcTransportRequest) {
+        let response = match decode_request(&transport.request) {
+            Ok(request) => self.handle_ipc_request(request),
+            Err(error) => {
+                warn!(%error, "rejecting invalid IPC request");
+                IpcResponse::error(error.to_string())
+            }
+        };
+
+        match encode_response(&response) {
+            Ok(encoded) => {
+                let _ = transport.response.send(encoded);
+            }
+            Err(error) => {
+                warn!(%error, "failed to encode IPC response");
+                let fallback = IpcResponse::error(error.to_string());
+                if let Ok(encoded) = encode_response(&fallback) {
+                    let _ = transport.response.send(encoded);
+                }
+            }
+        }
+    }
+
+    fn handle_ipc_request(&self, request: IpcRequest) -> IpcResponse {
+        match request.command {
+            IpcCommand::State => IpcResponse::state(self.state_snapshot()),
+        }
+    }
+
+    fn state_snapshot(&self) -> DaemonStateSnapshot {
+        DaemonStateSnapshot {
+            total_windows: self.windows.len(),
+            manageable_windows: self.manageable_window_count(),
+            floating_windows: self.floating_window_count(),
+            temporary_floating_windows: self.temporary_floating_window_count(),
+            active_workspace: self.workspaces.active_workspace().0,
+            foreground_window: self.foreground.map(|handle| handle.0),
+        }
     }
 
     fn execute_command(&mut self, command: DaemonCommand) -> Result<()> {
@@ -1791,6 +1860,31 @@ mod tests {
         assert_eq!(count_events(&batch, WindowEventKind::Shown), 2);
         assert_eq!(count_events(&batch, WindowEventKind::Moved), 1);
         assert_eq!(count_events(&batch, WindowEventKind::Hidden), 0);
+    }
+
+    #[test]
+    fn ipc_state_snapshot_reports_observable_daemon_counts() {
+        let mut state = daemon_state([
+            window(1, "One", Rect::from_size(0, 0, 100, 100)),
+            window(2, "Two", Rect::from_size(200, 0, 100, 100)),
+        ]);
+        state.foreground = Some(WindowHandle(2));
+        state.set_window_participation(WindowHandle(1), WindowParticipation::Floating);
+        state.workspaces.switch_to(WorkspaceId(2));
+
+        let response = state.handle_ipc_request(IpcRequest::state());
+
+        assert_eq!(
+            response,
+            IpcResponse::state(DaemonStateSnapshot {
+                total_windows: 2,
+                manageable_windows: 2,
+                floating_windows: 1,
+                temporary_floating_windows: 0,
+                active_workspace: 2,
+                foreground_window: Some(2),
+            })
+        );
     }
 
     fn daemon_state<const N: usize>(windows: [WindowInfo; N]) -> DaemonState {

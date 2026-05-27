@@ -8,8 +8,8 @@ The project is intentionally starting with the boring hard parts: window discove
 
 - `winland-core`: platform-independent layout and window state logic.
 - `winland-win32`: documented Win32 integration through the `windows` crate.
-- `winland-daemon`: future event-driven background process.
-- `winland-cli`: command-line diagnostics and control.
+- `winland-daemon`: event-driven background process with local IPC foundations.
+- `winland-cli`: command-line diagnostics and local daemon control.
 - `winland-config`: TOML configuration parsing, defaults, validation, and config file discovery.
 
 ## Principles
@@ -25,4 +25,8 @@ The project is intentionally starting with the boring hard parts: window discove
 
 ## Status
 
-This repo is in the planning and early implementation stage. See [ROADMAP.md](ROADMAP.md) for the phased build plan and [AGENTS.md](AGENTS.md) for project rules.
+This repo is in the planning and early implementation stage. See [ROADMAP.md](ROADMAP.md) for the agile backlog and [AGENTS.md](AGENTS.md) for project rules.
+
+## Current IPC Slice
+
+The first IPC control slice exposes `winland state`, backed by a versioned local named-pipe protocol. It reports daemon health and high-level window/workspace counts in human-readable form, with `winland state --json` available for scripts. Mutating IPC commands such as focus, swap, retile, reload, and quit are intentionally still upcoming.

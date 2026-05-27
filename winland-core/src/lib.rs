@@ -409,6 +409,203 @@ impl Default for LayoutEngine {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct WorkspaceId(pub u16);
+
+impl fmt::Display for WorkspaceId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkspaceWindowState {
+    pub workspace: WorkspaceId,
+    pub last_rect: Option<Rect>,
+    pub visible_on_all_workspaces: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkspaceVisibilityChange {
+    pub window: WindowHandle,
+    pub restore_rect: Option<Rect>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceSwitchPlan {
+    pub from: WorkspaceId,
+    pub to: WorkspaceId,
+    pub hide: Vec<WindowHandle>,
+    pub show: Vec<WorkspaceVisibilityChange>,
+}
+
+impl WorkspaceSwitchPlan {
+    pub fn is_empty(&self) -> bool {
+        self.hide.is_empty() && self.show.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceManager {
+    workspaces: BTreeSet<WorkspaceId>,
+    active: WorkspaceId,
+    windows: BTreeMap<WindowHandle, WorkspaceWindowState>,
+}
+
+impl WorkspaceManager {
+    pub fn new(workspace_count: u16) -> Self {
+        let workspace_count = workspace_count.max(1);
+        let workspaces = (1..=workspace_count).map(WorkspaceId).collect();
+
+        Self {
+            workspaces,
+            active: WorkspaceId(1),
+            windows: BTreeMap::new(),
+        }
+    }
+
+    pub fn active_workspace(&self) -> WorkspaceId {
+        self.active
+    }
+
+    pub fn workspaces(&self) -> impl Iterator<Item = WorkspaceId> + '_ {
+        self.workspaces.iter().copied()
+    }
+
+    pub fn window_state(&self, window: WindowHandle) -> Option<WorkspaceWindowState> {
+        self.windows.get(&window).copied()
+    }
+
+    pub fn track_window(&mut self, window: WindowHandle, rect: Rect) -> bool {
+        self.track_window_on_workspace(window, self.active, rect)
+    }
+
+    pub fn track_window_on_workspace(
+        &mut self,
+        window: WindowHandle,
+        workspace: WorkspaceId,
+        rect: Rect,
+    ) -> bool {
+        self.ensure_workspace(workspace);
+        match self.windows.get_mut(&window) {
+            Some(state) => {
+                state.last_rect = Some(rect);
+                false
+            }
+            None => {
+                self.windows.insert(
+                    window,
+                    WorkspaceWindowState {
+                        workspace,
+                        last_rect: Some(rect),
+                        visible_on_all_workspaces: false,
+                    },
+                );
+                true
+            }
+        }
+    }
+
+    pub fn remove_window(&mut self, window: WindowHandle) -> bool {
+        self.windows.remove(&window).is_some()
+    }
+
+    pub fn retain_windows(&mut self, existing: &BTreeSet<WindowHandle>) {
+        self.windows.retain(|window, _| existing.contains(window));
+    }
+
+    pub fn update_window_rect(&mut self, window: WindowHandle, rect: Rect) -> bool {
+        let Some(state) = self.windows.get_mut(&window) else {
+            return false;
+        };
+
+        state.last_rect = Some(rect);
+        true
+    }
+
+    pub fn move_window_to_workspace(
+        &mut self,
+        window: WindowHandle,
+        workspace: WorkspaceId,
+    ) -> bool {
+        self.ensure_workspace(workspace);
+        let Some(state) = self.windows.get_mut(&window) else {
+            return false;
+        };
+
+        if state.workspace == workspace {
+            return false;
+        }
+
+        state.workspace = workspace;
+        true
+    }
+
+    pub fn set_visible_on_all_workspaces(
+        &mut self,
+        window: WindowHandle,
+        visible_on_all_workspaces: bool,
+    ) -> bool {
+        let Some(state) = self.windows.get_mut(&window) else {
+            return false;
+        };
+
+        state.visible_on_all_workspaces = visible_on_all_workspaces;
+        true
+    }
+
+    pub fn is_window_on_active_workspace(&self, window: WindowHandle) -> bool {
+        self.windows
+            .get(&window)
+            .is_some_and(|state| state.visible_on_all_workspaces || state.workspace == self.active)
+    }
+
+    pub fn visible_windows(&self) -> impl Iterator<Item = WindowHandle> + '_ {
+        self.windows
+            .iter()
+            .filter(|(_, state)| state.visible_on_all_workspaces || state.workspace == self.active)
+            .map(|(window, _)| *window)
+    }
+
+    pub fn switch_to(&mut self, target: WorkspaceId) -> WorkspaceSwitchPlan {
+        self.ensure_workspace(target);
+
+        let from = self.active;
+        let mut plan = WorkspaceSwitchPlan {
+            from,
+            to: target,
+            hide: Vec::new(),
+            show: Vec::new(),
+        };
+
+        if from == target {
+            return plan;
+        }
+
+        for (window, state) in &self.windows {
+            if state.visible_on_all_workspaces {
+                continue;
+            }
+
+            if state.workspace == from {
+                plan.hide.push(*window);
+            } else if state.workspace == target {
+                plan.show.push(WorkspaceVisibilityChange {
+                    window: *window,
+                    restore_rect: state.last_rect,
+                });
+            }
+        }
+
+        self.active = target;
+        plan
+    }
+
+    fn ensure_workspace(&mut self, workspace: WorkspaceId) {
+        self.workspaces.insert(workspace);
+    }
+}
+
 pub fn tile_windows(work_area: Rect, windows: &[WindowHandle]) -> Vec<TileAssignment> {
     master_stack_assignments(work_area, windows, LayoutConfig::default())
 }
@@ -485,6 +682,56 @@ impl WindowInfo {
 
     pub fn is_manageable(&self) -> bool {
         self.manageable_reason().is_manageable()
+    }
+
+    /// Like `manageable_reason`, but allows a window to be hidden by Winland's
+    /// fake workspace mechanism while still rejecting risky window classes.
+    pub fn workspace_manageable_reason(&self) -> Manageability {
+        if self.is_visible {
+            return self.manageable_reason();
+        }
+
+        self.manageable_reason_after_visibility_check()
+    }
+
+    pub fn is_workspace_manageable(&self) -> bool {
+        self.workspace_manageable_reason().is_manageable()
+    }
+
+    fn manageable_reason_after_visibility_check(&self) -> Manageability {
+        if self.is_minimized {
+            return Manageability::Unmanageable("minimized");
+        }
+
+        if self.is_dwm_cloaked {
+            return Manageability::Unmanageable("DWM cloaked");
+        }
+
+        if self.title.trim().is_empty() {
+            return Manageability::Unmanageable("empty title");
+        }
+
+        if self.class_name.trim().is_empty() {
+            return Manageability::Unmanageable("empty class name");
+        }
+
+        if self.has_owner {
+            return Manageability::Unmanageable("owned window");
+        }
+
+        if self.is_tool_window {
+            return Manageability::Unmanageable("tool window");
+        }
+
+        if self.rect.is_empty() {
+            return Manageability::Unmanageable("empty rectangle");
+        }
+
+        if is_shell_class(&self.class_name) {
+            return Manageability::Unmanageable("shell window class");
+        }
+
+        Manageability::Manageable
     }
 }
 
@@ -670,6 +917,23 @@ mod tests {
         assert_eq!(
             window.manageable_reason(),
             Manageability::Unmanageable("not visible")
+        );
+    }
+
+    #[test]
+    fn workspace_manageable_allows_hidden_windows_but_keeps_other_guards() {
+        let mut hidden = window();
+        hidden.is_visible = false;
+
+        assert_eq!(
+            hidden.workspace_manageable_reason(),
+            Manageability::Manageable
+        );
+
+        hidden.is_minimized = true;
+        assert_eq!(
+            hidden.workspace_manageable_reason(),
+            Manageability::Unmanageable("minimized")
         );
     }
 
@@ -987,6 +1251,80 @@ mod tests {
                 .monitor(MonitorId(1))
                 .map(MonitorLayoutState::windows),
             Some([WindowHandle(1), WindowHandle(2)].as_slice())
+        );
+    }
+
+    #[test]
+    fn workspace_switch_hides_old_workspace_and_shows_target_workspace() {
+        let mut workspaces = WorkspaceManager::new(2);
+        workspaces.track_window(WindowHandle(1), Rect::from_size(0, 0, 100, 100));
+        workspaces.track_window_on_workspace(
+            WindowHandle(2),
+            WorkspaceId(2),
+            Rect::from_size(200, 0, 100, 100),
+        );
+
+        let plan = workspaces.switch_to(WorkspaceId(2));
+
+        assert_eq!(workspaces.active_workspace(), WorkspaceId(2));
+        assert_eq!(plan.from, WorkspaceId(1));
+        assert_eq!(plan.to, WorkspaceId(2));
+        assert_eq!(plan.hide, vec![WindowHandle(1)]);
+        assert_eq!(
+            plan.show,
+            vec![WorkspaceVisibilityChange {
+                window: WindowHandle(2),
+                restore_rect: Some(Rect::from_size(200, 0, 100, 100)),
+            }]
+        );
+    }
+
+    #[test]
+    fn workspace_state_survives_create_destroy_style_updates() {
+        let mut workspaces = WorkspaceManager::new(2);
+        assert!(workspaces.track_window(WindowHandle(1), Rect::from_size(0, 0, 100, 100)));
+        assert!(!workspaces.track_window(WindowHandle(1), Rect::from_size(10, 0, 100, 100)));
+        workspaces.move_window_to_workspace(WindowHandle(1), WorkspaceId(2));
+        workspaces.track_window(WindowHandle(2), Rect::from_size(0, 0, 100, 100));
+
+        workspaces.retain_windows(&BTreeSet::from([WindowHandle(1)]));
+
+        assert_eq!(
+            workspaces.window_state(WindowHandle(1)),
+            Some(WorkspaceWindowState {
+                workspace: WorkspaceId(2),
+                last_rect: Some(Rect::from_size(10, 0, 100, 100)),
+                visible_on_all_workspaces: false,
+            })
+        );
+        assert_eq!(workspaces.window_state(WindowHandle(2)), None);
+    }
+
+    #[test]
+    fn visible_on_all_workspace_windows_are_not_hidden_or_shown() {
+        let mut workspaces = WorkspaceManager::new(2);
+        workspaces.track_window(WindowHandle(1), Rect::from_size(0, 0, 100, 100));
+        workspaces.set_visible_on_all_workspaces(WindowHandle(1), true);
+        workspaces.track_window_on_workspace(
+            WindowHandle(2),
+            WorkspaceId(2),
+            Rect::from_size(200, 0, 100, 100),
+        );
+
+        let plan = workspaces.switch_to(WorkspaceId(2));
+
+        assert_eq!(plan.hide, Vec::<WindowHandle>::new());
+        assert_eq!(
+            plan.show,
+            vec![WorkspaceVisibilityChange {
+                window: WindowHandle(2),
+                restore_rect: Some(Rect::from_size(200, 0, 100, 100)),
+            }]
+        );
+        assert!(workspaces.is_window_on_active_workspace(WindowHandle(1)));
+        assert_eq!(
+            workspaces.visible_windows().collect::<Vec<_>>(),
+            vec![WindowHandle(1), WindowHandle(2)]
         );
     }
 

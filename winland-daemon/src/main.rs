@@ -6,7 +6,10 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
-use winland_core::{MonitorInfo, TileAssignment, WindowHandle, WindowInfo, tile_windows};
+use winland_core::{
+    MonitorInfo, TileAssignment, WindowHandle, WindowInfo, WorkspaceId, WorkspaceManager,
+    WorkspaceVisibilityChange, tile_windows,
+};
 use winland_win32::{
     HotkeyBinding, HotkeyEvent, HotkeyId, HotkeyModifierSet, VirtualKey, WindowEvent,
     WindowEventKind,
@@ -14,6 +17,7 @@ use winland_win32::{
 
 const RECONCILE_DEBOUNCE: Duration = Duration::from_millis(50);
 const MAX_BATCH_SIZE: usize = 512;
+const DEFAULT_WORKSPACE_COUNT: u16 = 9;
 
 const HOTKEY_FOCUS_LEFT: HotkeyId = HotkeyId(1);
 const HOTKEY_FOCUS_DOWN: HotkeyId = HotkeyId(2);
@@ -27,6 +31,8 @@ const HOTKEY_RETILE: HotkeyId = HotkeyId(9);
 const HOTKEY_TOGGLE_FLOAT: HotkeyId = HotkeyId(10);
 const HOTKEY_RELOAD: HotkeyId = HotkeyId(11);
 const HOTKEY_QUIT: HotkeyId = HotkeyId(12);
+const HOTKEY_SWITCH_WORKSPACE_BASE: i32 = 20;
+const HOTKEY_MOVE_TO_WORKSPACE_BASE: i32 = 40;
 
 fn main() -> Result<()> {
     init_tracing();
@@ -161,6 +167,7 @@ struct DaemonState {
     foreground: Option<WindowHandle>,
     tile_order: Vec<WindowHandle>,
     floating: BTreeSet<WindowHandle>,
+    workspaces: WorkspaceManager,
 }
 
 impl DaemonState {
@@ -171,14 +178,18 @@ impl DaemonState {
             .map(|window| (window.handle, window))
             .collect();
         let foreground = winland_win32::foreground_window().context("read foreground window")?;
+        let monitors = winland_win32::enumerate_monitors()
+            .context("enumerate monitors for daemon snapshot")?;
 
         let mut state = Self {
             windows,
             foreground,
             tile_order: Vec::new(),
             floating: BTreeSet::new(),
+            workspaces: WorkspaceManager::new(DEFAULT_WORKSPACE_COUNT),
         };
         state.tile_order = state.manageable_handles_sorted();
+        state.sync_workspace_state(&monitors);
 
         Ok(state)
     }
@@ -196,7 +207,9 @@ impl DaemonState {
         let mut refreshed =
             Self::discover().context("refresh window snapshot after event batch")?;
         let diff = self.diff(&refreshed);
-        self.preserve_keyboard_state(&mut refreshed);
+        let monitors = winland_win32::enumerate_monitors()
+            .context("enumerate monitors while preserving daemon state")?;
+        self.preserve_keyboard_state(&mut refreshed, &monitors);
         *self = refreshed;
 
         info!(
@@ -212,6 +225,7 @@ impl DaemonState {
             total_windows = self.windows.len(),
             manageable_windows = self.manageable_window_count(),
             floating_windows = self.floating.len(),
+            active_workspace = %self.workspaces.active_workspace(),
             added = diff.added.len(),
             removed = diff.removed.len(),
             changed = diff.changed,
@@ -242,7 +256,9 @@ impl DaemonState {
     fn execute_command(&mut self, command: DaemonCommand) -> Result<()> {
         if command == DaemonCommand::Reload {
             let mut refreshed = Self::discover().context("reload daemon window snapshot")?;
-            self.preserve_keyboard_state(&mut refreshed);
+            let monitors = winland_win32::enumerate_monitors()
+                .context("enumerate monitors while reloading daemon state")?;
+            self.preserve_keyboard_state(&mut refreshed, &monitors);
             *self = refreshed;
             self.log_snapshot("reloaded daemon state");
             return Ok(());
@@ -259,6 +275,33 @@ impl DaemonState {
             && let Err(error) = winland_win32::focus_window(target)
         {
             warn!(window = %target, %error, "failed to focus window from hotkey command");
+        }
+
+        for window in &plan.hide {
+            if let Err(error) = winland_win32::hide_window(*window) {
+                warn!(window = %window, %error, "failed to hide window during workspace command");
+            }
+        }
+
+        for change in &plan.show {
+            if let Some(rect) = change.restore_rect
+                && let Err(error) = winland_win32::move_resize_window(change.window, rect)
+            {
+                warn!(
+                    window = %change.window,
+                    rect = %rect,
+                    %error,
+                    "failed to restore workspace window placement before showing it"
+                );
+            }
+
+            if let Err(error) = winland_win32::show_window_without_activate(change.window) {
+                warn!(
+                    window = %change.window,
+                    %error,
+                    "failed to show window during workspace command"
+                );
+            }
         }
 
         for assignment in &plan.moves {
@@ -309,6 +352,23 @@ impl DaemonState {
             DaemonCommand::ToggleFloat => {
                 self.toggle_focused_float();
                 CommandPlan {
+                    moves: self.tile_assignments(monitors),
+                    ..CommandPlan::default()
+                }
+            }
+            DaemonCommand::SwitchWorkspace(workspace) => {
+                let workspace_plan = self.switch_workspace(workspace, monitors);
+                CommandPlan {
+                    hide: workspace_plan.hide,
+                    show: workspace_plan.show,
+                    moves: self.tile_assignments(monitors),
+                    ..CommandPlan::default()
+                }
+            }
+            DaemonCommand::MoveFocusedToWorkspace(workspace) => {
+                let hide = self.move_focused_to_workspace(workspace, monitors);
+                CommandPlan {
+                    hide,
                     moves: self.tile_assignments(monitors),
                     ..CommandPlan::default()
                 }
@@ -422,40 +482,148 @@ impl DaemonState {
         }
     }
 
-    fn tile_assignments(&self, monitors: &[MonitorInfo]) -> Vec<TileAssignment> {
-        let Some(monitor) = primary_monitor(monitors) else {
+    fn switch_workspace(
+        &mut self,
+        workspace: WorkspaceId,
+        monitors: &[MonitorInfo],
+    ) -> WorkspaceCommandPlan {
+        self.sync_workspace_state(monitors);
+        let mut plan = self.workspaces.switch_to(workspace);
+        plan.hide
+            .retain(|window| self.should_hide_for_workspace(*window, monitors));
+
+        if self
+            .foreground
+            .is_some_and(|window| !self.workspaces.is_window_on_active_workspace(window))
+        {
+            self.foreground = None;
+        }
+
+        WorkspaceCommandPlan {
+            hide: plan.hide,
+            show: plan.show,
+        }
+    }
+
+    fn move_focused_to_workspace(
+        &mut self,
+        workspace: WorkspaceId,
+        monitors: &[MonitorInfo],
+    ) -> Vec<WindowHandle> {
+        let Some(current) = self
+            .foreground
+            .filter(|handle| self.is_manageable_window(*handle))
+        else {
             return Vec::new();
         };
 
-        let handles: Vec<_> = self
-            .tile_order
-            .iter()
-            .copied()
-            .filter(|handle| !self.floating.contains(handle))
-            .filter(|handle| {
-                self.windows.get(handle).is_some_and(|window| {
-                    window.is_manageable() && monitor.rect.contains(window.rect.center())
-                })
-            })
-            .collect();
+        self.sync_workspace_state(monitors);
+        if let Some(window) = self.windows.get(&current) {
+            self.workspaces.update_window_rect(current, window.rect);
+        }
 
-        tile_windows(monitor.work_area, &handles)
+        let was_active = self.workspaces.is_window_on_active_workspace(current);
+        if !self.workspaces.move_window_to_workspace(current, workspace) {
+            return Vec::new();
+        }
+
+        if was_active && workspace != self.workspaces.active_workspace() {
+            self.floating.remove(&current);
+            self.foreground = None;
+            if self.should_hide_for_workspace(current, monitors) {
+                return vec![current];
+            }
+        }
+
+        Vec::new()
     }
 
-    fn preserve_keyboard_state(&self, refreshed: &mut Self) {
-        let manageable: BTreeSet<_> = refreshed.manageable_handles_sorted().into_iter().collect();
+    fn tile_assignments(&self, monitors: &[MonitorInfo]) -> Vec<TileAssignment> {
+        monitors
+            .iter()
+            .flat_map(|monitor| {
+                let handles: Vec<_> = self
+                    .tile_order
+                    .iter()
+                    .copied()
+                    .filter(|handle| !self.floating.contains(handle))
+                    .filter(|handle| {
+                        self.windows.get(handle).is_some_and(|window| {
+                            self.is_tilable_window(*handle)
+                                && monitor
+                                    .rect
+                                    .contains(self.window_layout_rect(*handle, window).center())
+                        })
+                    })
+                    .collect();
+
+                tile_windows(monitor.work_area, &handles)
+            })
+            .collect()
+    }
+
+    fn sync_workspace_state(&mut self, monitors: &[MonitorInfo]) {
+        let existing: BTreeSet<_> = self.windows.keys().copied().collect();
+        self.workspaces.retain_windows(&existing);
+
+        for (handle, window) in &self.windows {
+            if self.workspaces.window_state(*handle).is_some() {
+                if window.is_workspace_manageable() {
+                    self.workspaces.update_window_rect(*handle, window.rect);
+                }
+            } else if window.is_manageable() && !is_fullscreen_window(window, monitors) {
+                self.workspaces.track_window(*handle, window.rect);
+            }
+        }
+    }
+
+    fn should_hide_for_workspace(&self, window: WindowHandle, monitors: &[MonitorInfo]) -> bool {
+        self.windows.get(&window).is_some_and(|info| {
+            info.is_workspace_manageable() && !is_fullscreen_window(info, monitors)
+        })
+    }
+
+    fn is_tilable_window(&self, handle: WindowHandle) -> bool {
+        self.workspaces.is_window_on_active_workspace(handle)
+            && self
+                .windows
+                .get(&handle)
+                .is_some_and(WindowInfo::is_workspace_manageable)
+    }
+
+    fn window_layout_rect(&self, handle: WindowHandle, window: &WindowInfo) -> winland_core::Rect {
+        self.workspaces
+            .window_state(handle)
+            .and_then(|state| state.last_rect)
+            .unwrap_or(window.rect)
+    }
+
+    fn preserve_keyboard_state(&self, refreshed: &mut Self, monitors: &[MonitorInfo]) {
+        refreshed.workspaces = self.workspaces.clone();
+        refreshed.sync_workspace_state(monitors);
+
+        let known_workspace_windows: BTreeSet<_> = refreshed
+            .windows
+            .keys()
+            .copied()
+            .filter(|handle| refreshed.workspaces.window_state(*handle).is_some())
+            .collect();
         refreshed.tile_order = self
             .tile_order
             .iter()
             .copied()
-            .filter(|handle| manageable.contains(handle))
+            .filter(|handle| known_workspace_windows.contains(handle))
             .collect();
-        for handle in &manageable {
+        for handle in &known_workspace_windows {
             if !refreshed.tile_order.contains(handle) {
                 refreshed.tile_order.push(*handle);
             }
         }
-        refreshed.floating = self.floating.intersection(&manageable).copied().collect();
+        refreshed.floating = self
+            .floating
+            .intersection(&known_workspace_windows)
+            .copied()
+            .collect();
     }
 
     fn diff(&self, refreshed: &Self) -> SnapshotDiff {
@@ -501,9 +669,11 @@ impl DaemonState {
     }
 
     fn is_manageable_window(&self, handle: WindowHandle) -> bool {
-        self.windows
-            .get(&handle)
-            .is_some_and(|window| window.is_manageable())
+        self.workspaces.is_window_on_active_workspace(handle)
+            && self
+                .windows
+                .get(&handle)
+                .is_some_and(|window| window.is_manageable())
     }
 
     fn log_snapshot(&self, message: &'static str) {
@@ -511,6 +681,7 @@ impl DaemonState {
             total_windows = self.windows.len(),
             manageable_windows = self.manageable_window_count(),
             floating_windows = self.floating.len(),
+            active_workspace = %self.workspaces.active_workspace(),
             foreground = ?self.foreground,
             message
         );
@@ -531,13 +702,22 @@ enum DaemonCommand {
     Swap(FocusDirection),
     Retile,
     ToggleFloat,
+    SwitchWorkspace(WorkspaceId),
+    MoveFocusedToWorkspace(WorkspaceId),
     Reload,
     Quit,
 }
 
 impl DaemonCommand {
     fn needs_layout(self) -> bool {
-        matches!(self, Self::Swap(_) | Self::Retile | Self::ToggleFloat)
+        matches!(
+            self,
+            Self::Swap(_)
+                | Self::Retile
+                | Self::ToggleFloat
+                | Self::SwitchWorkspace(_)
+                | Self::MoveFocusedToWorkspace(_)
+        )
     }
 }
 
@@ -552,16 +732,41 @@ enum FocusDirection {
 #[derive(Debug, Default, PartialEq, Eq)]
 struct CommandPlan {
     focus: Option<WindowHandle>,
+    hide: Vec<WindowHandle>,
+    show: Vec<WorkspaceVisibilityChange>,
     moves: Vec<TileAssignment>,
     reload: bool,
     quit: bool,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct WorkspaceCommandPlan {
+    hide: Vec<WindowHandle>,
+    show: Vec<WorkspaceVisibilityChange>,
 }
 
 fn count_events(batch: &[WindowEvent], kind: WindowEventKind) -> usize {
     batch.iter().filter(|event| event.kind == kind).count()
 }
 
+fn workspace_from_hotkey(id: i32, base: i32) -> Option<WorkspaceId> {
+    let offset = id.checked_sub(base)?;
+    if !(0..i32::from(DEFAULT_WORKSPACE_COUNT)).contains(&offset) {
+        return None;
+    }
+
+    Some(WorkspaceId((offset + 1) as u16))
+}
+
 fn command_for_hotkey(id: HotkeyId) -> Option<DaemonCommand> {
+    if let Some(workspace) = workspace_from_hotkey(id.0, HOTKEY_SWITCH_WORKSPACE_BASE) {
+        return Some(DaemonCommand::SwitchWorkspace(workspace));
+    }
+
+    if let Some(workspace) = workspace_from_hotkey(id.0, HOTKEY_MOVE_TO_WORKSPACE_BASE) {
+        return Some(DaemonCommand::MoveFocusedToWorkspace(workspace));
+    }
+
     match id {
         HOTKEY_FOCUS_LEFT => Some(DaemonCommand::Focus(FocusDirection::Left)),
         HOTKEY_FOCUS_DOWN => Some(DaemonCommand::Focus(FocusDirection::Down)),
@@ -580,10 +785,10 @@ fn command_for_hotkey(id: HotkeyId) -> Option<DaemonCommand> {
 }
 
 fn default_hotkey_bindings() -> Vec<HotkeyBinding> {
-    let base = HotkeyModifierSet::new().super_key().alt();
+    let base = HotkeyModifierSet::new().control().alt();
     let shifted = base.shift();
 
-    vec![
+    let mut bindings = vec![
         binding(HOTKEY_FOCUS_LEFT, base, b'H', "focus left"),
         binding(HOTKEY_FOCUS_DOWN, base, b'J', "focus down"),
         binding(HOTKEY_FOCUS_UP, base, b'K', "focus up"),
@@ -596,7 +801,25 @@ fn default_hotkey_bindings() -> Vec<HotkeyBinding> {
         HotkeyBinding::new(HOTKEY_TOGGLE_FLOAT, base, VirtualKey::SPACE, "toggle float"),
         binding(HOTKEY_RELOAD, base, b'C', "reload"),
         binding(HOTKEY_QUIT, base, b'Q', "quit"),
-    ]
+    ];
+
+    for workspace in 1..=DEFAULT_WORKSPACE_COUNT {
+        let key = b'0' + workspace as u8;
+        bindings.push(binding(
+            HotkeyId(HOTKEY_SWITCH_WORKSPACE_BASE + i32::from(workspace) - 1),
+            base,
+            key,
+            "switch workspace",
+        ));
+        bindings.push(binding(
+            HotkeyId(HOTKEY_MOVE_TO_WORKSPACE_BASE + i32::from(workspace) - 1),
+            shifted,
+            key,
+            "move focused window to workspace",
+        ));
+    }
+
+    bindings
 }
 
 fn log_hotkey_registration(
@@ -636,11 +859,11 @@ fn hotkey_label(binding: &HotkeyBinding) -> String {
     if binding.modifiers.super_key {
         parts.push("Win".to_owned());
     }
-    if binding.modifiers.alt {
-        parts.push("Alt".to_owned());
-    }
     if binding.modifiers.control {
         parts.push("Ctrl".to_owned());
+    }
+    if binding.modifiers.alt {
+        parts.push("Alt".to_owned());
     }
     if binding.modifiers.shift {
         parts.push("Shift".to_owned());
@@ -671,11 +894,10 @@ fn binding(
     HotkeyBinding::new(id, modifiers, VirtualKey::ascii_uppercase(key), description)
 }
 
-fn primary_monitor(monitors: &[MonitorInfo]) -> Option<&MonitorInfo> {
+fn is_fullscreen_window(window: &WindowInfo, monitors: &[MonitorInfo]) -> bool {
     monitors
         .iter()
-        .find(|monitor| monitor.is_primary)
-        .or_else(|| monitors.first())
+        .any(|monitor| window.rect == monitor.rect || window.rect == monitor.work_area)
 }
 
 #[cfg(test)]
@@ -697,6 +919,14 @@ mod tests {
             command_for_hotkey(HOTKEY_TOGGLE_FLOAT),
             Some(DaemonCommand::ToggleFloat)
         );
+        assert_eq!(
+            command_for_hotkey(HotkeyId(HOTKEY_SWITCH_WORKSPACE_BASE + 1)),
+            Some(DaemonCommand::SwitchWorkspace(WorkspaceId(2)))
+        );
+        assert_eq!(
+            command_for_hotkey(HotkeyId(HOTKEY_MOVE_TO_WORKSPACE_BASE + 8)),
+            Some(DaemonCommand::MoveFocusedToWorkspace(WorkspaceId(9)))
+        );
         assert_eq!(command_for_hotkey(HOTKEY_QUIT), Some(DaemonCommand::Quit));
         assert_eq!(command_for_hotkey(HotkeyId(999)), None);
     }
@@ -705,12 +935,12 @@ mod tests {
     fn hotkey_label_is_human_readable() {
         let binding = HotkeyBinding::new(
             HOTKEY_TOGGLE_FLOAT,
-            HotkeyModifierSet::new().super_key().alt(),
+            HotkeyModifierSet::new().control().alt(),
             VirtualKey::SPACE,
             "toggle float",
         );
 
-        assert_eq!(hotkey_label(&binding), "Win+Alt+Space");
+        assert_eq!(hotkey_label(&binding), "Ctrl+Alt+Space");
     }
 
     #[test]
@@ -770,6 +1000,131 @@ mod tests {
     }
 
     #[test]
+    fn retile_tiles_windows_on_each_monitor_independently() {
+        let monitors = [
+            primary_test_monitor(),
+            MonitorInfo {
+                id: MonitorId(2),
+                is_primary: false,
+                rect: Rect::from_size(1000, 0, 800, 600),
+                work_area: Rect::from_size(1000, 0, 800, 560),
+            },
+        ];
+        let mut state = daemon_state([
+            window(1, "Primary One", Rect::from_size(0, 0, 100, 100)),
+            window(2, "Primary Two", Rect::from_size(200, 0, 100, 100)),
+            window(3, "Secondary", Rect::from_size(1100, 0, 100, 100)),
+        ]);
+        state.sync_workspace_state(&monitors);
+
+        let plan = state.plan_command(DaemonCommand::Retile, &monitors);
+
+        assert_eq!(
+            plan.moves,
+            vec![
+                TileAssignment {
+                    window: WindowHandle(1),
+                    rect: Rect::from_size(0, 0, 500, 760),
+                },
+                TileAssignment {
+                    window: WindowHandle(2),
+                    rect: Rect::from_size(500, 0, 500, 760),
+                },
+                TileAssignment {
+                    window: WindowHandle(3),
+                    rect: Rect::from_size(1000, 0, 800, 560),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn switch_workspace_plans_hide_show_and_retile_for_target_workspace() {
+        let mut state = daemon_state([
+            window(1, "One", Rect::from_size(0, 0, 100, 100)),
+            window(2, "Two", Rect::from_size(200, 0, 100, 100)),
+        ]);
+        state
+            .workspaces
+            .move_window_to_workspace(WindowHandle(2), WorkspaceId(2));
+
+        let plan = state.plan_command(
+            DaemonCommand::SwitchWorkspace(WorkspaceId(2)),
+            &[primary_test_monitor()],
+        );
+
+        assert_eq!(state.workspaces.active_workspace(), WorkspaceId(2));
+        assert_eq!(plan.hide, vec![WindowHandle(1)]);
+        assert_eq!(
+            plan.show,
+            vec![WorkspaceVisibilityChange {
+                window: WindowHandle(2),
+                restore_rect: Some(Rect::from_size(200, 0, 100, 100)),
+            }]
+        );
+        assert_eq!(
+            plan.moves,
+            vec![TileAssignment {
+                window: WindowHandle(2),
+                rect: primary_test_monitor().work_area,
+            }]
+        );
+    }
+
+    #[test]
+    fn move_focused_to_inactive_workspace_hides_it_and_retiles_remaining_windows() {
+        let mut state = daemon_state([
+            window(1, "One", Rect::from_size(0, 0, 100, 100)),
+            window(2, "Two", Rect::from_size(200, 0, 100, 100)),
+        ]);
+        state.foreground = Some(WindowHandle(1));
+
+        let plan = state.plan_command(
+            DaemonCommand::MoveFocusedToWorkspace(WorkspaceId(2)),
+            &[primary_test_monitor()],
+        );
+
+        assert_eq!(plan.hide, vec![WindowHandle(1)]);
+        assert_eq!(plan.show, Vec::<WorkspaceVisibilityChange>::new());
+        assert_eq!(
+            state
+                .workspaces
+                .window_state(WindowHandle(1))
+                .unwrap()
+                .workspace,
+            WorkspaceId(2)
+        );
+        assert_eq!(
+            plan.moves,
+            vec![TileAssignment {
+                window: WindowHandle(2),
+                rect: primary_test_monitor().work_area,
+            }]
+        );
+    }
+
+    #[test]
+    fn fullscreen_windows_are_not_hidden_by_workspace_switches() {
+        let mut state = daemon_state([
+            window(1, "Fullscreen", primary_test_monitor().rect),
+            window(2, "Two", Rect::from_size(200, 0, 100, 100)),
+        ]);
+        state
+            .workspaces
+            .track_window(WindowHandle(1), primary_test_monitor().rect);
+        state
+            .workspaces
+            .move_window_to_workspace(WindowHandle(2), WorkspaceId(2));
+
+        let plan = state.plan_command(
+            DaemonCommand::SwitchWorkspace(WorkspaceId(2)),
+            &[primary_test_monitor()],
+        );
+
+        assert_eq!(plan.hide, Vec::<WindowHandle>::new());
+    }
+
+    #[test]
     fn snapshot_diff_reports_added_removed_changed_and_foreground_changes() {
         let mut old = daemon_state([
             window(1, "Editor", Rect::from_size(10, 20, 800, 600)),
@@ -814,8 +1169,10 @@ mod tests {
             foreground: None,
             tile_order: Vec::new(),
             floating: BTreeSet::new(),
+            workspaces: WorkspaceManager::new(DEFAULT_WORKSPACE_COUNT),
         };
         state.tile_order = state.manageable_handles_sorted();
+        state.sync_workspace_state(&[primary_test_monitor()]);
         state
     }
 

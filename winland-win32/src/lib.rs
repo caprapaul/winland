@@ -30,9 +30,10 @@ mod platform {
         EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, EnumWindows, GW_OWNER, GWL_EXSTYLE,
         GWL_STYLE, GetClassNameW, GetForegroundWindow, GetMessageW, GetWindow, GetWindowLongPtrW,
         GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
-        IsWindowVisible, MONITORINFOF_PRIMARY, MSG, OBJID_WINDOW, PostThreadMessageW,
-        SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER, SetForegroundWindow, SetWindowPos,
-        TranslateMessage, WINEVENT_OUTOFCONTEXT, WM_HOTKEY, WM_QUIT, WS_EX_TOOLWINDOW,
+        IsWindowVisible, MONITORINFOF_PRIMARY, MSG, OBJID_WINDOW, PostThreadMessageW, SW_HIDE,
+        SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER, SetForegroundWindow,
+        SetWindowPos, ShowWindow, TranslateMessage, WINEVENT_OUTOFCONTEXT, WM_HOTKEY, WM_QUIT,
+        WS_EX_TOOLWINDOW,
     };
     use windows::core::PWSTR;
     use winland_core::{
@@ -137,6 +138,32 @@ mod platform {
         } else {
             Err(Win32Error::last_error("SetForegroundWindow"))
         }
+    }
+
+    pub fn hide_window(handle: WindowHandle) -> Result<()> {
+        let hwnd = hwnd_from_handle(handle);
+
+        // SAFETY: hwnd is a top-level window handle tracked from documented
+        // enumeration. SW_HIDE asks Windows to hide the window without changing
+        // ownership, styles, or DWM behavior.
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        }
+
+        Ok(())
+    }
+
+    pub fn show_window_without_activate(handle: WindowHandle) -> Result<()> {
+        let hwnd = hwnd_from_handle(handle);
+
+        // SAFETY: hwnd is a top-level window handle tracked from documented
+        // enumeration. SW_SHOWNOACTIVATE makes a hidden workspace window visible
+        // without stealing focus from the user's current foreground window.
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
+
+        Ok(())
     }
 
     pub fn subscribe_window_events(sender: Sender<WindowEvent>) -> Result<WindowEventSubscription> {
@@ -779,6 +806,14 @@ mod platform {
         Err(Win32Error::UnsupportedPlatform)
     }
 
+    pub fn hide_window(_handle: WindowHandle) -> Result<()> {
+        Err(Win32Error::UnsupportedPlatform)
+    }
+
+    pub fn show_window_without_activate(_handle: WindowHandle) -> Result<()> {
+        Err(Win32Error::UnsupportedPlatform)
+    }
+
     pub fn subscribe_window_events(
         _sender: Sender<WindowEvent>,
     ) -> Result<WindowEventSubscription> {
@@ -816,10 +851,12 @@ pub use platform::enumerate_monitors;
 pub use platform::enumerate_windows;
 pub use platform::focus_window;
 pub use platform::foreground_window;
+pub use platform::hide_window;
 pub use platform::move_resize_window;
 pub use platform::register_hotkeys;
 pub use platform::request_message_loop_stop;
 pub use platform::run_message_loop;
+pub use platform::show_window_without_activate;
 pub use platform::subscribe_window_events;
 use winland_core::WindowHandle;
 

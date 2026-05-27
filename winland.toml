@@ -33,9 +33,23 @@ window_rules = []
 log_level = "info"
 
 [hotkeys]
-# Phase 7 supports normal documented RegisterHotKey registration only.
-# Advanced interception is intentionally left for the later hotkey override phase.
+# Normal mode uses documented RegisterHotKey registration and remains the default.
+# Advanced interception installs an opt-in WH_KEYBOARD_LL hook for conflicts that
+# ordinary global hotkeys cannot claim.
 mode = "normal"
+
+# In advanced-interception mode, this hotkey is never intercepted. Keep it as a
+# recovery path if a suppressing binding is bad.
+panic_hotkey = "Ctrl+Alt+Shift+P"
+
+# Hook decisions over this budget are logged. Command execution is dispatched
+# outside the hook callback.
+override_latency_budget_micros = 250
+
+# Keep game and fullscreen input out of override logic by default.
+bypass = { fullscreen = true, class = [], executable_path = [], process_name = [] }
+# Example:
+# bypass = { fullscreen = true, process_name = ["eldenring.exe", "cs2.exe"] }
 
 # Supported command names:
 # focus-left, focus-down, focus-up, focus-right
@@ -77,7 +91,7 @@ bindings = [
 
 # Example alternate binding:
 # bindings = [
-#   { keys = "Win+H", command = "focus-left" },
+#   { keys = "Win+H", command = "focus-left", override_app = true },
 #   { keys = "Win+Shift+H", command = "swap-left" },
 #   { keys = "Win+R", command = "retile" },
 # ]

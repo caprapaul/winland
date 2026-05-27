@@ -204,17 +204,25 @@ Tasks:
 - Keep ordinary hotkeys on the documented `RegisterHotKey` path by default.
 - Add config for hotkey handling mode, such as normal registration versus advanced interception.
 - Use documented low-level keyboard hook APIs, such as `WH_KEYBOARD_LL`, only for explicit opt-in override mode.
+- Do not route game input through override logic by default.
+- Add a game-safe bypass path for fullscreen, exclusive, borderless-fullscreen, or rule-matched game processes.
+- Make game bypass rules configurable by process name, executable path, window class, and fullscreen state.
+- Keep hook callback work minimal: classify, decide, and return quickly; dispatch command work outside the hook path.
 - Route intercepted key combinations through the same command system as normal hotkeys.
 - Allow per-binding override intent where practical, so users can choose which shortcuts should suppress delivery to the focused app.
 - Add clear diagnostics for failed registrations, intercepted bindings, suppressed keys, and unsupported protected shortcuts.
 - Reserve a panic or escape hotkey that Winland never intercepts.
 - Document limits clearly: secure desktop, UAC prompts, `Ctrl+Alt+Del`, and reserved OS shortcuts cannot be overridden.
+- Add latency instrumentation or a benchmark harness for the hook decision path.
 - Test matching and command routing without requiring a real keyboard hook.
 
 Done criteria:
 - Normal hotkey mode remains the default and still uses `RegisterHotKey`.
 - Override mode is disabled unless explicitly configured.
 - App-level shortcut conflicts can be intercepted where Windows allows it.
+- Games, fullscreen apps, and configured bypass processes receive input without Winland interception overhead beyond a fast bypass check.
+- Hook decision latency has an explicit budget and is measured before the phase is considered done.
+- Command execution never runs directly inside the low-level keyboard hook callback.
 - Protected or unsupported Windows shortcuts fail safely with clear diagnostics.
 - A user has a documented way to recover if an override binding is bad.
 
@@ -223,6 +231,7 @@ Not yet:
 - No undocumented keyboard injection or private APIs.
 - No attempt to override secure desktop shortcuts.
 - No default interception of all keyboard input.
+- No interception for games unless the user explicitly opts a specific game in.
 - No modal keybinding language unless explicitly added later.
 
 ## Phase 10: IPC and CLI

@@ -84,6 +84,9 @@ impl Default for GeneralConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct HotkeysConfig {
     pub mode: HotkeyMode,
+    pub panic_hotkey: String,
+    pub override_latency_budget_micros: u64,
+    pub bypass: HotkeyBypassConfig,
     pub bindings: Vec<HotkeyBindingConfig>,
 }
 
@@ -91,6 +94,9 @@ impl Default for HotkeysConfig {
     fn default() -> Self {
         Self {
             mode: HotkeyMode::Normal,
+            panic_hotkey: "Ctrl+Alt+Shift+P".to_owned(),
+            override_latency_budget_micros: 250,
+            bypass: HotkeyBypassConfig::default(),
             bindings: default_hotkey_bindings(),
         }
     }
@@ -101,6 +107,27 @@ impl Default for HotkeysConfig {
 pub enum HotkeyMode {
     #[default]
     Normal,
+    AdvancedInterception,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct HotkeyBypassConfig {
+    pub fullscreen: bool,
+    pub class: Vec<TextMatcherConfig>,
+    pub executable_path: Vec<TextMatcherConfig>,
+    pub process_name: Vec<TextMatcherConfig>,
+}
+
+impl Default for HotkeyBypassConfig {
+    fn default() -> Self {
+        Self {
+            fullscreen: true,
+            class: Vec::new(),
+            executable_path: Vec::new(),
+            process_name: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -108,6 +135,8 @@ pub enum HotkeyMode {
 pub struct HotkeyBindingConfig {
     pub keys: String,
     pub command: String,
+    #[serde(default)]
+    pub override_app: bool,
 }
 
 impl HotkeyBindingConfig {
@@ -308,7 +337,7 @@ pub enum TextMatcherConfig {
 }
 
 impl TextMatcherConfig {
-    fn to_core(&self) -> Result<TextMatcher, ConfigError> {
+    pub fn to_core(&self) -> Result<TextMatcher, ConfigError> {
         match self {
             Self::Exact(value) => Ok(TextMatcher::Exact(value.clone())),
             Self::Detailed(fields) => fields.to_core(),
@@ -410,6 +439,7 @@ pub enum HotkeyModifier {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum HotkeyKey {
     Character(char),
+    Escape,
     Space,
 }
 
@@ -558,6 +588,7 @@ pub fn parse_hotkey_chord(input: &str) -> Result<HotkeyChord, ConfigError> {
 
 fn parse_hotkey_key(input: &str) -> Result<HotkeyKey, ConfigError> {
     match input.to_ascii_lowercase().as_str() {
+        "esc" | "escape" => Ok(HotkeyKey::Escape),
         "space" => Ok(HotkeyKey::Space),
         _ => {
             let mut chars = input.chars();
@@ -697,13 +728,43 @@ fn validate_workspaces(workspaces: &WorkspacesConfig, errors: &mut Vec<String>) 
 }
 
 fn validate_hotkeys(hotkeys: &HotkeysConfig, workspace_count: u16, errors: &mut Vec<String>) {
+    match parse_hotkey_chord(&hotkeys.panic_hotkey) {
+        Ok(chord) => {
+            if is_protected_hotkey_chord(&chord) {
+                errors.push(
+                    "hotkeys.panic_hotkey must not be a protected Windows shortcut".to_owned(),
+                );
+            }
+        }
+        Err(ConfigError::Validation(validation)) => {
+            for error in validation.0 {
+                errors.push(format!("hotkeys.panic_hotkey: {error}"));
+            }
+        }
+        Err(error) => errors.push(format!("hotkeys.panic_hotkey: {error}")),
+    }
+
+    if hotkeys.override_latency_budget_micros == 0 {
+        errors.push("hotkeys.override_latency_budget_micros must be greater than 0".to_owned());
+    }
+
+    validate_hotkey_bypass(&hotkeys.bypass, errors);
+
     let mut chords = BTreeSet::new();
     for (index, binding) in hotkeys.bindings.iter().enumerate() {
         match binding.chord() {
             Ok(chord) => {
-                if !chords.insert(chord) {
+                if !chords.insert(chord.clone()) {
                     errors.push(format!(
                         "hotkeys.bindings[{index}].keys duplicates an earlier binding"
+                    ));
+                }
+                if hotkeys.mode == HotkeyMode::AdvancedInterception
+                    && binding.override_app
+                    && is_protected_hotkey_chord(&chord)
+                {
+                    errors.push(format!(
+                        "hotkeys.bindings[{index}].keys is a protected Windows shortcut and cannot be overridden"
                     ));
                 }
             }
@@ -722,6 +783,27 @@ fn validate_hotkeys(hotkeys: &HotkeysConfig, workspace_count: u16, errors: &mut 
             errors,
         );
     }
+}
+
+fn validate_hotkey_bypass(bypass: &HotkeyBypassConfig, errors: &mut Vec<String>) {
+    for (index, matcher) in bypass.class.iter().enumerate() {
+        matcher.validate(format!("hotkeys.bypass.class[{index}]"), errors);
+    }
+    for (index, matcher) in bypass.executable_path.iter().enumerate() {
+        matcher.validate(format!("hotkeys.bypass.executable_path[{index}]"), errors);
+    }
+    for (index, matcher) in bypass.process_name.iter().enumerate() {
+        matcher.validate(format!("hotkeys.bypass.process_name[{index}]"), errors);
+    }
+}
+
+fn is_protected_hotkey_chord(chord: &HotkeyChord) -> bool {
+    let has_super = chord.modifiers.contains(&HotkeyModifier::Super);
+    let has_control = chord.modifiers.contains(&HotkeyModifier::Control);
+    let has_alt = chord.modifiers.contains(&HotkeyModifier::Alt);
+
+    matches!(chord.key, HotkeyKey::Character('L')) && has_super
+        || matches!(chord.key, HotkeyKey::Escape) && has_control && has_alt
 }
 
 fn validate_command(context: &str, command: &str, workspace_count: u16, errors: &mut Vec<String>) {
@@ -862,6 +944,7 @@ fn default_hotkey_bindings() -> Vec<HotkeyBindingConfig> {
     .map(|(keys, command)| HotkeyBindingConfig {
         keys: keys.to_owned(),
         command: command.to_owned(),
+        override_app: false,
     })
     .collect()
 }
@@ -880,6 +963,10 @@ mod tests {
         assert_eq!(config.general.log_level, "info");
         assert_eq!(config.workspace_count(), 9);
         assert_eq!(config.layout_config().master_ratio_percent, 50);
+        assert_eq!(config.hotkeys.mode, HotkeyMode::Normal);
+        assert_eq!(config.hotkeys.panic_hotkey, "Ctrl+Alt+Shift+P");
+        assert_eq!(config.hotkeys.override_latency_budget_micros, 250);
+        assert!(config.hotkeys.bypass.fullscreen);
         assert_eq!(config.hotkeys.bindings.len(), 30);
         assert!(config.behavior.startup_retile);
         assert!(config.behavior.dynamic_retile);
@@ -896,8 +983,12 @@ mod tests {
             log_level = "debug"
 
             [hotkeys]
+            mode = "advanced-interception"
+            panic_hotkey = "Ctrl+Alt+Shift+P"
+            override_latency_budget_micros = 300
+            bypass = { fullscreen = true, process_name = ["game.exe"] }
             bindings = [
-              { keys = "Ctrl+Alt+R", command = "retile" },
+              { keys = "Ctrl+Alt+R", command = "retile", override_app = true },
               { keys = "Ctrl+Alt+1", command = "switch-workspace-1" },
             ]
 
@@ -931,6 +1022,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.general.log_level, "debug");
+        assert_eq!(config.hotkeys.mode, HotkeyMode::AdvancedInterception);
+        assert!(config.hotkeys.bindings[0].override_app);
+        assert_eq!(config.hotkeys.override_latency_budget_micros, 300);
+        assert_eq!(config.hotkeys.bypass.process_name.len(), 1);
         assert_eq!(config.layout_config().gap, 8);
         assert_eq!(config.workspace_count(), 2);
         assert!(config.behavior.startup_retile);
@@ -985,6 +1080,31 @@ mod tests {
         assert_eq!(
             parse_hotkey_chord("control + alt + h").unwrap(),
             parse_hotkey_chord("Ctrl+Alt+H").unwrap()
+        );
+    }
+
+    #[test]
+    fn override_mode_rejects_protected_suppressed_shortcuts() {
+        let error = parse_toml(
+            r#"
+            [hotkeys]
+            mode = "advanced-interception"
+            panic_hotkey = "Ctrl+Alt+Shift+P"
+            bindings = [
+              { keys = "Win+L", command = "retile", override_app = true },
+            ]
+            "#,
+        )
+        .unwrap_err();
+
+        let ConfigError::Validation(errors) = error else {
+            panic!("expected validation errors");
+        };
+
+        assert!(
+            errors
+                .to_string()
+                .contains("protected Windows shortcut and cannot be overridden")
         );
     }
 

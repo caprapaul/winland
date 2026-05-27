@@ -100,6 +100,8 @@ If a module needs `HWND`, `RECT`, `BOOL`, raw pointers, callbacks, or Win32 hand
 - Retile in response to window lifecycle and monitor events, but debounce event bursts so Winland does not thrash.
 - When the user starts dragging or resizing a managed tiled window, treat it as a temporary floating window and pause tiling pressure on that window.
 - When the drag or resize ends, return the window to tiled state and retile the affected workspace by default.
+- Hotkey override mode must not add meaningful input latency to games. Bypass fullscreen, exclusive, borderless-fullscreen, and rule-matched game processes by default.
+- If a low-level keyboard hook is used, keep hook callbacks tiny: decide quickly, never run command logic inside the hook, and return immediately for bypassed game windows.
 - Prefer reversible operations. Track previous placement when changing window geometry so recovery features can be added later.
 
 ## Visuals Policy

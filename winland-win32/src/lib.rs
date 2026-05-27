@@ -6,10 +6,11 @@ mod platform {
     use std::os::windows::ffi::OsStringExt;
     use std::sync::mpsc::Sender;
     use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
 
     use tracing::{debug, warn};
     use windows::Win32::Foundation::{
-        BOOL, CloseHandle, HANDLE, HMODULE, HWND, LPARAM, RECT, TRUE, WPARAM,
+        BOOL, CloseHandle, HANDLE, HMODULE, HWND, LPARAM, LRESULT, RECT, TRUE, WPARAM,
     };
     use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
     use windows::Win32::Graphics::Gdi::{
@@ -21,19 +22,21 @@ mod platform {
     };
     use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, RegisterHotKey,
-        UnregisterHotKey,
+        GetAsyncKeyState, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT,
+        MOD_WIN, RegisterHotKey, UnregisterHotKey,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        DispatchMessageW, EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE,
-        EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW, EVENT_SYSTEM_FOREGROUND,
+        CallNextHookEx, DispatchMessageW, EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY,
+        EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW, EVENT_SYSTEM_FOREGROUND,
         EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND,
         EVENT_SYSTEM_MOVESIZESTART, EnumWindows, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetClassNameW,
         GetForegroundWindow, GetMessageW, GetWindow, GetWindowLongPtrW, GetWindowRect,
-        GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
-        MONITORINFOF_PRIMARY, MSG, OBJID_WINDOW, PostThreadMessageW, SW_HIDE, SW_SHOWNOACTIVATE,
-        SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER, SetForegroundWindow, SetWindowPos,
-        ShowWindow, TranslateMessage, WINEVENT_OUTOFCONTEXT, WM_HOTKEY, WM_QUIT, WS_EX_TOOLWINDOW,
+        GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HC_ACTION, HHOOK, IsIconic,
+        IsWindowVisible, KBDLLHOOKSTRUCT, MONITORINFOF_PRIMARY, MSG, OBJID_WINDOW,
+        PostThreadMessageW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOOWNERZORDER,
+        SWP_NOZORDER, SetForegroundWindow, SetWindowPos, SetWindowsHookExW, ShowWindow,
+        TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WINEVENT_OUTOFCONTEXT, WM_HOTKEY,
+        WM_KEYDOWN, WM_QUIT, WM_SYSKEYDOWN, WS_EX_TOOLWINDOW,
     };
     use windows::core::PWSTR;
     use winland_core::{
@@ -41,12 +44,14 @@ mod platform {
     };
 
     use crate::{
-        HotkeyBinding, HotkeyEvent, HotkeyModifierSet, HotkeyRegistrationFailure, Result,
-        Win32Error, WindowEvent, WindowEventKind,
+        HotkeyBinding, HotkeyEvent, HotkeyInterceptionDecision, HotkeyLowLevelEvent,
+        HotkeyModifierSet, HotkeyOverrideOptions, HotkeyRegistrationFailure, HotkeyWindowContext,
+        Result, VirtualKey, Win32Error, WindowEvent, WindowEventKind, classify_intercepted_hotkey,
     };
 
     static EVENT_SENDER: OnceLock<Mutex<Option<Sender<WindowEvent>>>> = OnceLock::new();
     static HOTKEY_SENDER: OnceLock<Mutex<Option<HotkeySenderState>>> = OnceLock::new();
+    static HOTKEY_OVERRIDE: OnceLock<Mutex<Option<HotkeyOverrideState>>> = OnceLock::new();
 
     pub fn enumerate_windows() -> Result<Vec<WindowInfo>> {
         let mut windows = Vec::new();
@@ -240,6 +245,49 @@ mod platform {
         })
     }
 
+    pub fn install_hotkey_override(
+        bindings: Vec<HotkeyBinding>,
+        options: HotkeyOverrideOptions,
+        sender: Sender<HotkeyEvent>,
+    ) -> Result<HotkeyOverrideRegistration> {
+        {
+            let mut guard = hotkey_override_slot()
+                .lock()
+                .map_err(|_| Win32Error::HotkeyOverrideLockPoisoned)?;
+            if guard.is_some() {
+                return Err(Win32Error::HotkeyOverrideAlreadyInstalled);
+            }
+
+            *guard = Some(HotkeyOverrideState {
+                sender,
+                bindings,
+                options,
+            });
+        }
+
+        // SAFETY: The callback is a process-static low-level keyboard hook
+        // procedure. Thread id 0 installs it for the current desktop without
+        // injecting Winland code into other processes.
+        let hook =
+            unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(low_level_keyboard_proc), None, 0) };
+        let hook = match hook {
+            Ok(hook) => hook,
+            Err(source) => {
+                clear_hotkey_override();
+                return Err(Win32Error::Windows {
+                    context: "SetWindowsHookExW(WH_KEYBOARD_LL)",
+                    source,
+                });
+            }
+        };
+        if hook.0.is_null() {
+            clear_hotkey_override();
+            return Err(Win32Error::last_error("SetWindowsHookExW(WH_KEYBOARD_LL)"));
+        }
+
+        Ok(HotkeyOverrideRegistration { hook })
+    }
+
     pub fn request_message_loop_stop() -> Result<()> {
         let thread_id = {
             let guard = hotkey_sender_slot()
@@ -332,9 +380,32 @@ mod platform {
         }
     }
 
+    pub struct HotkeyOverrideRegistration {
+        hook: HHOOK,
+    }
+
+    impl Drop for HotkeyOverrideRegistration {
+        fn drop(&mut self) {
+            // SAFETY: This hook handle was returned by SetWindowsHookExW for
+            // this registration and is unhooked at most once here.
+            let ok = unsafe { UnhookWindowsHookEx(self.hook) };
+            if let Err(error) = ok {
+                warn!(?error, "failed to remove low-level keyboard hook");
+            }
+
+            clear_hotkey_override();
+        }
+    }
+
     struct HotkeySenderState {
         sender: Sender<HotkeyEvent>,
         message_thread_id: u32,
+    }
+
+    struct HotkeyOverrideState {
+        sender: Sender<HotkeyEvent>,
+        bindings: Vec<HotkeyBinding>,
+        options: HotkeyOverrideOptions,
     }
 
     struct EnumState<'a> {
@@ -379,6 +450,69 @@ mod platform {
             }
             Err(_) => warn!("window event sender lock is poisoned"),
         }
+    }
+
+    unsafe extern "system" fn low_level_keyboard_proc(
+        code: i32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        if code != HC_ACTION as i32 || !is_key_down_message(wparam.0 as u32) {
+            // SAFETY: Forwarding unhandled hook events preserves the documented
+            // low-level hook chain contract.
+            return unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) };
+        }
+
+        // SAFETY: For HC_ACTION keyboard events, lparam points to a
+        // KBDLLHOOKSTRUCT owned by Windows for the duration of this callback.
+        let keyboard = unsafe { *(lparam.0 as *const KBDLLHOOKSTRUCT) };
+        let event = HotkeyLowLevelEvent {
+            modifiers: current_modifier_state(),
+            virtual_key: VirtualKey(keyboard.vkCode),
+        };
+
+        let Some(slot) = HOTKEY_OVERRIDE.get() else {
+            // SAFETY: See the forwarding note above.
+            return unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) };
+        };
+
+        let Ok(guard) = slot.lock() else {
+            warn!("hotkey override lock is poisoned");
+            // SAFETY: See the forwarding note above.
+            return unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) };
+        };
+        let Some(state) = guard.as_ref() else {
+            // SAFETY: See the forwarding note above.
+            return unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) };
+        };
+
+        let focused = foreground_hotkey_context(&state.options);
+        let started = Instant::now();
+        let decision =
+            classify_intercepted_hotkey(&event, &state.bindings, &state.options, focused.as_ref());
+        let elapsed = started.elapsed();
+        if elapsed > state.options.latency_budget {
+            warn!(
+                elapsed_micros = elapsed.as_micros(),
+                budget_micros = state.options.latency_budget.as_micros(),
+                "low-level hotkey decision exceeded latency budget"
+            );
+        }
+
+        match decision {
+            HotkeyInterceptionDecision::Dispatch { id, suppress } => {
+                let _ = state.sender.send(HotkeyEvent { id });
+                if suppress {
+                    return LRESULT(1);
+                }
+            }
+            HotkeyInterceptionDecision::PassThrough { reason } => {
+                debug!(reason, "hotkey override passed key through");
+            }
+        }
+
+        // SAFETY: See the forwarding note above.
+        unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) }
     }
 
     fn register_hotkey(binding: &HotkeyBinding) -> Result<()> {
@@ -432,6 +566,79 @@ mod platform {
             }
             Err(_) => warn!("hotkey sender lock is poisoned"),
         }
+    }
+
+    fn is_key_down_message(message: u32) -> bool {
+        message == WM_KEYDOWN || message == WM_SYSKEYDOWN
+    }
+
+    fn current_modifier_state() -> HotkeyModifierSet {
+        let mut modifiers = HotkeyModifierSet::new();
+        modifiers.no_repeat = false;
+
+        if key_is_down(0x12) {
+            modifiers.alt = true;
+        }
+        if key_is_down(0x11) {
+            modifiers.control = true;
+        }
+        if key_is_down(0x10) {
+            modifiers.shift = true;
+        }
+        if key_is_down(0x5B) || key_is_down(0x5C) {
+            modifiers.super_key = true;
+        }
+
+        modifiers
+    }
+
+    fn key_is_down(virtual_key: i32) -> bool {
+        // SAFETY: GetAsyncKeyState reads process-global keyboard state for the
+        // supplied documented virtual-key code and does not retain pointers.
+        unsafe { GetAsyncKeyState(virtual_key) < 0 }
+    }
+
+    fn foreground_hotkey_context(options: &HotkeyOverrideOptions) -> Option<HotkeyWindowContext> {
+        // SAFETY: GetForegroundWindow reads the current foreground HWND and does
+        // not require ownership of that window handle.
+        let hwnd = unsafe { GetForegroundWindow() };
+        if hwnd.0.is_null() {
+            return None;
+        }
+
+        let rect = window_rect(hwnd).ok();
+        let executable_path = if options.bypass.needs_process_metadata() {
+            foreground_executable_path(hwnd)
+        } else {
+            None
+        };
+
+        Some(HotkeyWindowContext {
+            class_name: class_name(hwnd).unwrap_or_default(),
+            executable_path,
+            is_fullscreen: rect.is_some_and(rect_matches_monitor),
+        })
+    }
+
+    fn foreground_executable_path(hwnd: HWND) -> Option<String> {
+        let mut process_id = 0;
+        // SAFETY: hwnd is the current foreground window. process_id points to
+        // valid writable storage for the duration of the call.
+        unsafe {
+            GetWindowThreadProcessId(hwnd, Some(&mut process_id));
+        }
+
+        executable_path(process_id)
+    }
+
+    fn rect_matches_monitor(rect: Rect) -> bool {
+        enumerate_monitors()
+            .map(|monitors| {
+                monitors
+                    .iter()
+                    .any(|monitor| rect == monitor.rect || rect == monitor.work_area)
+            })
+            .unwrap_or(false)
     }
 
     fn hotkey_modifiers(modifiers: HotkeyModifierSet) -> HOT_KEY_MODIFIERS {
@@ -751,6 +958,10 @@ mod platform {
         HOTKEY_SENDER.get_or_init(|| Mutex::new(None))
     }
 
+    fn hotkey_override_slot() -> &'static Mutex<Option<HotkeyOverrideState>> {
+        HOTKEY_OVERRIDE.get_or_init(|| Mutex::new(None))
+    }
+
     fn clear_event_sender() {
         match event_sender_slot().lock() {
             Ok(mut guard) => *guard = None,
@@ -762,6 +973,13 @@ mod platform {
         match hotkey_sender_slot().lock() {
             Ok(mut guard) => *guard = None,
             Err(_) => warn!("hotkey sender lock is poisoned while clearing"),
+        }
+    }
+
+    fn clear_hotkey_override() {
+        match hotkey_override_slot().lock() {
+            Ok(mut guard) => *guard = None,
+            Err(_) => warn!("hotkey override lock is poisoned while clearing"),
         }
     }
 
@@ -830,6 +1048,14 @@ mod platform {
         Err(Win32Error::UnsupportedPlatform)
     }
 
+    pub fn install_hotkey_override(
+        _bindings: Vec<HotkeyBinding>,
+        _options: crate::HotkeyOverrideOptions,
+        _sender: Sender<HotkeyEvent>,
+    ) -> Result<HotkeyOverrideRegistration> {
+        Err(Win32Error::UnsupportedPlatform)
+    }
+
     pub fn request_message_loop_stop() -> Result<()> {
         Err(Win32Error::UnsupportedPlatform)
     }
@@ -840,6 +1066,7 @@ mod platform {
 
     pub struct WindowEventSubscription;
     pub struct HotkeyRegistration;
+    pub struct HotkeyOverrideRegistration;
 
     impl HotkeyRegistration {
         pub fn failures(&self) -> &[HotkeyRegistrationFailure] {
@@ -848,6 +1075,7 @@ mod platform {
     }
 }
 
+pub use platform::HotkeyOverrideRegistration;
 pub use platform::HotkeyRegistration;
 pub use platform::WindowEventSubscription;
 pub use platform::enumerate_monitors;
@@ -855,13 +1083,16 @@ pub use platform::enumerate_windows;
 pub use platform::focus_window;
 pub use platform::foreground_window;
 pub use platform::hide_window;
+pub use platform::install_hotkey_override;
 pub use platform::move_resize_window;
 pub use platform::register_hotkeys;
 pub use platform::request_message_loop_stop;
 pub use platform::run_message_loop;
 pub use platform::show_window_without_activate;
 pub use platform::subscribe_window_events;
-use winland_core::WindowHandle;
+use std::time::{Duration, Instant};
+
+use winland_core::{TextMatcher, WindowHandle};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HotkeyBinding {
@@ -869,6 +1100,7 @@ pub struct HotkeyBinding {
     pub modifiers: HotkeyModifierSet,
     pub virtual_key: VirtualKey,
     pub description: String,
+    pub suppress_app: bool,
 }
 
 impl HotkeyBinding {
@@ -883,7 +1115,13 @@ impl HotkeyBinding {
             modifiers,
             virtual_key,
             description: description.into(),
+            suppress_app: false,
         }
+    }
+
+    pub fn with_suppression(mut self, suppress_app: bool) -> Self {
+        self.suppress_app = suppress_app;
+        self
     }
 }
 
@@ -958,12 +1196,179 @@ impl VirtualKey {
         Self(byte as u32)
     }
 
+    pub const ESCAPE: Self = Self(0x1B);
     pub const SPACE: Self = Self(0x20);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HotkeyEvent {
     pub id: HotkeyId,
+}
+
+#[derive(Debug, Clone)]
+pub struct HotkeyOverrideOptions {
+    pub panic_hotkey: HotkeyLowLevelEvent,
+    pub bypass: HotkeyBypassRules,
+    pub latency_budget: Duration,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct HotkeyBypassRules {
+    pub fullscreen: bool,
+    pub class_names: Vec<TextMatcher>,
+    pub executable_paths: Vec<TextMatcher>,
+    pub process_names: Vec<TextMatcher>,
+}
+
+impl HotkeyBypassRules {
+    pub fn needs_process_metadata(&self) -> bool {
+        !self.executable_paths.is_empty() || !self.process_names.is_empty()
+    }
+
+    fn matches(&self, focused: &HotkeyWindowContext) -> bool {
+        if self.fullscreen && focused.is_fullscreen {
+            return true;
+        }
+
+        if self
+            .class_names
+            .iter()
+            .any(|matcher| matcher.matches(&focused.class_name))
+        {
+            return true;
+        }
+
+        if let Some(path) = &focused.executable_path {
+            if self
+                .executable_paths
+                .iter()
+                .any(|matcher| matcher.matches(path))
+            {
+                return true;
+            }
+
+            if let Some(name) = process_name(path)
+                && self
+                    .process_names
+                    .iter()
+                    .any(|matcher| matcher.matches(&name))
+            {
+                return true;
+            }
+        }
+
+        false
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HotkeyLowLevelEvent {
+    pub modifiers: HotkeyModifierSet,
+    pub virtual_key: VirtualKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HotkeyWindowContext {
+    pub class_name: String,
+    pub executable_path: Option<String>,
+    pub is_fullscreen: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HotkeyInterceptionDecision {
+    Dispatch { id: HotkeyId, suppress: bool },
+    PassThrough { reason: &'static str },
+}
+
+pub fn classify_intercepted_hotkey(
+    event: &HotkeyLowLevelEvent,
+    bindings: &[HotkeyBinding],
+    options: &HotkeyOverrideOptions,
+    focused: Option<&HotkeyWindowContext>,
+) -> HotkeyInterceptionDecision {
+    if event.matches(&options.panic_hotkey) {
+        return HotkeyInterceptionDecision::PassThrough {
+            reason: "panic hotkey",
+        };
+    }
+
+    if focused.is_some_and(|window| options.bypass.matches(window)) {
+        return HotkeyInterceptionDecision::PassThrough {
+            reason: "game-safe bypass",
+        };
+    }
+
+    let Some(binding) = bindings
+        .iter()
+        .find(|binding| event.matches_binding(binding))
+    else {
+        return HotkeyInterceptionDecision::PassThrough {
+            reason: "unbound key",
+        };
+    };
+
+    HotkeyInterceptionDecision::Dispatch {
+        id: binding.id,
+        suppress: binding.suppress_app,
+    }
+}
+
+pub fn benchmark_hotkey_decision_path(
+    event: &HotkeyLowLevelEvent,
+    bindings: &[HotkeyBinding],
+    options: &HotkeyOverrideOptions,
+    focused: Option<&HotkeyWindowContext>,
+    iterations: usize,
+) -> HotkeyDecisionBenchmark {
+    let iterations = iterations.max(1);
+    let mut max = Duration::ZERO;
+    let started_all = Instant::now();
+
+    for _ in 0..iterations {
+        let started = Instant::now();
+        let _ = classify_intercepted_hotkey(event, bindings, options, focused);
+        max = max.max(started.elapsed());
+    }
+
+    let total = started_all.elapsed();
+    HotkeyDecisionBenchmark {
+        iterations,
+        total,
+        average: total / iterations as u32,
+        max,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HotkeyDecisionBenchmark {
+    pub iterations: usize,
+    pub total: Duration,
+    pub average: Duration,
+    pub max: Duration,
+}
+
+impl HotkeyLowLevelEvent {
+    fn matches(&self, other: &Self) -> bool {
+        self.virtual_key == other.virtual_key && modifiers_match(self.modifiers, other.modifiers)
+    }
+
+    fn matches_binding(&self, binding: &HotkeyBinding) -> bool {
+        self.virtual_key == binding.virtual_key
+            && modifiers_match(self.modifiers, binding.modifiers)
+    }
+}
+
+fn modifiers_match(actual: HotkeyModifierSet, expected: HotkeyModifierSet) -> bool {
+    actual.alt == expected.alt
+        && actual.control == expected.control
+        && actual.shift == expected.shift
+        && actual.super_key == expected.super_key
+}
+
+fn process_name(path: &str) -> Option<String> {
+    std::path::Path::new(path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1009,6 +1414,10 @@ pub enum Win32Error {
     HotkeysAlreadyRegistered,
     #[error("hotkeys are not registered")]
     HotkeysNotRegistered,
+    #[error("hotkey override hook is already installed")]
+    HotkeyOverrideAlreadyInstalled,
+    #[error("hotkey override hook state lock is poisoned")]
+    HotkeyOverrideLockPoisoned,
     #[cfg(windows)]
     #[error("failed to register hotkey {id} ({description}): {source}")]
     HotkeyRegistration {
@@ -1033,6 +1442,128 @@ impl Win32Error {
         Self::Windows {
             context,
             source: windows::core::Error::from_win32(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn override_decision_dispatches_and_suppresses_matching_binding() {
+        let binding = HotkeyBinding::new(
+            HotkeyId(7),
+            HotkeyModifierSet::new().control().alt(),
+            VirtualKey::ascii_uppercase(b'H'),
+            "focus-left",
+        )
+        .with_suppression(true);
+        let options = test_options();
+        let event = HotkeyLowLevelEvent {
+            modifiers: HotkeyModifierSet::new().control().alt(),
+            virtual_key: VirtualKey::ascii_uppercase(b'H'),
+        };
+
+        assert_eq!(
+            classify_intercepted_hotkey(&event, &[binding], &options, None),
+            HotkeyInterceptionDecision::Dispatch {
+                id: HotkeyId(7),
+                suppress: true,
+            }
+        );
+    }
+
+    #[test]
+    fn override_decision_never_dispatches_panic_hotkey() {
+        let binding = HotkeyBinding::new(
+            HotkeyId(1),
+            HotkeyModifierSet::new().control().alt().shift(),
+            VirtualKey::ESCAPE,
+            "quit",
+        )
+        .with_suppression(true);
+        let options = test_options();
+
+        assert_eq!(
+            classify_intercepted_hotkey(&options.panic_hotkey, &[binding], &options, None),
+            HotkeyInterceptionDecision::PassThrough {
+                reason: "panic hotkey",
+            }
+        );
+    }
+
+    #[test]
+    fn override_decision_bypasses_fullscreen_and_configured_games() {
+        let binding = HotkeyBinding::new(
+            HotkeyId(1),
+            HotkeyModifierSet::new().control().alt(),
+            VirtualKey::ascii_uppercase(b'H'),
+            "focus-left",
+        )
+        .with_suppression(true);
+        let event = HotkeyLowLevelEvent {
+            modifiers: HotkeyModifierSet::new().control().alt(),
+            virtual_key: VirtualKey::ascii_uppercase(b'H'),
+        };
+        let mut options = test_options();
+        options.bypass.process_names = vec![TextMatcher::Exact("game.exe".to_owned())];
+
+        let fullscreen = HotkeyWindowContext {
+            class_name: "GameWindow".to_owned(),
+            executable_path: Some(r"C:\Games\other.exe".to_owned()),
+            is_fullscreen: true,
+        };
+        let configured_game = HotkeyWindowContext {
+            class_name: "Window".to_owned(),
+            executable_path: Some(r"C:\Games\game.exe".to_owned()),
+            is_fullscreen: false,
+        };
+
+        assert_eq!(
+            classify_intercepted_hotkey(
+                &event,
+                std::slice::from_ref(&binding),
+                &options,
+                Some(&fullscreen)
+            ),
+            HotkeyInterceptionDecision::PassThrough {
+                reason: "game-safe bypass",
+            }
+        );
+        assert_eq!(
+            classify_intercepted_hotkey(&event, &[binding], &options, Some(&configured_game)),
+            HotkeyInterceptionDecision::PassThrough {
+                reason: "game-safe bypass",
+            }
+        );
+    }
+
+    #[test]
+    fn hotkey_decision_benchmark_records_iterations() {
+        let options = test_options();
+        let event = HotkeyLowLevelEvent {
+            modifiers: HotkeyModifierSet::new(),
+            virtual_key: VirtualKey::SPACE,
+        };
+
+        let benchmark = benchmark_hotkey_decision_path(&event, &[], &options, None, 8);
+
+        assert_eq!(benchmark.iterations, 8);
+        assert!(benchmark.total >= benchmark.average);
+    }
+
+    fn test_options() -> HotkeyOverrideOptions {
+        HotkeyOverrideOptions {
+            panic_hotkey: HotkeyLowLevelEvent {
+                modifiers: HotkeyModifierSet::new().control().alt().shift(),
+                virtual_key: VirtualKey::ESCAPE,
+            },
+            bypass: HotkeyBypassRules {
+                fullscreen: true,
+                ..HotkeyBypassRules::default()
+            },
+            latency_budget: Duration::from_micros(250),
         }
     }
 }

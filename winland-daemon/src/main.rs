@@ -6,15 +6,15 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
-use winland_config::{Config, HotkeyKey, HotkeyModifier};
+use winland_config::{Config, HotkeyKey, HotkeyMode, HotkeyModifier, TextMatcherConfig};
 use winland_core::{
     LayoutConfig, MonitorInfo, Rect, TileAssignment, WindowHandle, WindowInfo, WindowParticipation,
     WindowRule, WindowRuleDecision, WorkspaceId, WorkspaceManager, WorkspaceVisibilityChange,
     evaluate_window_rules, tile_windows_with_config,
 };
 use winland_win32::{
-    HotkeyBinding, HotkeyEvent, HotkeyId, HotkeyModifierSet, VirtualKey, WindowEvent,
-    WindowEventKind,
+    HotkeyBinding, HotkeyBypassRules, HotkeyEvent, HotkeyId, HotkeyLowLevelEvent,
+    HotkeyModifierSet, HotkeyOverrideOptions, VirtualKey, WindowEvent, WindowEventKind,
 };
 
 const RECONCILE_DEBOUNCE: Duration = Duration::from_millis(50);
@@ -34,10 +34,15 @@ fn main() -> Result<()> {
 
     let (hotkey_sender, hotkey_receiver) = mpsc::channel();
     let (hotkey_bindings, hotkey_commands) = hotkey_bindings_from_config(&loaded_config.config)?;
-    let hotkey_registration =
-        winland_win32::register_hotkeys(hotkey_bindings.clone(), hotkey_sender)
-            .context("register documented Win32 daemon hotkeys")?;
-    log_hotkey_registration(&hotkey_bindings, &hotkey_registration);
+    let hotkey_backend = install_hotkey_backend(
+        &loaded_config.config,
+        hotkey_bindings.clone(),
+        hotkey_sender,
+    )?;
+    debug!(
+        backend = hotkey_backend.name(),
+        "installed daemon hotkey backend"
+    );
     let hotkey_bridge = spawn_hotkey_bridge(hotkey_receiver, daemon_sender.clone())
         .context("spawn hotkey bridge")?;
     drop(daemon_sender);
@@ -54,7 +59,7 @@ fn main() -> Result<()> {
     let message_loop_result =
         winland_win32::run_message_loop().context("run Win32 daemon message loop");
 
-    drop(hotkey_registration);
+    drop(hotkey_backend);
     drop(subscription);
     join_bridge(window_bridge, "window event bridge")?;
     join_bridge(hotkey_bridge, "hotkey bridge")?;
@@ -1103,6 +1108,52 @@ impl HotkeyCommandMap {
     }
 }
 
+enum HotkeyBackend {
+    Registered {
+        _registration: winland_win32::HotkeyRegistration,
+    },
+    Override {
+        _registration: winland_win32::HotkeyOverrideRegistration,
+    },
+}
+
+impl HotkeyBackend {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Registered { .. } => "register-hotkey",
+            Self::Override { .. } => "advanced-interception",
+        }
+    }
+}
+
+fn install_hotkey_backend(
+    config: &Config,
+    hotkey_bindings: Vec<HotkeyBinding>,
+    hotkey_sender: Sender<HotkeyEvent>,
+) -> Result<HotkeyBackend> {
+    match config.hotkeys.mode {
+        HotkeyMode::Normal => {
+            let registration =
+                winland_win32::register_hotkeys(hotkey_bindings.clone(), hotkey_sender)
+                    .context("register documented Win32 daemon hotkeys")?;
+            log_hotkey_registration(&hotkey_bindings, &registration);
+            Ok(HotkeyBackend::Registered {
+                _registration: registration,
+            })
+        }
+        HotkeyMode::AdvancedInterception => {
+            let options = hotkey_override_options_from_config(config)?;
+            log_hotkey_override_bindings(&hotkey_bindings, &options);
+            let registration =
+                winland_win32::install_hotkey_override(hotkey_bindings, options, hotkey_sender)
+                    .context("install documented low-level keyboard hook for hotkey override")?;
+            Ok(HotkeyBackend::Override {
+                _registration: registration,
+            })
+        }
+    }
+}
+
 fn hotkey_bindings_from_config(config: &Config) -> Result<(Vec<HotkeyBinding>, HotkeyCommandMap)> {
     let mut bindings = Vec::with_capacity(config.hotkeys.bindings.len());
     let mut commands = BTreeMap::new();
@@ -1114,16 +1165,51 @@ fn hotkey_bindings_from_config(config: &Config) -> Result<(Vec<HotkeyBinding>, H
         let chord = binding_config
             .chord()
             .with_context(|| format!("parse hotkey '{}'", binding_config.keys))?;
-        bindings.push(HotkeyBinding::new(
-            id,
-            hotkey_modifiers_from_config(&chord),
-            virtual_key_from_config(&chord.key),
-            binding_config.command.clone(),
-        ));
+        bindings.push(
+            HotkeyBinding::new(
+                id,
+                hotkey_modifiers_from_config(&chord),
+                virtual_key_from_config(&chord.key),
+                binding_config.command.clone(),
+            )
+            .with_suppression(
+                config.hotkeys.mode == HotkeyMode::AdvancedInterception
+                    && binding_config.override_app,
+            ),
+        );
         commands.insert(id, command);
     }
 
     Ok((bindings, HotkeyCommandMap { commands }))
+}
+
+fn hotkey_override_options_from_config(config: &Config) -> Result<HotkeyOverrideOptions> {
+    let panic_chord = winland_config::parse_hotkey_chord(&config.hotkeys.panic_hotkey)
+        .with_context(|| format!("parse panic hotkey '{}'", config.hotkeys.panic_hotkey))?;
+
+    Ok(HotkeyOverrideOptions {
+        panic_hotkey: HotkeyLowLevelEvent {
+            modifiers: hotkey_modifiers_from_config(&panic_chord),
+            virtual_key: virtual_key_from_config(&panic_chord.key),
+        },
+        bypass: HotkeyBypassRules {
+            fullscreen: config.hotkeys.bypass.fullscreen,
+            class_names: text_matchers_from_config(&config.hotkeys.bypass.class)?,
+            executable_paths: text_matchers_from_config(&config.hotkeys.bypass.executable_path)?,
+            process_names: text_matchers_from_config(&config.hotkeys.bypass.process_name)?,
+        },
+        latency_budget: Duration::from_micros(config.hotkeys.override_latency_budget_micros),
+    })
+}
+
+fn text_matchers_from_config(
+    matchers: &[TextMatcherConfig],
+) -> Result<Vec<winland_core::TextMatcher>> {
+    matchers
+        .iter()
+        .map(TextMatcherConfig::to_core)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("convert hotkey bypass matcher")
 }
 
 fn daemon_command_from_name(command: &str) -> Option<DaemonCommand> {
@@ -1176,6 +1262,7 @@ fn hotkey_modifiers_from_config(chord: &winland_config::HotkeyChord) -> HotkeyMo
 fn virtual_key_from_config(key: &HotkeyKey) -> VirtualKey {
     match key {
         HotkeyKey::Character(ch) => VirtualKey::ascii_uppercase(*ch as u8),
+        HotkeyKey::Escape => VirtualKey::ESCAPE,
         HotkeyKey::Space => VirtualKey::SPACE,
     }
 }
@@ -1212,6 +1299,36 @@ fn log_hotkey_registration(
     }
 }
 
+fn log_hotkey_override_bindings(bindings: &[HotkeyBinding], options: &HotkeyOverrideOptions) {
+    info!(
+        binding_count = bindings.len(),
+        suppressing_bindings = bindings
+            .iter()
+            .filter(|binding| binding.suppress_app)
+            .count(),
+        latency_budget_micros = options.latency_budget.as_micros(),
+        fullscreen_bypass = options.bypass.fullscreen,
+        class_bypass_rules = options.bypass.class_names.len(),
+        executable_path_bypass_rules = options.bypass.executable_paths.len(),
+        process_name_bypass_rules = options.bypass.process_names.len(),
+        "installing opt-in hotkey override mode"
+    );
+
+    for binding in bindings {
+        info!(
+            hotkey = %hotkey_label(binding),
+            description = %binding.description,
+            suppress_app = binding.suppress_app,
+            "configured intercepted daemon hotkey"
+        );
+    }
+
+    info!(
+        hotkey = %hotkey_low_level_label(&options.panic_hotkey),
+        "panic hotkey will always pass through without interception"
+    );
+}
+
 fn hotkey_label(binding: &HotkeyBinding) -> String {
     let mut parts = Vec::new();
     if binding.modifiers.super_key {
@@ -1231,8 +1348,20 @@ fn hotkey_label(binding: &HotkeyBinding) -> String {
     parts.join("+")
 }
 
+fn hotkey_low_level_label(event: &HotkeyLowLevelEvent) -> String {
+    let binding = HotkeyBinding::new(
+        HotkeyId(0),
+        event.modifiers,
+        event.virtual_key,
+        "panic hotkey",
+    );
+    hotkey_label(&binding)
+}
+
 fn virtual_key_label(key: VirtualKey) -> String {
-    if key.0 == 0x20 {
+    if key == VirtualKey::ESCAPE {
+        "Escape".to_owned()
+    } else if key.0 == 0x20 {
         "Space".to_owned()
     } else if (b'0' as u32..=b'9' as u32).contains(&key.0)
         || (b'A' as u32..=b'Z' as u32).contains(&key.0)

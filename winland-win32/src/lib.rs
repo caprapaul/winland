@@ -1330,6 +1330,7 @@ pub use shell::USER_WINLOGON_KEY;
 pub use shell::elevated_daemon_task_installed;
 pub use shell::install_elevated_daemon_task;
 pub use shell::install_shell_replacement;
+pub use shell::launch_app;
 pub use shell::launch_elevated_process_and_wait;
 pub use shell::launch_explorer;
 pub use shell::launch_shell_test;
@@ -1450,6 +1451,10 @@ impl VirtualKey {
         Self(byte as u32)
     }
 
+    pub const ARROW_LEFT: Self = Self(0x25);
+    pub const ARROW_UP: Self = Self(0x26);
+    pub const ARROW_RIGHT: Self = Self(0x27);
+    pub const ARROW_DOWN: Self = Self(0x28);
     pub const ESCAPE: Self = Self(0x1B);
     pub const SPACE: Self = Self(0x20);
 }

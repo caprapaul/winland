@@ -93,7 +93,7 @@ pub struct HotkeysConfig {
 impl Default for HotkeysConfig {
     fn default() -> Self {
         Self {
-            mode: HotkeyMode::Normal,
+            mode: HotkeyMode::AdvancedInterception,
             panic_hotkey: "Ctrl+Alt+Shift+P".to_owned(),
             override_latency_budget_micros: 250,
             bypass: HotkeyBypassConfig::default(),
@@ -134,7 +134,8 @@ impl Default for HotkeyBypassConfig {
 #[serde(deny_unknown_fields)]
 pub struct HotkeyBindingConfig {
     pub keys: String,
-    pub command: String,
+    pub command: Option<String>,
+    pub launch: Option<String>,
     #[serde(default)]
     pub override_app: bool,
 }
@@ -439,6 +440,10 @@ pub enum HotkeyModifier {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum HotkeyKey {
     Character(char),
+    ArrowLeft,
+    ArrowDown,
+    ArrowUp,
+    ArrowRight,
     Escape,
     Space,
 }
@@ -588,6 +593,10 @@ pub fn parse_hotkey_chord(input: &str) -> Result<HotkeyChord, ConfigError> {
 
 fn parse_hotkey_key(input: &str) -> Result<HotkeyKey, ConfigError> {
     match input.to_ascii_lowercase().as_str() {
+        "left" | "arrowleft" | "leftarrow" => Ok(HotkeyKey::ArrowLeft),
+        "down" | "arrowdown" | "downarrow" => Ok(HotkeyKey::ArrowDown),
+        "up" | "arrowup" | "uparrow" => Ok(HotkeyKey::ArrowUp),
+        "right" | "arrowright" | "rightarrow" => Ok(HotkeyKey::ArrowRight),
         "esc" | "escape" => Ok(HotkeyKey::Escape),
         "space" => Ok(HotkeyKey::Space),
         _ => {
@@ -776,12 +785,39 @@ fn validate_hotkeys(hotkeys: &HotkeysConfig, workspace_count: u16, errors: &mut 
             Err(error) => errors.push(format!("hotkeys.bindings[{index}].keys: {error}")),
         }
 
+        validate_hotkey_binding_action(binding, index, workspace_count, errors);
+    }
+}
+
+fn validate_hotkey_binding_action(
+    binding: &HotkeyBindingConfig,
+    index: usize,
+    workspace_count: u16,
+    errors: &mut Vec<String>,
+) {
+    let action_count =
+        usize::from(binding.command.is_some()) + usize::from(binding.launch.is_some());
+    if action_count != 1 {
+        errors.push(format!(
+            "hotkeys.bindings[{index}] must set exactly one of command or launch"
+        ));
+    }
+
+    if let Some(command) = &binding.command {
         validate_command(
             &format!("hotkeys.bindings[{index}].command"),
-            &binding.command,
+            command,
             workspace_count,
             errors,
         );
+    }
+
+    if let Some(launch) = &binding.launch
+        && launch.trim().is_empty()
+    {
+        errors.push(format!(
+            "hotkeys.bindings[{index}].launch must not be empty"
+        ));
     }
 }
 
@@ -908,45 +944,56 @@ fn validate_workspace_key(context: &str, value: &str, errors: &mut Vec<String>) 
 }
 
 fn default_hotkey_bindings() -> Vec<HotkeyBindingConfig> {
-    [
-        ("Ctrl+Alt+H", "focus-left"),
-        ("Ctrl+Alt+J", "focus-down"),
-        ("Ctrl+Alt+K", "focus-up"),
-        ("Ctrl+Alt+L", "focus-right"),
-        ("Ctrl+Alt+Shift+H", "swap-left"),
-        ("Ctrl+Alt+Shift+J", "swap-down"),
-        ("Ctrl+Alt+Shift+K", "swap-up"),
-        ("Ctrl+Alt+Shift+L", "swap-right"),
-        ("Ctrl+Alt+R", "retile"),
-        ("Ctrl+Alt+Space", "toggle-float"),
-        ("Ctrl+Alt+C", "reload"),
-        ("Ctrl+Alt+Q", "quit"),
-        ("Ctrl+Alt+1", "switch-workspace-1"),
-        ("Ctrl+Alt+2", "switch-workspace-2"),
-        ("Ctrl+Alt+3", "switch-workspace-3"),
-        ("Ctrl+Alt+4", "switch-workspace-4"),
-        ("Ctrl+Alt+5", "switch-workspace-5"),
-        ("Ctrl+Alt+6", "switch-workspace-6"),
-        ("Ctrl+Alt+7", "switch-workspace-7"),
-        ("Ctrl+Alt+8", "switch-workspace-8"),
-        ("Ctrl+Alt+9", "switch-workspace-9"),
-        ("Ctrl+Alt+Shift+1", "move-to-workspace-1"),
-        ("Ctrl+Alt+Shift+2", "move-to-workspace-2"),
-        ("Ctrl+Alt+Shift+3", "move-to-workspace-3"),
-        ("Ctrl+Alt+Shift+4", "move-to-workspace-4"),
-        ("Ctrl+Alt+Shift+5", "move-to-workspace-5"),
-        ("Ctrl+Alt+Shift+6", "move-to-workspace-6"),
-        ("Ctrl+Alt+Shift+7", "move-to-workspace-7"),
-        ("Ctrl+Alt+Shift+8", "move-to-workspace-8"),
-        ("Ctrl+Alt+Shift+9", "move-to-workspace-9"),
-    ]
-    .into_iter()
-    .map(|(keys, command)| HotkeyBindingConfig {
-        keys: keys.to_owned(),
-        command: command.to_owned(),
-        override_app: false,
-    })
-    .collect()
+    let mut bindings = vec![HotkeyBindingConfig {
+        keys: "Win+T".to_owned(),
+        command: None,
+        launch: Some("wt.exe".to_owned()),
+        override_app: true,
+    }];
+
+    bindings.extend(
+        [
+            ("Win+Left", "focus-left"),
+            ("Win+Down", "focus-down"),
+            ("Win+Up", "focus-up"),
+            ("Win+Right", "focus-right"),
+            ("Win+Shift+Left", "swap-left"),
+            ("Win+Shift+Down", "swap-down"),
+            ("Win+Shift+Up", "swap-up"),
+            ("Win+Shift+Right", "swap-right"),
+            ("Win+R", "retile"),
+            ("Win+F", "toggle-float"),
+            ("Win+C", "reload"),
+            ("Win+Q", "quit"),
+            ("Win+1", "switch-workspace-1"),
+            ("Win+2", "switch-workspace-2"),
+            ("Win+3", "switch-workspace-3"),
+            ("Win+4", "switch-workspace-4"),
+            ("Win+5", "switch-workspace-5"),
+            ("Win+6", "switch-workspace-6"),
+            ("Win+7", "switch-workspace-7"),
+            ("Win+8", "switch-workspace-8"),
+            ("Win+9", "switch-workspace-9"),
+            ("Win+Shift+1", "move-to-workspace-1"),
+            ("Win+Shift+2", "move-to-workspace-2"),
+            ("Win+Shift+3", "move-to-workspace-3"),
+            ("Win+Shift+4", "move-to-workspace-4"),
+            ("Win+Shift+5", "move-to-workspace-5"),
+            ("Win+Shift+6", "move-to-workspace-6"),
+            ("Win+Shift+7", "move-to-workspace-7"),
+            ("Win+Shift+8", "move-to-workspace-8"),
+            ("Win+Shift+9", "move-to-workspace-9"),
+        ]
+        .into_iter()
+        .map(|(keys, command)| HotkeyBindingConfig {
+            keys: keys.to_owned(),
+            command: Some(command.to_owned()),
+            launch: None,
+            override_app: true,
+        }),
+    );
+
+    bindings
 }
 
 #[cfg(test)]
@@ -963,11 +1010,20 @@ mod tests {
         assert_eq!(config.general.log_level, "info");
         assert_eq!(config.workspace_count(), 9);
         assert_eq!(config.layout_config().master_ratio_percent, 50);
-        assert_eq!(config.hotkeys.mode, HotkeyMode::Normal);
+        assert_eq!(config.hotkeys.mode, HotkeyMode::AdvancedInterception);
         assert_eq!(config.hotkeys.panic_hotkey, "Ctrl+Alt+Shift+P");
         assert_eq!(config.hotkeys.override_latency_budget_micros, 250);
         assert!(config.hotkeys.bypass.fullscreen);
-        assert_eq!(config.hotkeys.bindings.len(), 30);
+        assert_eq!(config.hotkeys.bindings.len(), 31);
+        assert_eq!(config.hotkeys.bindings[0].keys, "Win+T");
+        assert_eq!(config.hotkeys.bindings[0].launch.as_deref(), Some("wt.exe"));
+        assert!(config.hotkeys.bindings[0].override_app);
+        assert_eq!(config.hotkeys.bindings[1].keys, "Win+Left");
+        assert_eq!(
+            config.hotkeys.bindings[1].command.as_deref(),
+            Some("focus-left")
+        );
+        assert!(config.hotkeys.bindings[1].override_app);
         assert!(config.behavior.startup_retile);
         assert!(config.behavior.dynamic_retile);
         assert!(config.behavior.drag_to_float);
@@ -989,6 +1045,7 @@ mod tests {
             bypass = { fullscreen = true, process_name = ["game.exe"] }
             bindings = [
               { keys = "Ctrl+Alt+R", command = "retile", override_app = true },
+              { keys = "Win+T", launch = "wt.exe" },
               { keys = "Ctrl+Alt+1", command = "switch-workspace-1" },
             ]
 
@@ -1024,6 +1081,7 @@ mod tests {
         assert_eq!(config.general.log_level, "debug");
         assert_eq!(config.hotkeys.mode, HotkeyMode::AdvancedInterception);
         assert!(config.hotkeys.bindings[0].override_app);
+        assert_eq!(config.hotkeys.bindings[1].launch.as_deref(), Some("wt.exe"));
         assert_eq!(config.hotkeys.override_latency_budget_micros, 300);
         assert_eq!(config.hotkeys.bypass.process_name.len(), 1);
         assert_eq!(config.layout_config().gap, 8);
@@ -1106,6 +1164,29 @@ mod tests {
                 .to_string()
                 .contains("protected Windows shortcut and cannot be overridden")
         );
+    }
+
+    #[test]
+    fn hotkey_binding_must_choose_command_or_launch() {
+        let error = parse_toml(
+            r#"
+            [hotkeys]
+            bindings = [
+              { keys = "Win+T", command = "retile", launch = "wt.exe" },
+              { keys = "Win+Y" },
+              { keys = "Win+U", launch = "" },
+            ]
+            "#,
+        )
+        .unwrap_err();
+
+        let ConfigError::Validation(errors) = error else {
+            panic!("expected validation errors");
+        };
+        let output = errors.to_string();
+
+        assert!(output.contains("must set exactly one of command or launch"));
+        assert!(output.contains("hotkeys.bindings[2].launch must not be empty"));
     }
 
     #[test]

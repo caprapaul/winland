@@ -33,10 +33,9 @@ window_rules = []
 log_level = "info"
 
 [hotkeys]
-# Normal mode uses documented RegisterHotKey registration and remains the default.
-# Advanced interception installs an opt-in WH_KEYBOARD_LL hook for conflicts that
-# ordinary global hotkeys cannot claim.
-mode = "normal"
+# Advanced interception is the custom-shell default because Win-key shortcuts
+# such as Win+Arrow are usually owned by Windows in normal RegisterHotKey mode.
+mode = "advanced-interception"
 
 # In advanced-interception mode, this hotkey is never intercepted. Keep it as a
 # recovery path if a suppressing binding is bad.
@@ -56,37 +55,40 @@ bypass = { fullscreen = true, class = [], executable_path = [], process_name = [
 # swap-left, swap-down, swap-up, swap-right
 # retile, toggle-float, reload, quit
 # switch-workspace-N, move-to-workspace-N
+# Bindings may set either command = "..." for Winland actions or launch = "..."
+# for an app command line.
 bindings = [
-  { keys = "Ctrl+Alt+H", command = "focus-left" },
-  { keys = "Ctrl+Alt+J", command = "focus-down" },
-  { keys = "Ctrl+Alt+K", command = "focus-up" },
-  { keys = "Ctrl+Alt+L", command = "focus-right" },
-  { keys = "Ctrl+Alt+Shift+H", command = "swap-left" },
-  { keys = "Ctrl+Alt+Shift+J", command = "swap-down" },
-  { keys = "Ctrl+Alt+Shift+K", command = "swap-up" },
-  { keys = "Ctrl+Alt+Shift+L", command = "swap-right" },
-  { keys = "Ctrl+Alt+R", command = "retile" },
-  { keys = "Ctrl+Alt+Space", command = "toggle-float" },
-  { keys = "Ctrl+Alt+C", command = "reload" },
-  { keys = "Ctrl+Alt+Q", command = "quit" },
-  { keys = "Ctrl+Alt+1", command = "switch-workspace-1" },
-  { keys = "Ctrl+Alt+2", command = "switch-workspace-2" },
-  { keys = "Ctrl+Alt+3", command = "switch-workspace-3" },
-  { keys = "Ctrl+Alt+4", command = "switch-workspace-4" },
-  { keys = "Ctrl+Alt+5", command = "switch-workspace-5" },
-  { keys = "Ctrl+Alt+6", command = "switch-workspace-6" },
-  { keys = "Ctrl+Alt+7", command = "switch-workspace-7" },
-  { keys = "Ctrl+Alt+8", command = "switch-workspace-8" },
-  { keys = "Ctrl+Alt+9", command = "switch-workspace-9" },
-  { keys = "Ctrl+Alt+Shift+1", command = "move-to-workspace-1" },
-  { keys = "Ctrl+Alt+Shift+2", command = "move-to-workspace-2" },
-  { keys = "Ctrl+Alt+Shift+3", command = "move-to-workspace-3" },
-  { keys = "Ctrl+Alt+Shift+4", command = "move-to-workspace-4" },
-  { keys = "Ctrl+Alt+Shift+5", command = "move-to-workspace-5" },
-  { keys = "Ctrl+Alt+Shift+6", command = "move-to-workspace-6" },
-  { keys = "Ctrl+Alt+Shift+7", command = "move-to-workspace-7" },
-  { keys = "Ctrl+Alt+Shift+8", command = "move-to-workspace-8" },
-  { keys = "Ctrl+Alt+Shift+9", command = "move-to-workspace-9" },
+  { keys = "Win+T", launch = "wt.exe", override_app = true },
+  { keys = "Win+Left", command = "focus-left", override_app = true },
+  { keys = "Win+Down", command = "focus-down", override_app = true },
+  { keys = "Win+Up", command = "focus-up", override_app = true },
+  { keys = "Win+Right", command = "focus-right", override_app = true },
+  { keys = "Win+Shift+Left", command = "swap-left", override_app = true },
+  { keys = "Win+Shift+Down", command = "swap-down", override_app = true },
+  { keys = "Win+Shift+Up", command = "swap-up", override_app = true },
+  { keys = "Win+Shift+Right", command = "swap-right", override_app = true },
+  { keys = "Win+R", command = "retile", override_app = true },
+  { keys = "Win+F", command = "toggle-float", override_app = true },
+  { keys = "Win+C", command = "reload", override_app = true },
+  { keys = "Win+Q", command = "quit", override_app = true },
+  { keys = "Win+1", command = "switch-workspace-1", override_app = true },
+  { keys = "Win+2", command = "switch-workspace-2", override_app = true },
+  { keys = "Win+3", command = "switch-workspace-3", override_app = true },
+  { keys = "Win+4", command = "switch-workspace-4", override_app = true },
+  { keys = "Win+5", command = "switch-workspace-5", override_app = true },
+  { keys = "Win+6", command = "switch-workspace-6", override_app = true },
+  { keys = "Win+7", command = "switch-workspace-7", override_app = true },
+  { keys = "Win+8", command = "switch-workspace-8", override_app = true },
+  { keys = "Win+9", command = "switch-workspace-9", override_app = true },
+  { keys = "Win+Shift+1", command = "move-to-workspace-1", override_app = true },
+  { keys = "Win+Shift+2", command = "move-to-workspace-2", override_app = true },
+  { keys = "Win+Shift+3", command = "move-to-workspace-3", override_app = true },
+  { keys = "Win+Shift+4", command = "move-to-workspace-4", override_app = true },
+  { keys = "Win+Shift+5", command = "move-to-workspace-5", override_app = true },
+  { keys = "Win+Shift+6", command = "move-to-workspace-6", override_app = true },
+  { keys = "Win+Shift+7", command = "move-to-workspace-7", override_app = true },
+  { keys = "Win+Shift+8", command = "move-to-workspace-8", override_app = true },
+  { keys = "Win+Shift+9", command = "move-to-workspace-9", override_app = true },
 ]
 
 # Example alternate binding:
@@ -94,6 +96,7 @@ bindings = [
 #   { keys = "Win+H", command = "focus-left", override_app = true },
 #   { keys = "Win+Shift+H", command = "swap-left" },
 #   { keys = "Win+R", command = "retile" },
+#   { keys = "Win+T", launch = "wt.exe" },
 # ]
 
 [layout]

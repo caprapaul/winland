@@ -148,6 +148,15 @@ mod platform {
         launch_process("explorer.exe")
     }
 
+    pub fn launch_app(command_line: &str) -> Result<()> {
+        let command_line = command_line.trim();
+        if command_line.is_empty() {
+            return Err(Win32Error::InvalidShellCommand);
+        }
+
+        launch_process(command_line)
+    }
+
     pub fn launch_shell_test(shell_command: &str) -> Result<()> {
         let shell_command = shell_command.trim();
         if shell_command.is_empty() {
@@ -678,6 +687,10 @@ mod platform {
         Err(Win32Error::UnsupportedPlatform)
     }
 
+    pub fn launch_app(_command_line: &str) -> Result<()> {
+        Err(Win32Error::UnsupportedPlatform)
+    }
+
     pub fn launch_shell_test(_shell_command: &str) -> Result<()> {
         Err(Win32Error::UnsupportedPlatform)
     }
@@ -763,6 +776,7 @@ pub use platform::USER_WINLOGON_KEY;
 pub use platform::elevated_daemon_task_installed;
 pub use platform::install_elevated_daemon_task;
 pub use platform::install_shell_replacement;
+pub use platform::launch_app;
 pub use platform::launch_elevated_process_and_wait;
 pub use platform::launch_explorer;
 pub use platform::launch_shell_test;

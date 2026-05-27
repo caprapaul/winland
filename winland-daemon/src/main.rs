@@ -6,7 +6,9 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
-use winland_config::{Config, HotkeyKey, HotkeyMode, HotkeyModifier, TextMatcherConfig};
+use winland_config::{
+    Config, HotkeyBindingConfig, HotkeyKey, HotkeyMode, HotkeyModifier, TextMatcherConfig,
+};
 use winland_core::{
     LayoutConfig, MonitorInfo, Rect, TileAssignment, WindowHandle, WindowInfo, WindowParticipation,
     WindowRule, WindowRuleDecision, WorkspaceId, WorkspaceManager, WorkspaceVisibilityChange,
@@ -388,6 +390,12 @@ impl DaemonState {
     }
 
     fn execute_command(&mut self, command: DaemonCommand) -> Result<()> {
+        if let DaemonCommand::Launch(command_line) = &command {
+            winland_win32::launch_app(command_line)
+                .with_context(|| format!("launch app from hotkey '{command_line}'"))?;
+            return Ok(());
+        }
+
         if command == DaemonCommand::Reload {
             let loaded_config =
                 winland_config::load_or_default(None).context("reload Winland config")?;
@@ -520,6 +528,7 @@ impl DaemonState {
                 reload: true,
                 ..CommandPlan::default()
             },
+            DaemonCommand::Launch(_) => CommandPlan::default(),
         }
     }
 
@@ -1114,7 +1123,7 @@ struct SnapshotDiff {
     foreground_changed: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum DaemonCommand {
     Focus(FocusDirection),
     Swap(FocusDirection),
@@ -1124,10 +1133,11 @@ enum DaemonCommand {
     MoveFocusedToWorkspace(WorkspaceId),
     Reload,
     Quit,
+    Launch(String),
 }
 
 impl DaemonCommand {
-    fn needs_layout(self) -> bool {
+    fn needs_layout(&self) -> bool {
         matches!(
             self,
             Self::Swap(_)
@@ -1174,7 +1184,7 @@ struct HotkeyCommandMap {
 
 impl HotkeyCommandMap {
     fn command(&self, id: HotkeyId) -> Option<DaemonCommand> {
-        self.commands.get(&id).copied()
+        self.commands.get(&id).cloned()
     }
 }
 
@@ -1230,8 +1240,8 @@ fn hotkey_bindings_from_config(config: &Config) -> Result<(Vec<HotkeyBinding>, H
 
     for (index, binding_config) in config.hotkeys.bindings.iter().enumerate() {
         let id = HotkeyId((index + 1) as i32);
-        let command = daemon_command_from_name(&binding_config.command)
-            .with_context(|| format!("map hotkey command '{}'", binding_config.command))?;
+        let (command, description) = daemon_command_from_binding(binding_config)
+            .with_context(|| format!("map hotkey binding '{}'", binding_config.keys))?;
         let chord = binding_config
             .chord()
             .with_context(|| format!("parse hotkey '{}'", binding_config.keys))?;
@@ -1240,7 +1250,7 @@ fn hotkey_bindings_from_config(config: &Config) -> Result<(Vec<HotkeyBinding>, H
                 id,
                 hotkey_modifiers_from_config(&chord),
                 virtual_key_from_config(&chord.key),
-                binding_config.command.clone(),
+                description,
             )
             .with_suppression(
                 config.hotkeys.mode == HotkeyMode::AdvancedInterception
@@ -1251,6 +1261,29 @@ fn hotkey_bindings_from_config(config: &Config) -> Result<(Vec<HotkeyBinding>, H
     }
 
     Ok((bindings, HotkeyCommandMap { commands }))
+}
+
+fn daemon_command_from_binding(binding: &HotkeyBindingConfig) -> Result<(DaemonCommand, String)> {
+    if let Some(command) = binding.command.as_deref() {
+        let command = command.trim();
+        let daemon_command = daemon_command_from_name(command)
+            .with_context(|| format!("map hotkey command '{command}'"))?;
+        return Ok((daemon_command, command.to_owned()));
+    }
+
+    if let Some(command_line) = binding.launch.as_deref() {
+        let command_line = command_line.trim();
+        if command_line.is_empty() {
+            return Err(anyhow!("launch command line must not be empty"));
+        }
+
+        return Ok((
+            DaemonCommand::Launch(command_line.to_owned()),
+            format!("launch {command_line}"),
+        ));
+    }
+
+    Err(anyhow!("hotkey binding must set command or launch"))
 }
 
 fn hotkey_override_options_from_config(config: &Config) -> Result<HotkeyOverrideOptions> {
@@ -1332,6 +1365,10 @@ fn hotkey_modifiers_from_config(chord: &winland_config::HotkeyChord) -> HotkeyMo
 fn virtual_key_from_config(key: &HotkeyKey) -> VirtualKey {
     match key {
         HotkeyKey::Character(ch) => VirtualKey::ascii_uppercase(*ch as u8),
+        HotkeyKey::ArrowLeft => VirtualKey::ARROW_LEFT,
+        HotkeyKey::ArrowDown => VirtualKey::ARROW_DOWN,
+        HotkeyKey::ArrowUp => VirtualKey::ARROW_UP,
+        HotkeyKey::ArrowRight => VirtualKey::ARROW_RIGHT,
         HotkeyKey::Escape => VirtualKey::ESCAPE,
         HotkeyKey::Space => VirtualKey::SPACE,
     }
@@ -1429,7 +1466,15 @@ fn hotkey_low_level_label(event: &HotkeyLowLevelEvent) -> String {
 }
 
 fn virtual_key_label(key: VirtualKey) -> String {
-    if key == VirtualKey::ESCAPE {
+    if key == VirtualKey::ARROW_LEFT {
+        "Left".to_owned()
+    } else if key == VirtualKey::ARROW_DOWN {
+        "Down".to_owned()
+    } else if key == VirtualKey::ARROW_UP {
+        "Up".to_owned()
+    } else if key == VirtualKey::ARROW_RIGHT {
+        "Right".to_owned()
+    } else if key == VirtualKey::ESCAPE {
         "Escape".to_owned()
     } else if key.0 == 0x20 {
         "Space".to_owned()
@@ -1499,6 +1544,20 @@ mod tests {
         );
         assert_eq!(daemon_command_from_name("quit"), Some(DaemonCommand::Quit));
         assert_eq!(daemon_command_from_name("unknown"), None);
+
+        let launch = HotkeyBindingConfig {
+            keys: "Win+T".to_owned(),
+            command: None,
+            launch: Some("wt.exe".to_owned()),
+            override_app: false,
+        };
+        assert_eq!(
+            daemon_command_from_binding(&launch).unwrap(),
+            (
+                DaemonCommand::Launch("wt.exe".to_owned()),
+                "launch wt.exe".to_owned()
+            )
+        );
     }
 
     #[test]

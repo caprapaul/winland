@@ -8,8 +8,8 @@ use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 use winland_config::{Config, HotkeyKey, HotkeyModifier};
 use winland_core::{
-    LayoutConfig, MonitorInfo, TileAssignment, WindowHandle, WindowInfo, WindowRule,
-    WindowRuleDecision, WorkspaceId, WorkspaceManager, WorkspaceVisibilityChange,
+    LayoutConfig, MonitorInfo, Rect, TileAssignment, WindowHandle, WindowInfo, WindowParticipation,
+    WindowRule, WindowRuleDecision, WorkspaceId, WorkspaceManager, WorkspaceVisibilityChange,
     evaluate_window_rules, tile_windows_with_config,
 };
 use winland_win32::{
@@ -42,8 +42,9 @@ fn main() -> Result<()> {
         .context("spawn hotkey bridge")?;
     drop(daemon_sender);
 
-    let state = DaemonState::discover(runtime_config, hotkey_commands)
+    let mut state = DaemonState::discover(runtime_config, hotkey_commands)
         .context("build initial window snapshot")?;
+    state.apply_startup_retile()?;
     let processor = thread::Builder::new()
         .name("winland-daemon-events".to_owned())
         .spawn(move || process_daemon_events(daemon_receiver, state))
@@ -86,6 +87,10 @@ struct RuntimeConfig {
     layout: LayoutConfig,
     workspace_count: u16,
     window_rules: Vec<WindowRule>,
+    startup_retile: bool,
+    dynamic_retile: bool,
+    drag_to_float: bool,
+    retile_on_drag_end: bool,
 }
 
 impl RuntimeConfig {
@@ -94,6 +99,10 @@ impl RuntimeConfig {
             layout: config.layout_config(),
             workspace_count: config.workspace_count(),
             window_rules: config.window_rules().context("convert window rules")?,
+            startup_retile: config.behavior.startup_retile,
+            dynamic_retile: config.behavior.dynamic_retile,
+            drag_to_float: config.behavior.drag_to_float,
+            retile_on_drag_end: config.behavior.retile_on_drag_end,
         })
     }
 }
@@ -186,7 +195,8 @@ struct DaemonState {
     windows: BTreeMap<WindowHandle, WindowInfo>,
     foreground: Option<WindowHandle>,
     tile_order: Vec<WindowHandle>,
-    floating: BTreeSet<WindowHandle>,
+    participation: BTreeMap<WindowHandle, WindowParticipation>,
+    previous_rects: BTreeMap<WindowHandle, Rect>,
     workspaces: WorkspaceManager,
     config: RuntimeConfig,
     hotkey_commands: HotkeyCommandMap,
@@ -207,7 +217,8 @@ impl DaemonState {
             windows,
             foreground,
             tile_order: Vec::new(),
-            floating: BTreeSet::new(),
+            participation: BTreeMap::new(),
+            previous_rects: BTreeMap::new(),
             workspaces: WorkspaceManager::new(config.workspace_count),
             config,
             hotkey_commands,
@@ -216,6 +227,23 @@ impl DaemonState {
         state.sync_workspace_state(&monitors);
 
         Ok(state)
+    }
+
+    fn apply_startup_retile(&mut self) -> Result<()> {
+        if !self.config.startup_retile {
+            return Ok(());
+        }
+
+        let monitors =
+            winland_win32::enumerate_monitors().context("enumerate monitors for startup retile")?;
+        self.sync_workspace_state(&monitors);
+        let assignments = self.tile_assignments(&monitors);
+        apply_tile_assignments(&assignments, "startup retile");
+        info!(
+            move_count = assignments.len(),
+            "completed startup retile request"
+        );
+        Ok(())
     }
 
     fn reconcile_after_events(&mut self, batch: &[WindowEvent]) -> Result<()> {
@@ -230,11 +258,13 @@ impl DaemonState {
 
         let mut refreshed = Self::discover(self.config.clone(), self.hotkey_commands.clone())
             .context("refresh window snapshot after event batch")?;
-        let diff = self.diff(&refreshed);
         let monitors = winland_win32::enumerate_monitors()
             .context("enumerate monitors while preserving daemon state")?;
+        let diff = self.diff(&refreshed, &monitors);
         self.preserve_keyboard_state(&mut refreshed, &monitors);
         *self = refreshed;
+        let event_plan = self.plan_after_window_events(batch, &diff, &monitors);
+        apply_tile_assignments(&event_plan.moves, "dynamic retile");
 
         info!(
             event_count = batch.len(),
@@ -243,17 +273,22 @@ impl DaemonState {
             shown_events = count_events(batch, WindowEventKind::Shown),
             hidden_events = count_events(batch, WindowEventKind::Hidden),
             moved_events = count_events(batch, WindowEventKind::Moved),
+            movesize_start_events = count_events(batch, WindowEventKind::MoveSizeStart),
+            movesize_end_events = count_events(batch, WindowEventKind::MoveSizeEnd),
             minimized_events = count_events(batch, WindowEventKind::Minimized),
             restored_events = count_events(batch, WindowEventKind::Restored),
             foreground_events = count_events(batch, WindowEventKind::ForegroundChanged),
             total_windows = self.windows.len(),
             manageable_windows = self.manageable_window_count(),
-            floating_windows = self.floating.len(),
+            floating_windows = self.floating_window_count(),
+            temporary_floating_windows = self.temporary_floating_window_count(),
             active_workspace = %self.workspaces.active_workspace(),
             added = diff.added.len(),
             removed = diff.removed.len(),
             changed = diff.changed,
+            moved_between_monitors = diff.moved_between_monitors,
             foreground_changed = diff.foreground_changed,
+            retile_moves = event_plan.moves.len(),
             "reconciled window snapshot"
         );
 
@@ -506,9 +541,188 @@ impl DaemonState {
             return;
         };
 
-        if !self.floating.remove(&current) {
-            self.floating.insert(current);
+        self.remember_previous_rect(current);
+        let next = match self.window_participation(current) {
+            WindowParticipation::Floating | WindowParticipation::TemporarilyFloating => {
+                WindowParticipation::Tiled
+            }
+            WindowParticipation::Tiled => WindowParticipation::Floating,
+        };
+        self.set_window_participation(current, next);
+    }
+
+    fn plan_after_window_events(
+        &mut self,
+        batch: &[WindowEvent],
+        diff: &SnapshotDiff,
+        monitors: &[MonitorInfo],
+    ) -> CommandPlan {
+        let mut should_retile = self.should_retile_after_events(batch, diff);
+
+        if self.config.drag_to_float {
+            for event in batch {
+                match event.kind {
+                    WindowEventKind::MoveSizeStart => {
+                        if self.start_temporary_float(event.window) {
+                            should_retile = should_retile || self.config.dynamic_retile;
+                        }
+                    }
+                    WindowEventKind::MoveSizeEnd => {
+                        if self.window_participation(event.window)
+                            == WindowParticipation::TemporarilyFloating
+                        {
+                            self.reorder_temporary_float_by_drop(event.window, monitors);
+                        }
+
+                        if self.clear_temporary_float(event.window)
+                            && self.config.retile_on_drag_end
+                        {
+                            should_retile = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
+
+        if should_retile {
+            CommandPlan {
+                moves: self.tile_assignments(monitors),
+                ..CommandPlan::default()
+            }
+        } else {
+            CommandPlan::default()
+        }
+    }
+
+    fn should_retile_after_events(&self, batch: &[WindowEvent], diff: &SnapshotDiff) -> bool {
+        if !self.config.dynamic_retile {
+            return false;
+        }
+
+        batch.iter().any(|event| {
+            matches!(
+                event.kind,
+                WindowEventKind::Created
+                    | WindowEventKind::Destroyed
+                    | WindowEventKind::Shown
+                    | WindowEventKind::Hidden
+                    | WindowEventKind::Minimized
+                    | WindowEventKind::Restored
+            )
+        }) || diff.moved_between_monitors > 0
+    }
+
+    fn start_temporary_float(&mut self, window: WindowHandle) -> bool {
+        if self.window_participation(window) == WindowParticipation::Floating
+            || !self.is_tilable_window(window)
+        {
+            return false;
+        }
+
+        self.remember_previous_rect(window);
+        self.set_window_participation(window, WindowParticipation::TemporarilyFloating);
+        true
+    }
+
+    fn clear_temporary_float(&mut self, window: WindowHandle) -> bool {
+        if self.window_participation(window) != WindowParticipation::TemporarilyFloating {
+            return false;
+        }
+
+        self.set_window_participation(window, WindowParticipation::Tiled);
+        true
+    }
+
+    fn reorder_temporary_float_by_drop(
+        &mut self,
+        window: WindowHandle,
+        monitors: &[MonitorInfo],
+    ) -> bool {
+        let Some(window_info) = self.windows.get(&window) else {
+            return false;
+        };
+        let Some(target_monitor) = monitor_for_rect(window_info.rect, monitors) else {
+            return false;
+        };
+        let Some(monitor) = monitors.iter().find(|monitor| monitor.id == target_monitor) else {
+            return false;
+        };
+
+        let target_handles: Vec<_> = self
+            .tile_order
+            .iter()
+            .copied()
+            .filter(|handle| *handle != window)
+            .filter(|handle| self.window_participation(*handle).is_tiled())
+            .filter(|handle| {
+                self.windows.get(handle).is_some_and(|candidate| {
+                    self.is_tilable_window(*handle)
+                        && monitor
+                            .rect
+                            .contains(self.window_layout_rect(*handle, candidate).center())
+                })
+            })
+            .collect();
+        let local_index =
+            self.drop_insert_index(window, window_info.rect, &target_handles, monitor);
+
+        self.reinsert_window_at_local_index(window, &target_handles, local_index)
+    }
+
+    fn drop_insert_index(
+        &self,
+        window: WindowHandle,
+        dropped_rect: Rect,
+        target_handles: &[WindowHandle],
+        monitor: &MonitorInfo,
+    ) -> usize {
+        let dropped_center = dropped_rect.center();
+
+        (0..=target_handles.len())
+            .filter_map(|index| {
+                let mut handles = target_handles.to_vec();
+                handles.insert(index, window);
+                let assignment =
+                    tile_windows_with_config(monitor.work_area, &handles, self.config.layout)
+                        .into_iter()
+                        .find(|assignment| assignment.window == window)?;
+                let center = assignment.rect.center();
+                let dx = i64::from(center.x - dropped_center.x);
+                let dy = i64::from(center.y - dropped_center.y);
+                Some((dx * dx + dy * dy, index))
+            })
+            .min_by_key(|(distance, index)| (*distance, *index))
+            .map(|(_, index)| index)
+            .unwrap_or(target_handles.len())
+    }
+
+    fn reinsert_window_at_local_index(
+        &mut self,
+        window: WindowHandle,
+        target_handles: &[WindowHandle],
+        local_index: usize,
+    ) -> bool {
+        let old_order = self.tile_order.clone();
+        self.tile_order.retain(|handle| *handle != window);
+
+        let insert_at = if let Some(before) = target_handles.get(local_index) {
+            self.tile_order
+                .iter()
+                .position(|handle| handle == before)
+                .unwrap_or(self.tile_order.len())
+        } else if let Some(after) = target_handles.last() {
+            self.tile_order
+                .iter()
+                .position(|handle| handle == after)
+                .map(|index| index + 1)
+                .unwrap_or(self.tile_order.len())
+        } else {
+            self.tile_order.len()
+        };
+
+        self.tile_order.insert(insert_at, window);
+        self.tile_order != old_order
     }
 
     fn switch_workspace(
@@ -557,7 +771,7 @@ impl DaemonState {
         }
 
         if was_active && workspace != self.workspaces.active_workspace() {
-            self.floating.remove(&current);
+            self.set_window_participation(current, WindowParticipation::Tiled);
             self.foreground = None;
             if self.should_hide_for_workspace(current, monitors) {
                 return vec![current];
@@ -575,7 +789,7 @@ impl DaemonState {
                     .tile_order
                     .iter()
                     .copied()
-                    .filter(|handle| !self.floating.contains(handle))
+                    .filter(|handle| self.window_participation(*handle).is_tiled())
                     .filter(|handle| {
                         self.windows.get(handle).is_some_and(|window| {
                             self.is_tilable_window(*handle)
@@ -618,7 +832,7 @@ impl DaemonState {
                 }
 
                 if decision.float == Some(true) {
-                    self.floating.insert(handle);
+                    self.set_window_participation(handle, WindowParticipation::Floating);
                 }
                 if decision.always_on_workspace == Some(true) {
                     self.workspaces.set_visible_on_all_workspaces(handle, true);
@@ -669,14 +883,21 @@ impl DaemonState {
                 refreshed.tile_order.push(*handle);
             }
         }
-        refreshed.floating = self
-            .floating
-            .intersection(&known_workspace_windows)
-            .copied()
+        refreshed.participation = self
+            .participation
+            .iter()
+            .filter(|(handle, _)| known_workspace_windows.contains(handle))
+            .map(|(handle, participation)| (*handle, *participation))
+            .collect();
+        refreshed.previous_rects = self
+            .previous_rects
+            .iter()
+            .filter(|(handle, _)| known_workspace_windows.contains(handle))
+            .map(|(handle, rect)| (*handle, *rect))
             .collect();
     }
 
-    fn diff(&self, refreshed: &Self) -> SnapshotDiff {
+    fn diff(&self, refreshed: &Self, monitors: &[MonitorInfo]) -> SnapshotDiff {
         let old_handles: BTreeSet<_> = self.windows.keys().copied().collect();
         let new_handles: BTreeSet<_> = refreshed.windows.keys().copied().collect();
 
@@ -686,11 +907,27 @@ impl DaemonState {
             .intersection(&old_handles)
             .filter(|handle| self.windows.get(handle) != refreshed.windows.get(handle))
             .count();
+        let moved_between_monitors = new_handles
+            .intersection(&old_handles)
+            .filter(|handle| {
+                let old_monitor = self
+                    .windows
+                    .get(handle)
+                    .and_then(|window| monitor_for_rect(window.rect, monitors));
+                let new_monitor = refreshed
+                    .windows
+                    .get(handle)
+                    .and_then(|window| monitor_for_rect(window.rect, monitors));
+
+                old_monitor.is_some() && new_monitor.is_some() && old_monitor != new_monitor
+            })
+            .count();
 
         SnapshotDiff {
             added,
             removed,
             changed,
+            moved_between_monitors,
             foreground_changed: self.foreground != refreshed.foreground,
         }
     }
@@ -700,6 +937,45 @@ impl DaemonState {
             .values()
             .filter(|window| self.is_manageable_by_rules(window, &self.rule_decision(window)))
             .count()
+    }
+
+    fn floating_window_count(&self) -> usize {
+        self.participation
+            .values()
+            .filter(|participation| **participation == WindowParticipation::Floating)
+            .count()
+    }
+
+    fn temporary_floating_window_count(&self) -> usize {
+        self.participation
+            .values()
+            .filter(|participation| **participation == WindowParticipation::TemporarilyFloating)
+            .count()
+    }
+
+    fn window_participation(&self, window: WindowHandle) -> WindowParticipation {
+        self.participation.get(&window).copied().unwrap_or_default()
+    }
+
+    fn set_window_participation(
+        &mut self,
+        window: WindowHandle,
+        participation: WindowParticipation,
+    ) {
+        match participation {
+            WindowParticipation::Tiled => {
+                self.participation.remove(&window);
+            }
+            WindowParticipation::Floating | WindowParticipation::TemporarilyFloating => {
+                self.participation.insert(window, participation);
+            }
+        }
+    }
+
+    fn remember_previous_rect(&mut self, window: WindowHandle) {
+        if let Some(info) = self.windows.get(&window) {
+            self.previous_rects.insert(window, info.rect);
+        }
     }
 
     fn manageable_handles_sorted(&self) -> Vec<WindowHandle> {
@@ -745,7 +1021,8 @@ impl DaemonState {
         info!(
             total_windows = self.windows.len(),
             manageable_windows = self.manageable_window_count(),
-            floating_windows = self.floating.len(),
+            floating_windows = self.floating_window_count(),
+            temporary_floating_windows = self.temporary_floating_window_count(),
             active_workspace = %self.workspaces.active_workspace(),
             foreground = ?self.foreground,
             message
@@ -753,11 +1030,12 @@ impl DaemonState {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct SnapshotDiff {
     added: Vec<WindowHandle>,
     removed: Vec<WindowHandle>,
     changed: usize,
+    moved_between_monitors: usize,
     foreground_changed: bool,
 }
 
@@ -965,10 +1243,32 @@ fn virtual_key_label(key: VirtualKey) -> String {
     }
 }
 
+fn apply_tile_assignments(assignments: &[TileAssignment], operation: &'static str) {
+    for assignment in assignments {
+        if let Err(error) = winland_win32::move_resize_window(assignment.window, assignment.rect) {
+            warn!(
+                window = %assignment.window,
+                rect = %assignment.rect,
+                %error,
+                operation,
+                "failed to move window"
+            );
+        }
+    }
+}
+
 fn is_fullscreen_window(window: &WindowInfo, monitors: &[MonitorInfo]) -> bool {
     monitors
         .iter()
         .any(|monitor| window.rect == monitor.rect || window.rect == monitor.work_area)
+}
+
+fn monitor_for_rect(rect: Rect, monitors: &[MonitorInfo]) -> Option<winland_core::MonitorId> {
+    let center = rect.center();
+    monitors
+        .iter()
+        .find(|monitor| monitor.rect.contains(center))
+        .map(|monitor| monitor.id)
 }
 
 #[cfg(test)]
@@ -1060,7 +1360,10 @@ mod tests {
 
         let plan = state.plan_command(DaemonCommand::ToggleFloat, &[primary_test_monitor()]);
 
-        assert!(state.floating.contains(&WindowHandle(1)));
+        assert_eq!(
+            state.window_participation(WindowHandle(1)),
+            WindowParticipation::Floating
+        );
         assert_eq!(
             plan.moves,
             vec![TileAssignment {
@@ -1107,6 +1410,136 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn movesize_start_temporarily_floats_tiled_window() {
+        let mut state = daemon_state([
+            window(1, "One", Rect::from_size(0, 0, 100, 100)),
+            window(2, "Two", Rect::from_size(200, 0, 100, 100)),
+        ]);
+
+        let plan = state.plan_after_window_events(
+            &[event(WindowEventKind::MoveSizeStart, 1)],
+            &SnapshotDiff::default(),
+            &[primary_test_monitor()],
+        );
+
+        assert_eq!(
+            state.window_participation(WindowHandle(1)),
+            WindowParticipation::TemporarilyFloating
+        );
+        assert_eq!(
+            state.previous_rects.get(&WindowHandle(1)).copied(),
+            Some(Rect::from_size(0, 0, 100, 100))
+        );
+        assert_eq!(
+            plan.moves,
+            vec![TileAssignment {
+                window: WindowHandle(2),
+                rect: primary_test_monitor().work_area,
+            }]
+        );
+    }
+
+    #[test]
+    fn movesize_end_reabsorbs_temporary_float_by_default() {
+        let mut state = daemon_state([
+            window(1, "One", Rect::from_size(0, 0, 100, 100)),
+            window(2, "Two", Rect::from_size(200, 0, 100, 100)),
+        ]);
+        state.set_window_participation(WindowHandle(1), WindowParticipation::TemporarilyFloating);
+
+        let plan = state.plan_after_window_events(
+            &[event(WindowEventKind::MoveSizeEnd, 1)],
+            &SnapshotDiff::default(),
+            &[primary_test_monitor()],
+        );
+
+        assert_eq!(
+            state.window_participation(WindowHandle(1)),
+            WindowParticipation::Tiled
+        );
+        assert_eq!(plan.moves.len(), 2);
+        assert_eq!(plan.moves[0].window, WindowHandle(1));
+    }
+
+    #[test]
+    fn movesize_end_reorders_tiled_window_from_drop_position() {
+        let mut state = daemon_state([
+            window(1, "One", Rect::from_size(700, 500, 100, 100)),
+            window(2, "Two", Rect::from_size(100, 0, 100, 100)),
+            window(3, "Three", Rect::from_size(300, 0, 100, 100)),
+        ]);
+        state.set_window_participation(WindowHandle(1), WindowParticipation::TemporarilyFloating);
+
+        let plan = state.plan_after_window_events(
+            &[event(WindowEventKind::MoveSizeEnd, 1)],
+            &SnapshotDiff::default(),
+            &[primary_test_monitor()],
+        );
+
+        assert_eq!(
+            state.tile_order,
+            vec![WindowHandle(2), WindowHandle(3), WindowHandle(1)]
+        );
+        assert_eq!(
+            plan.moves
+                .iter()
+                .map(|assignment| assignment.window)
+                .collect::<Vec<_>>(),
+            vec![WindowHandle(2), WindowHandle(3), WindowHandle(1)]
+        );
+    }
+
+    #[test]
+    fn permanent_floating_survives_movesize_start() {
+        let mut state = daemon_state([
+            window(1, "One", Rect::from_size(0, 0, 100, 100)),
+            window(2, "Two", Rect::from_size(200, 0, 100, 100)),
+        ]);
+        state.set_window_participation(WindowHandle(1), WindowParticipation::Floating);
+
+        let plan = state.plan_after_window_events(
+            &[event(WindowEventKind::MoveSizeStart, 1)],
+            &SnapshotDiff::default(),
+            &[primary_test_monitor()],
+        );
+
+        assert_eq!(
+            state.window_participation(WindowHandle(1)),
+            WindowParticipation::Floating
+        );
+        assert!(plan.moves.is_empty());
+    }
+
+    #[test]
+    fn dynamic_retile_can_be_disabled() {
+        let mut state = daemon_state([
+            window(1, "One", Rect::from_size(0, 0, 100, 100)),
+            window(2, "Two", Rect::from_size(200, 0, 100, 100)),
+        ]);
+        state.config.dynamic_retile = false;
+
+        let plan = state.plan_after_window_events(
+            &[event(WindowEventKind::Shown, 2)],
+            &SnapshotDiff::default(),
+            &[primary_test_monitor()],
+        );
+
+        assert!(plan.moves.is_empty());
+    }
+
+    #[test]
+    fn monitor_moves_request_dynamic_retile() {
+        let monitors = [primary_test_monitor(), secondary_test_monitor()];
+        let old = daemon_state([window(1, "One", Rect::from_size(100, 0, 100, 100))]);
+        let refreshed = daemon_state([window(1, "One", Rect::from_size(1100, 0, 100, 100))]);
+
+        let diff = old.diff(&refreshed, &monitors);
+
+        assert_eq!(diff.moved_between_monitors, 1);
+        assert!(refreshed.should_retile_after_events(&[event(WindowEventKind::Moved, 1)], &diff));
     }
 
     #[test]
@@ -1209,11 +1642,12 @@ mod tests {
         ]);
         refreshed.foreground = Some(WindowHandle(3));
 
-        let diff = old.diff(&refreshed);
+        let diff = old.diff(&refreshed, &[primary_test_monitor()]);
 
         assert_eq!(diff.added, vec![WindowHandle(3)]);
         assert_eq!(diff.removed, vec![WindowHandle(2)]);
         assert_eq!(diff.changed, 1);
+        assert_eq!(diff.moved_between_monitors, 0);
         assert!(diff.foreground_changed);
     }
 
@@ -1239,7 +1673,8 @@ mod tests {
             windows,
             foreground: None,
             tile_order: Vec::new(),
-            floating: BTreeSet::new(),
+            participation: BTreeMap::new(),
+            previous_rects: BTreeMap::new(),
             workspaces: WorkspaceManager::new(9),
             config: RuntimeConfig::default(),
             hotkey_commands: HotkeyCommandMap::default(),
@@ -1263,6 +1698,15 @@ mod tests {
             is_primary: true,
             rect: Rect::from_size(0, 0, 1000, 800),
             work_area: Rect::from_size(0, 0, 1000, 760),
+        }
+    }
+
+    fn secondary_test_monitor() -> MonitorInfo {
+        MonitorInfo {
+            id: MonitorId(2),
+            is_primary: false,
+            rect: Rect::from_size(1000, 0, 800, 600),
+            work_area: Rect::from_size(1000, 0, 800, 560),
         }
     }
 

@@ -108,6 +108,24 @@ pub struct TileAssignment {
     pub rect: Rect,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WindowParticipation {
+    #[default]
+    Tiled,
+    Floating,
+    TemporarilyFloating,
+}
+
+impl WindowParticipation {
+    pub fn is_tiled(self) -> bool {
+        matches!(self, Self::Tiled)
+    }
+
+    pub fn is_floating(self) -> bool {
+        matches!(self, Self::Floating | Self::TemporarilyFloating)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutDirection {
     Left,
@@ -161,7 +179,7 @@ pub struct MonitorLayoutState {
     config: LayoutConfig,
     windows: Vec<WindowHandle>,
     focused: Option<WindowHandle>,
-    floating: BTreeSet<WindowHandle>,
+    participation: BTreeMap<WindowHandle, WindowParticipation>,
 }
 
 impl MonitorLayoutState {
@@ -175,7 +193,7 @@ impl MonitorLayoutState {
             config: config.normalized(),
             windows: Vec::new(),
             focused: None,
-            floating: BTreeSet::new(),
+            participation: BTreeMap::new(),
         }
     }
 
@@ -196,7 +214,32 @@ impl MonitorLayoutState {
     }
 
     pub fn is_floating(&self, window: WindowHandle) -> bool {
-        self.floating.contains(&window)
+        self.participation(window).is_floating()
+    }
+
+    pub fn participation(&self, window: WindowHandle) -> WindowParticipation {
+        self.participation.get(&window).copied().unwrap_or_default()
+    }
+
+    pub fn set_participation(
+        &mut self,
+        window: WindowHandle,
+        participation: WindowParticipation,
+    ) -> bool {
+        if !self.windows.contains(&window) {
+            return false;
+        }
+
+        match participation {
+            WindowParticipation::Tiled => {
+                self.participation.remove(&window);
+            }
+            WindowParticipation::Floating | WindowParticipation::TemporarilyFloating => {
+                self.participation.insert(window, participation);
+            }
+        }
+
+        true
     }
 
     pub fn insert_window(&mut self, window: WindowHandle) -> bool {
@@ -222,7 +265,7 @@ impl MonitorLayoutState {
         };
 
         self.windows.remove(index);
-        self.floating.remove(&window);
+        self.participation.remove(&window);
 
         if self.focused == Some(window) {
             self.focused = if self.windows.is_empty() {
@@ -267,12 +310,30 @@ impl MonitorLayoutState {
             return None;
         }
 
-        if self.floating.remove(&window) {
-            Some(false)
-        } else {
-            self.floating.insert(window);
-            Some(true)
+        let next = match self.participation(window) {
+            WindowParticipation::Tiled => WindowParticipation::Floating,
+            WindowParticipation::Floating | WindowParticipation::TemporarilyFloating => {
+                WindowParticipation::Tiled
+            }
+        };
+        self.set_participation(window, next);
+        Some(next.is_floating())
+    }
+
+    pub fn set_temporarily_floating(&mut self, window: WindowHandle) -> bool {
+        if self.participation(window) == WindowParticipation::Floating {
+            return false;
         }
+
+        self.set_participation(window, WindowParticipation::TemporarilyFloating)
+    }
+
+    pub fn clear_temporary_floating(&mut self, window: WindowHandle) -> bool {
+        if self.participation(window) != WindowParticipation::TemporarilyFloating {
+            return false;
+        }
+
+        self.set_participation(window, WindowParticipation::Tiled)
     }
 
     pub fn adjust_master_ratio(&mut self, delta_percentage_points: i8) -> u8 {
@@ -287,7 +348,7 @@ impl MonitorLayoutState {
 
     pub fn reset_layout(&mut self) {
         self.config = LayoutConfig::default();
-        self.floating.clear();
+        self.participation.clear();
         self.focused = self.windows.first().copied();
     }
 
@@ -296,7 +357,7 @@ impl MonitorLayoutState {
             .windows
             .iter()
             .copied()
-            .filter(|window| !self.floating.contains(window))
+            .filter(|window| self.participation(*window).is_tiled())
             .collect();
 
         master_stack_assignments(work_area, &tiled_windows, self.config)
@@ -1317,6 +1378,52 @@ mod tests {
                     rect: Rect::from_size(500, 0, 500, 800),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn temporary_floating_windows_are_reabsorbed_after_drag_end() {
+        let mut layout = MonitorLayoutState::new(MonitorId(1));
+        layout.insert_window(WindowHandle(1));
+        layout.insert_window(WindowHandle(2));
+        layout.insert_window(WindowHandle(3));
+
+        assert!(layout.set_temporarily_floating(WindowHandle(2)));
+        assert_eq!(
+            layout.participation(WindowHandle(2)),
+            WindowParticipation::TemporarilyFloating
+        );
+
+        let during_drag = layout.assignments(Rect::from_size(0, 0, 1000, 800));
+        assert_eq!(
+            during_drag
+                .iter()
+                .map(|assignment| assignment.window)
+                .collect::<Vec<_>>(),
+            vec![WindowHandle(1), WindowHandle(3)]
+        );
+
+        assert!(layout.clear_temporary_floating(WindowHandle(2)));
+        let after_drag = layout.assignments(Rect::from_size(0, 0, 1000, 800));
+        assert_eq!(
+            after_drag
+                .iter()
+                .map(|assignment| assignment.window)
+                .collect::<Vec<_>>(),
+            vec![WindowHandle(1), WindowHandle(2), WindowHandle(3)]
+        );
+    }
+
+    #[test]
+    fn permanent_floating_is_not_replaced_by_temporary_drag_state() {
+        let mut layout = MonitorLayoutState::new(MonitorId(1));
+        layout.insert_window(WindowHandle(1));
+
+        assert_eq!(layout.toggle_floating(WindowHandle(1)), Some(true));
+        assert!(!layout.set_temporarily_floating(WindowHandle(1)));
+        assert_eq!(
+            layout.participation(WindowHandle(1)),
+            WindowParticipation::Floating
         );
     }
 

@@ -117,7 +117,16 @@ startup = "keep-current"
 
 [behavior]
 # Retile existing manageable windows when the daemon starts.
-startup_retile = false
+startup_retile = true
+
+# Retile after event bursts that change manageable window participation or monitor placement.
+dynamic_retile = true
+
+# Temporarily release tiled windows while the user drags or resizes them.
+drag_to_float = true
+
+# Reabsorb temporarily floating windows into the tiled layout when drag/resize ends.
+retile_on_drag_end = true
 
 # Reserved for behavior policy. Kept explicit so config can grow without
 # changing the shape users already edit.

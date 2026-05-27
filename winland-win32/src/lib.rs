@@ -27,13 +27,13 @@ mod platform {
     use windows::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE,
         EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW, EVENT_SYSTEM_FOREGROUND,
-        EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, EnumWindows, GW_OWNER, GWL_EXSTYLE,
-        GWL_STYLE, GetClassNameW, GetForegroundWindow, GetMessageW, GetWindow, GetWindowLongPtrW,
-        GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
-        IsWindowVisible, MONITORINFOF_PRIMARY, MSG, OBJID_WINDOW, PostThreadMessageW, SW_HIDE,
-        SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER, SetForegroundWindow,
-        SetWindowPos, ShowWindow, TranslateMessage, WINEVENT_OUTOFCONTEXT, WM_HOTKEY, WM_QUIT,
-        WS_EX_TOOLWINDOW,
+        EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND,
+        EVENT_SYSTEM_MOVESIZESTART, EnumWindows, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetClassNameW,
+        GetForegroundWindow, GetMessageW, GetWindow, GetWindowLongPtrW, GetWindowRect,
+        GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
+        MONITORINFOF_PRIMARY, MSG, OBJID_WINDOW, PostThreadMessageW, SW_HIDE, SW_SHOWNOACTIVATE,
+        SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER, SetForegroundWindow, SetWindowPos,
+        ShowWindow, TranslateMessage, WINEVENT_OUTOFCONTEXT, WM_HOTKEY, WM_QUIT, WS_EX_TOOLWINDOW,
     };
     use windows::core::PWSTR;
     use winland_core::{
@@ -504,6 +504,7 @@ mod platform {
 
         for (event_min, event_max) in [
             (EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND),
+            (EVENT_SYSTEM_MOVESIZESTART, EVENT_SYSTEM_MOVESIZEEND),
             (EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND),
             (EVENT_OBJECT_CREATE, EVENT_OBJECT_LOCATIONCHANGE),
         ] {
@@ -563,6 +564,8 @@ mod platform {
             EVENT_OBJECT_SHOW => WindowEventKind::Shown,
             EVENT_OBJECT_HIDE => WindowEventKind::Hidden,
             EVENT_OBJECT_LOCATIONCHANGE => WindowEventKind::Moved,
+            EVENT_SYSTEM_MOVESIZESTART => WindowEventKind::MoveSizeStart,
+            EVENT_SYSTEM_MOVESIZEEND => WindowEventKind::MoveSizeEnd,
             EVENT_SYSTEM_MINIMIZESTART => WindowEventKind::Minimized,
             EVENT_SYSTEM_MINIMIZEEND => WindowEventKind::Restored,
             EVENT_SYSTEM_FOREGROUND => WindowEventKind::ForegroundChanged,
@@ -977,6 +980,8 @@ pub enum WindowEventKind {
     Shown,
     Hidden,
     Moved,
+    MoveSizeStart,
+    MoveSizeEnd,
     Minimized,
     Restored,
     ForegroundChanged,

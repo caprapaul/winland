@@ -181,6 +181,9 @@ pub enum WorkspaceStartup {
 #[serde(default, deny_unknown_fields)]
 pub struct BehaviorConfig {
     pub startup_retile: bool,
+    pub dynamic_retile: bool,
+    pub drag_to_float: bool,
+    pub retile_on_drag_end: bool,
     pub focus_follows_mouse: bool,
     pub restore_previous_placement: bool,
     pub manage_minimized_windows: bool,
@@ -190,7 +193,10 @@ pub struct BehaviorConfig {
 impl Default for BehaviorConfig {
     fn default() -> Self {
         Self {
-            startup_retile: false,
+            startup_retile: true,
+            dynamic_retile: true,
+            drag_to_float: true,
+            retile_on_drag_end: true,
             focus_follows_mouse: false,
             restore_previous_placement: true,
             manage_minimized_windows: false,
@@ -875,7 +881,10 @@ mod tests {
         assert_eq!(config.workspace_count(), 9);
         assert_eq!(config.layout_config().master_ratio_percent, 50);
         assert_eq!(config.hotkeys.bindings.len(), 30);
-        assert!(!config.behavior.startup_retile);
+        assert!(config.behavior.startup_retile);
+        assert!(config.behavior.dynamic_retile);
+        assert!(config.behavior.drag_to_float);
+        assert!(config.behavior.retile_on_drag_end);
         assert!(config.window_rules.is_empty());
     }
 
@@ -904,6 +913,9 @@ mod tests {
 
             [behavior]
             startup_retile = true
+            dynamic_retile = false
+            drag_to_float = true
+            retile_on_drag_end = false
 
             [[window_rules]]
             name = "float settings"
@@ -922,6 +934,9 @@ mod tests {
         assert_eq!(config.layout_config().gap, 8);
         assert_eq!(config.workspace_count(), 2);
         assert!(config.behavior.startup_retile);
+        assert!(!config.behavior.dynamic_retile);
+        assert!(config.behavior.drag_to_float);
+        assert!(!config.behavior.retile_on_drag_end);
         assert_eq!(config.window_rules().unwrap().len(), 1);
     }
 

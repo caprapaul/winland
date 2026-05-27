@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use tracing::debug;
@@ -18,6 +20,8 @@ enum Command {
     Windows(WindowsArgs),
     /// Arrange manageable windows on the primary monitor once.
     TileOnce,
+    /// Inspect or validate Winland configuration.
+    Config(ConfigArgs),
 }
 
 #[derive(Debug, Args)]
@@ -25,6 +29,25 @@ struct WindowsArgs {
     /// Show only windows that Winland would currently consider manageable.
     #[arg(long)]
     manageable_only: bool,
+}
+
+#[derive(Debug, Args)]
+struct ConfigArgs {
+    #[command(subcommand)]
+    command: ConfigCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigCommand {
+    /// Validate a Winland TOML config file without mutating daemon state.
+    Validate(ConfigValidateArgs),
+}
+
+#[derive(Debug, Args)]
+struct ConfigValidateArgs {
+    /// Config file to validate. If omitted, Winland uses discovery paths or defaults.
+    #[arg(short, long)]
+    path: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -35,6 +58,7 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Windows(args) => list_windows(args),
         Command::TileOnce => tile_once(),
+        Command::Config(args) => handle_config(args),
     }
 }
 
@@ -57,6 +81,22 @@ fn list_windows(args: WindowsArgs) -> Result<()> {
         .collect();
 
     print_table(&listed);
+    Ok(())
+}
+
+fn handle_config(args: ConfigArgs) -> Result<()> {
+    match args.command {
+        ConfigCommand::Validate(args) => validate_config(args),
+    }
+}
+
+fn validate_config(args: ConfigValidateArgs) -> Result<()> {
+    let loaded = winland_config::load_or_default(args.path.as_deref())?;
+    match loaded.path {
+        Some(path) => println!("Config is valid: {}", path.display()),
+        None => println!("Config is valid: no config file found, using built-in defaults."),
+    }
+
     Ok(())
 }
 

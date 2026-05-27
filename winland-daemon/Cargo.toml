@@ -8,5 +8,6 @@ license.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+winland-config = { path = "../winland-config" }
 winland-core = { path = "../winland-core" }
 winland-win32 = { path = "../winland-win32" }

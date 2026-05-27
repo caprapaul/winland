@@ -38,11 +38,13 @@ If a module needs `HWND`, `RECT`, `BOOL`, raw pointers, callbacks, or Win32 hand
 5. Build a real layout engine in `winland-core`.
 6. Add fake workspaces by hiding, showing, moving, or restoring window sets through documented APIs.
 7. Add the configuration system, including hotkeys, layouts, workspaces, behavior toggles, and window rules.
-8. Add IPC and a stronger CLI.
-9. Add borders or visual feedback only after tiling is stable.
-10. Add optional animations only after layout, events, IPC, and rules are reliable.
-11. Add bar or status integration.
-12. Harden edge cases.
+8. Add automatic startup retile, dynamic retile, and drag-to-float behavior.
+9. Add opt-in hotkey override mode for conflicts that ordinary global hotkeys cannot claim.
+10. Add IPC and a stronger CLI.
+11. Add borders or visual feedback only after tiling is stable.
+12. Add optional animations only after layout, events, IPC, and rules are reliable.
+13. Add bar or status integration.
+14. Harden edge cases.
 
 ## Testing Rules
 
@@ -64,12 +66,12 @@ If a module needs `HWND`, `RECT`, `BOOL`, raw pointers, callbacks, or Win32 hand
 - Provide sensible defaults so Winland can run without a config file.
 - Once Phase 7 lands, user-facing workflow behavior should be configurable when practical.
 - Cover at least these config areas:
-  - Hotkeys: modifier/key combinations mapped to named commands.
+  - Hotkeys: modifier/key combinations mapped to named commands, plus an explicit mode for normal registration versus advanced interception when that phase exists.
   - Layouts: default layout, gaps, ratios, per-monitor or per-workspace layout choices, and layout-specific options.
   - Workspaces: names, count, initial monitor assignment, and startup behavior.
   - Window rules: match criteria and actions such as manage, ignore, float, target workspace, and always-on-workspace.
-  - Behavior toggles: startup retile, focus behavior, restore behavior, handling of minimized windows, and conservative safety switches.
-  - Visual feedback: border enablement, colors, widths, and related options after Phase 9 exists.
+  - Behavior toggles: startup retile, dynamic retile, drag-to-float, retile-on-drag-end, focus behavior, restore behavior, handling of minimized windows, and conservative safety switches.
+  - Visual feedback: border enablement, colors, widths, and related options after Phase 11 exists.
   - Daemon and IPC: logging level, IPC endpoint selection when needed, reload behavior, and diagnostics settings.
 - Add a `winland config validate` or equivalent CLI command when config files become user-editable.
 - Config reload should be explicit at first. Automatic file watching can come later if it proves useful.
@@ -93,6 +95,11 @@ If a module needs `HWND`, `RECT`, `BOOL`, raw pointers, callbacks, or Win32 hand
 - Expect apps to be strange: cloaked windows, tool windows, child windows, UWP windows, elevated windows, fullscreen apps, minimized windows, and windows that refuse movement.
 - Never assume all visible top-level windows are manageable.
 - Avoid fighting the user. If the foreground window or active monitor changes, react conservatively.
+- Tile manageable windows by default once automatic tiling is enabled.
+- Retile on daemon startup after initial window discovery, unless the user disables that behavior.
+- Retile in response to window lifecycle and monitor events, but debounce event bursts so Winland does not thrash.
+- When the user starts dragging or resizing a managed tiled window, treat it as a temporary floating window and pause tiling pressure on that window.
+- When the drag or resize ends, return the window to tiled state and retile the affected workspace by default.
 - Prefer reversible operations. Track previous placement when changing window geometry so recovery features can be added later.
 
 ## Visuals Policy

@@ -143,7 +143,7 @@ Tasks:
 - Add config for hotkeys as modifier/key combinations mapped to named daemon commands.
 - Add config for layouts, including default layout, gaps, ratios, per-monitor or per-workspace layout choices, and layout-specific options.
 - Add config for workspaces, including names, count, initial monitor assignment, and startup behavior.
-- Add config for behavior toggles such as startup retile, focus behavior, restore behavior, minimized-window handling, and conservative safety switches.
+- Add config for behavior toggles such as focus behavior, restore behavior, minimized-window handling, and conservative safety switches.
 - Match windows by class, title, executable path, process name, and other stable metadata.
 - Support manage, ignore, float, target workspace, initial layout hints, and always-on-workspace behavior.
 - Add config validation through the CLI, such as `winland config validate`.
@@ -164,7 +164,68 @@ Not yet:
 - No automatic online rule database.
 - No automatic config file watching unless explicitly requested later.
 
-## Phase 8: IPC and CLI
+## Phase 8: Automatic Retiling and Drag-to-Float
+
+Goal: Make tiling the default live behavior: tile on daemon start, retile dynamically, and temporarily release windows while the user drags or resizes them.
+
+Tasks:
+- Retile once on daemon startup after initial window discovery.
+- Retile dynamically when manageable windows are created, destroyed, shown, hidden, restored, minimized, or moved between monitors.
+- Debounce retile requests so event storms produce one coherent layout update.
+- Detect user move/resize start and end events, such as documented move-size WinEvents where available.
+- Model window participation explicitly: tiled by default, permanently floating by rule or command, or temporarily floating during user drag/resize.
+- During user drag or resize, mark the affected tiled window as temporarily floating so Winland does not fight the drag.
+- Ensure retile operations exclude temporary floating windows during the drag and re-include them after drag end.
+- On drag or resize end, clear temporary floating state and retile the affected workspace by default.
+- Preserve enough previous geometry to make float transitions and recovery predictable.
+- Extend config with startup retile, dynamic retile, drag-to-float, and retile-on-drag-end toggles.
+- Add layout and daemon tests for tiled, permanently floating, and temporarily floating participation.
+
+Done criteria:
+- Starting the daemon tiles existing manageable windows by default.
+- Opening, closing, showing, hiding, minimizing, restoring, or monitor-moving manageable windows causes an event-driven retile.
+- Dragging or resizing a tiled window temporarily releases it from tiling, then returns it to the tiled layout when the drag ends.
+- Winland does not continuously fight the user's pointer during interactive move or resize.
+- Tiled, permanently floating, and temporarily floating states have clear behavior in layout tests.
+- Retile after drag end reabsorbs the window into the tiled layout by default.
+- The behavior can be disabled or adjusted through config.
+
+Not yet:
+- No animation while dragging.
+- No permanent floating by manual drag alone unless a command or rule requests it.
+- No polling-based drag detection unless a narrow documented fallback is required.
+- No visual drag overlay.
+
+## Phase 9: Hotkey Override Mode
+
+Goal: Let users opt into overriding app-level hotkey conflicts where documented Windows mechanisms allow it.
+
+Tasks:
+- Keep ordinary hotkeys on the documented `RegisterHotKey` path by default.
+- Add config for hotkey handling mode, such as normal registration versus advanced interception.
+- Use documented low-level keyboard hook APIs, such as `WH_KEYBOARD_LL`, only for explicit opt-in override mode.
+- Route intercepted key combinations through the same command system as normal hotkeys.
+- Allow per-binding override intent where practical, so users can choose which shortcuts should suppress delivery to the focused app.
+- Add clear diagnostics for failed registrations, intercepted bindings, suppressed keys, and unsupported protected shortcuts.
+- Reserve a panic or escape hotkey that Winland never intercepts.
+- Document limits clearly: secure desktop, UAC prompts, `Ctrl+Alt+Del`, and reserved OS shortcuts cannot be overridden.
+- Test matching and command routing without requiring a real keyboard hook.
+
+Done criteria:
+- Normal hotkey mode remains the default and still uses `RegisterHotKey`.
+- Override mode is disabled unless explicitly configured.
+- App-level shortcut conflicts can be intercepted where Windows allows it.
+- Protected or unsupported Windows shortcuts fail safely with clear diagnostics.
+- A user has a documented way to recover if an override binding is bad.
+
+Not yet:
+- No keyboard driver.
+- No undocumented keyboard injection or private APIs.
+- No attempt to override secure desktop shortcuts.
+- No default interception of all keyboard input.
+- No modal keybinding language unless explicitly added later.
+
+## Phase 10: IPC and CLI
 
 Goal: Make the daemon controllable and observable from command-line tools.
 
@@ -186,7 +247,7 @@ Not yet:
 - No plugin system.
 - No bar-specific protocol unless needed for status experiments.
 
-## Phase 9: Borders / Visual Feedback
+## Phase 11: Borders / Visual Feedback
 
 Goal: Add minimal feedback for focus and managed state after core tiling is stable.
 
@@ -209,7 +270,7 @@ Not yet:
 - No animations.
 - No compositor replacement behavior.
 
-## Phase 10: Optional Animations
+## Phase 12: Optional Animations
 
 Goal: Add restrained, optional motion only after correctness is established.
 
@@ -229,7 +290,7 @@ Not yet:
 - No undocumented DWM hooks.
 - No animation-first redesign of the layout engine.
 
-## Phase 11: Bar/Status Integration
+## Phase 13: Bar/Status Integration
 
 Goal: Expose useful state to external bars or status tools.
 
@@ -249,7 +310,7 @@ Not yet:
 - No Electron-based UI.
 - No online service dependency.
 
-## Phase 12: Hardening and Edge Cases
+## Phase 14: Hardening and Edge Cases
 
 Goal: Make Winland robust enough for daily use on real Windows desktops.
 

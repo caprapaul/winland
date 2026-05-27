@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct WindowHandle(pub u64);
@@ -610,6 +611,127 @@ pub fn tile_windows(work_area: Rect, windows: &[WindowHandle]) -> Vec<TileAssign
     master_stack_assignments(work_area, windows, LayoutConfig::default())
 }
 
+pub fn tile_windows_with_config(
+    work_area: Rect,
+    windows: &[WindowHandle],
+    config: LayoutConfig,
+) -> Vec<TileAssignment> {
+    master_stack_assignments(work_area, windows, config)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TextMatcher {
+    Exact(String),
+    Contains(String),
+    Prefix(String),
+    Suffix(String),
+}
+
+impl TextMatcher {
+    pub fn matches(&self, value: &str) -> bool {
+        let value = value.to_lowercase();
+        match self {
+            Self::Exact(expected) => value == expected.to_lowercase(),
+            Self::Contains(needle) => value.contains(&needle.to_lowercase()),
+            Self::Prefix(prefix) => value.starts_with(&prefix.to_lowercase()),
+            Self::Suffix(suffix) => value.ends_with(&suffix.to_lowercase()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WindowRuleMatch {
+    pub class_name: Option<TextMatcher>,
+    pub title: Option<TextMatcher>,
+    pub executable_path: Option<TextMatcher>,
+    pub process_name: Option<TextMatcher>,
+}
+
+impl WindowRuleMatch {
+    pub fn matches(&self, window: &WindowInfo) -> bool {
+        if let Some(matcher) = &self.class_name
+            && !matcher.matches(&window.class_name)
+        {
+            return false;
+        }
+
+        if let Some(matcher) = &self.title
+            && !matcher.matches(&window.title)
+        {
+            return false;
+        }
+
+        if let Some(matcher) = &self.executable_path
+            && !window
+                .executable_path
+                .as_deref()
+                .is_some_and(|path| matcher.matches(path))
+        {
+            return false;
+        }
+
+        if let Some(matcher) = &self.process_name
+            && !window
+                .executable_path
+                .as_deref()
+                .and_then(process_name)
+                .is_some_and(|name| matcher.matches(&name))
+        {
+            return false;
+        }
+
+        true
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.class_name.is_none()
+            && self.title.is_none()
+            && self.executable_path.is_none()
+            && self.process_name.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WindowRuleAction {
+    pub manage: Option<bool>,
+    pub float: Option<bool>,
+    pub target_workspace: Option<WorkspaceId>,
+    pub always_on_workspace: Option<bool>,
+    pub layout: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowRule {
+    pub name: String,
+    pub matcher: WindowRuleMatch,
+    pub action: WindowRuleAction,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WindowRuleDecision {
+    pub manage: Option<bool>,
+    pub float: Option<bool>,
+    pub target_workspace: Option<WorkspaceId>,
+    pub always_on_workspace: Option<bool>,
+    pub layout: Option<String>,
+    pub matched_rules: Vec<String>,
+}
+
+pub fn evaluate_window_rules(window: &WindowInfo, rules: &[WindowRule]) -> WindowRuleDecision {
+    let mut decision = WindowRuleDecision::default();
+
+    for rule in rules {
+        if !rule.matcher.matches(window) {
+            continue;
+        }
+
+        decision.matched_rules.push(rule.name.clone());
+        merge_rule_action(&mut decision, &rule.action);
+    }
+
+    decision
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowStyles {
     pub style: u32,
@@ -772,6 +894,30 @@ fn is_shell_class(class_name: &str) -> bool {
             | "MsgrIMEWindowClass"
             | "IME"
     )
+}
+
+fn merge_rule_action(decision: &mut WindowRuleDecision, action: &WindowRuleAction) {
+    if action.manage.is_some() {
+        decision.manage = action.manage;
+    }
+    if action.float.is_some() {
+        decision.float = action.float;
+    }
+    if action.target_workspace.is_some() {
+        decision.target_workspace = action.target_workspace;
+    }
+    if action.always_on_workspace.is_some() {
+        decision.always_on_workspace = action.always_on_workspace;
+    }
+    if action.layout.is_some() {
+        decision.layout = action.layout.clone();
+    }
+}
+
+fn process_name(path: &str) -> Option<String> {
+    Path::new(path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
 }
 
 fn master_stack_assignments(
@@ -1349,5 +1495,65 @@ mod tests {
             .collect();
 
         assert_eq!(handles, vec![WindowHandle(1)]);
+    }
+
+    #[test]
+    fn window_rules_match_stable_metadata() {
+        let rule = WindowRule {
+            name: "pin editor".to_owned(),
+            matcher: WindowRuleMatch {
+                class_name: Some(TextMatcher::Exact("ApplicationFrameWindow".to_owned())),
+                title: Some(TextMatcher::Contains("edit".to_owned())),
+                executable_path: Some(TextMatcher::Suffix("notepad.exe".to_owned())),
+                process_name: Some(TextMatcher::Exact("notepad.exe".to_owned())),
+            },
+            action: WindowRuleAction {
+                target_workspace: Some(WorkspaceId(2)),
+                ..WindowRuleAction::default()
+            },
+        };
+
+        let decision = evaluate_window_rules(&window(), &[rule]);
+
+        assert_eq!(decision.target_workspace, Some(WorkspaceId(2)));
+        assert_eq!(decision.matched_rules, vec!["pin editor"]);
+    }
+
+    #[test]
+    fn later_matching_window_rules_override_earlier_actions() {
+        let rules = [
+            WindowRule {
+                name: "float all app frames".to_owned(),
+                matcher: WindowRuleMatch {
+                    class_name: Some(TextMatcher::Exact("ApplicationFrameWindow".to_owned())),
+                    ..WindowRuleMatch::default()
+                },
+                action: WindowRuleAction {
+                    float: Some(true),
+                    target_workspace: Some(WorkspaceId(2)),
+                    ..WindowRuleAction::default()
+                },
+            },
+            WindowRule {
+                name: "keep notepad tiled".to_owned(),
+                matcher: WindowRuleMatch {
+                    process_name: Some(TextMatcher::Exact("notepad.exe".to_owned())),
+                    ..WindowRuleMatch::default()
+                },
+                action: WindowRuleAction {
+                    float: Some(false),
+                    ..WindowRuleAction::default()
+                },
+            },
+        ];
+
+        let decision = evaluate_window_rules(&window(), &rules);
+
+        assert_eq!(decision.float, Some(false));
+        assert_eq!(decision.target_workspace, Some(WorkspaceId(2)));
+        assert_eq!(
+            decision.matched_rules,
+            vec!["float all app frames", "keep notepad tiled"]
+        );
     }
 }

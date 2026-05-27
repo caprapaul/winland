@@ -6,9 +6,11 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
+use winland_config::{Config, HotkeyKey, HotkeyModifier};
 use winland_core::{
-    MonitorInfo, TileAssignment, WindowHandle, WindowInfo, WorkspaceId, WorkspaceManager,
-    WorkspaceVisibilityChange, tile_windows,
+    LayoutConfig, MonitorInfo, TileAssignment, WindowHandle, WindowInfo, WindowRule,
+    WindowRuleDecision, WorkspaceId, WorkspaceManager, WorkspaceVisibilityChange,
+    evaluate_window_rules, tile_windows_with_config,
 };
 use winland_win32::{
     HotkeyBinding, HotkeyEvent, HotkeyId, HotkeyModifierSet, VirtualKey, WindowEvent,
@@ -17,25 +19,11 @@ use winland_win32::{
 
 const RECONCILE_DEBOUNCE: Duration = Duration::from_millis(50);
 const MAX_BATCH_SIZE: usize = 512;
-const DEFAULT_WORKSPACE_COUNT: u16 = 9;
-
-const HOTKEY_FOCUS_LEFT: HotkeyId = HotkeyId(1);
-const HOTKEY_FOCUS_DOWN: HotkeyId = HotkeyId(2);
-const HOTKEY_FOCUS_UP: HotkeyId = HotkeyId(3);
-const HOTKEY_FOCUS_RIGHT: HotkeyId = HotkeyId(4);
-const HOTKEY_SWAP_LEFT: HotkeyId = HotkeyId(5);
-const HOTKEY_SWAP_DOWN: HotkeyId = HotkeyId(6);
-const HOTKEY_SWAP_UP: HotkeyId = HotkeyId(7);
-const HOTKEY_SWAP_RIGHT: HotkeyId = HotkeyId(8);
-const HOTKEY_RETILE: HotkeyId = HotkeyId(9);
-const HOTKEY_TOGGLE_FLOAT: HotkeyId = HotkeyId(10);
-const HOTKEY_RELOAD: HotkeyId = HotkeyId(11);
-const HOTKEY_QUIT: HotkeyId = HotkeyId(12);
-const HOTKEY_SWITCH_WORKSPACE_BASE: i32 = 20;
-const HOTKEY_MOVE_TO_WORKSPACE_BASE: i32 = 40;
-
 fn main() -> Result<()> {
-    init_tracing();
+    let loaded_config = winland_config::load_or_default(None).context("load Winland config")?;
+    init_tracing(&loaded_config.config.general.log_level);
+    log_loaded_config(&loaded_config);
+    let runtime_config = RuntimeConfig::from_config(&loaded_config.config)?;
 
     let (daemon_sender, daemon_receiver) = mpsc::channel();
     let (window_sender, window_receiver) = mpsc::channel();
@@ -45,7 +33,7 @@ fn main() -> Result<()> {
         .context("spawn window event bridge")?;
 
     let (hotkey_sender, hotkey_receiver) = mpsc::channel();
-    let hotkey_bindings = default_hotkey_bindings();
+    let (hotkey_bindings, hotkey_commands) = hotkey_bindings_from_config(&loaded_config.config)?;
     let hotkey_registration =
         winland_win32::register_hotkeys(hotkey_bindings.clone(), hotkey_sender)
             .context("register documented Win32 daemon hotkeys")?;
@@ -54,7 +42,8 @@ fn main() -> Result<()> {
         .context("spawn hotkey bridge")?;
     drop(daemon_sender);
 
-    let state = DaemonState::discover().context("build initial window snapshot")?;
+    let state = DaemonState::discover(runtime_config, hotkey_commands)
+        .context("build initial window snapshot")?;
     let processor = thread::Builder::new()
         .name("winland-daemon-events".to_owned())
         .spawn(move || process_daemon_events(daemon_receiver, state))
@@ -76,12 +65,43 @@ fn main() -> Result<()> {
     }
 }
 
-fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+fn init_tracing(default_level: &str) {
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
         .init();
+}
+
+fn log_loaded_config(loaded: &winland_config::LoadedConfig) {
+    match &loaded.path {
+        Some(path) => info!(path = %path.display(), "loaded Winland config"),
+        None => info!("no Winland config file found; using built-in defaults"),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeConfig {
+    layout: LayoutConfig,
+    workspace_count: u16,
+    window_rules: Vec<WindowRule>,
+}
+
+impl RuntimeConfig {
+    fn from_config(config: &Config) -> Result<Self> {
+        Ok(Self {
+            layout: config.layout_config(),
+            workspace_count: config.workspace_count(),
+            window_rules: config.window_rules().context("convert window rules")?,
+        })
+    }
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self::from_config(&Config::default()).expect("built-in config defaults are valid")
+    }
 }
 
 fn spawn_window_bridge(
@@ -168,10 +188,12 @@ struct DaemonState {
     tile_order: Vec<WindowHandle>,
     floating: BTreeSet<WindowHandle>,
     workspaces: WorkspaceManager,
+    config: RuntimeConfig,
+    hotkey_commands: HotkeyCommandMap,
 }
 
 impl DaemonState {
-    fn discover() -> Result<Self> {
+    fn discover(config: RuntimeConfig, hotkey_commands: HotkeyCommandMap) -> Result<Self> {
         let windows = winland_win32::enumerate_windows()
             .context("enumerate windows for daemon snapshot")?
             .into_iter()
@@ -186,7 +208,9 @@ impl DaemonState {
             foreground,
             tile_order: Vec::new(),
             floating: BTreeSet::new(),
-            workspaces: WorkspaceManager::new(DEFAULT_WORKSPACE_COUNT),
+            workspaces: WorkspaceManager::new(config.workspace_count),
+            config,
+            hotkey_commands,
         };
         state.tile_order = state.manageable_handles_sorted();
         state.sync_workspace_state(&monitors);
@@ -204,8 +228,8 @@ impl DaemonState {
             );
         }
 
-        let mut refreshed =
-            Self::discover().context("refresh window snapshot after event batch")?;
+        let mut refreshed = Self::discover(self.config.clone(), self.hotkey_commands.clone())
+            .context("refresh window snapshot after event batch")?;
         let diff = self.diff(&refreshed);
         let monitors = winland_win32::enumerate_monitors()
             .context("enumerate monitors while preserving daemon state")?;
@@ -244,7 +268,7 @@ impl DaemonState {
     }
 
     fn handle_hotkey(&mut self, event: HotkeyEvent) -> Result<()> {
-        let Some(command) = command_for_hotkey(event.id) else {
+        let Some(command) = self.hotkey_commands.command(event.id) else {
             warn!(id = event.id.0, "ignoring unrecognized daemon hotkey");
             return Ok(());
         };
@@ -255,7 +279,12 @@ impl DaemonState {
 
     fn execute_command(&mut self, command: DaemonCommand) -> Result<()> {
         if command == DaemonCommand::Reload {
-            let mut refreshed = Self::discover().context("reload daemon window snapshot")?;
+            let loaded_config =
+                winland_config::load_or_default(None).context("reload Winland config")?;
+            log_loaded_config(&loaded_config);
+            let runtime_config = RuntimeConfig::from_config(&loaded_config.config)?;
+            let mut refreshed = Self::discover(runtime_config, self.hotkey_commands.clone())
+                .context("reload daemon window snapshot")?;
             let monitors = winland_win32::enumerate_monitors()
                 .context("enumerate monitors while reloading daemon state")?;
             self.preserve_keyboard_state(&mut refreshed, &monitors);
@@ -557,7 +586,7 @@ impl DaemonState {
                     })
                     .collect();
 
-                tile_windows(monitor.work_area, &handles)
+                tile_windows_with_config(monitor.work_area, &handles, self.config.layout)
             })
             .collect()
     }
@@ -566,29 +595,50 @@ impl DaemonState {
         let existing: BTreeSet<_> = self.windows.keys().copied().collect();
         self.workspaces.retain_windows(&existing);
 
-        for (handle, window) in &self.windows {
-            if self.workspaces.window_state(*handle).is_some() {
-                if window.is_workspace_manageable() {
-                    self.workspaces.update_window_rect(*handle, window.rect);
+        let windows: Vec<_> = self
+            .windows
+            .iter()
+            .map(|(handle, window)| (*handle, window.clone()))
+            .collect();
+
+        for (handle, window) in windows {
+            let decision = self.rule_decision(&window);
+            if self.workspaces.window_state(handle).is_some() {
+                if self.is_workspace_manageable_by_rules(&window, &decision) {
+                    self.workspaces.update_window_rect(handle, window.rect);
                 }
-            } else if window.is_manageable() && !is_fullscreen_window(window, monitors) {
-                self.workspaces.track_window(*handle, window.rect);
+            } else if self.is_manageable_by_rules(&window, &decision)
+                && !is_fullscreen_window(&window, monitors)
+            {
+                if let Some(workspace) = decision.target_workspace {
+                    self.workspaces
+                        .track_window_on_workspace(handle, workspace, window.rect);
+                } else {
+                    self.workspaces.track_window(handle, window.rect);
+                }
+
+                if decision.float == Some(true) {
+                    self.floating.insert(handle);
+                }
+                if decision.always_on_workspace == Some(true) {
+                    self.workspaces.set_visible_on_all_workspaces(handle, true);
+                }
             }
         }
     }
 
     fn should_hide_for_workspace(&self, window: WindowHandle, monitors: &[MonitorInfo]) -> bool {
         self.windows.get(&window).is_some_and(|info| {
-            info.is_workspace_manageable() && !is_fullscreen_window(info, monitors)
+            self.is_workspace_manageable_by_rules(info, &self.rule_decision(info))
+                && !is_fullscreen_window(info, monitors)
         })
     }
 
     fn is_tilable_window(&self, handle: WindowHandle) -> bool {
         self.workspaces.is_window_on_active_workspace(handle)
-            && self
-                .windows
-                .get(&handle)
-                .is_some_and(WindowInfo::is_workspace_manageable)
+            && self.windows.get(&handle).is_some_and(|window| {
+                self.is_workspace_manageable_by_rules(window, &self.rule_decision(window))
+            })
     }
 
     fn window_layout_rect(&self, handle: WindowHandle, window: &WindowInfo) -> winland_core::Rect {
@@ -648,14 +698,14 @@ impl DaemonState {
     fn manageable_window_count(&self) -> usize {
         self.windows
             .values()
-            .filter(|window| window.is_manageable())
+            .filter(|window| self.is_manageable_by_rules(window, &self.rule_decision(window)))
             .count()
     }
 
     fn manageable_handles_sorted(&self) -> Vec<WindowHandle> {
         self.windows
             .iter()
-            .filter(|(_, window)| window.is_manageable())
+            .filter(|(_, window)| self.is_manageable_by_rules(window, &self.rule_decision(window)))
             .map(|(handle, _)| *handle)
             .collect()
     }
@@ -670,10 +720,25 @@ impl DaemonState {
 
     fn is_manageable_window(&self, handle: WindowHandle) -> bool {
         self.workspaces.is_window_on_active_workspace(handle)
-            && self
-                .windows
-                .get(&handle)
-                .is_some_and(|window| window.is_manageable())
+            && self.windows.get(&handle).is_some_and(|window| {
+                self.is_manageable_by_rules(window, &self.rule_decision(window))
+            })
+    }
+
+    fn rule_decision(&self, window: &WindowInfo) -> WindowRuleDecision {
+        evaluate_window_rules(window, &self.config.window_rules)
+    }
+
+    fn is_manageable_by_rules(&self, window: &WindowInfo, decision: &WindowRuleDecision) -> bool {
+        window.is_manageable() && decision.manage != Some(false)
+    }
+
+    fn is_workspace_manageable_by_rules(
+        &self,
+        window: &WindowInfo,
+        decision: &WindowRuleDecision,
+    ) -> bool {
+        window.is_workspace_manageable() && decision.manage != Some(false)
     }
 
     fn log_snapshot(&self, message: &'static str) {
@@ -749,77 +814,92 @@ fn count_events(batch: &[WindowEvent], kind: WindowEventKind) -> usize {
     batch.iter().filter(|event| event.kind == kind).count()
 }
 
-fn workspace_from_hotkey(id: i32, base: i32) -> Option<WorkspaceId> {
-    let offset = id.checked_sub(base)?;
-    if !(0..i32::from(DEFAULT_WORKSPACE_COUNT)).contains(&offset) {
-        return None;
-    }
-
-    Some(WorkspaceId((offset + 1) as u16))
+#[derive(Debug, Clone, Default)]
+struct HotkeyCommandMap {
+    commands: BTreeMap<HotkeyId, DaemonCommand>,
 }
 
-fn command_for_hotkey(id: HotkeyId) -> Option<DaemonCommand> {
-    if let Some(workspace) = workspace_from_hotkey(id.0, HOTKEY_SWITCH_WORKSPACE_BASE) {
-        return Some(DaemonCommand::SwitchWorkspace(workspace));
+impl HotkeyCommandMap {
+    fn command(&self, id: HotkeyId) -> Option<DaemonCommand> {
+        self.commands.get(&id).copied()
+    }
+}
+
+fn hotkey_bindings_from_config(config: &Config) -> Result<(Vec<HotkeyBinding>, HotkeyCommandMap)> {
+    let mut bindings = Vec::with_capacity(config.hotkeys.bindings.len());
+    let mut commands = BTreeMap::new();
+
+    for (index, binding_config) in config.hotkeys.bindings.iter().enumerate() {
+        let id = HotkeyId((index + 1) as i32);
+        let command = daemon_command_from_name(&binding_config.command)
+            .with_context(|| format!("map hotkey command '{}'", binding_config.command))?;
+        let chord = binding_config
+            .chord()
+            .with_context(|| format!("parse hotkey '{}'", binding_config.keys))?;
+        bindings.push(HotkeyBinding::new(
+            id,
+            hotkey_modifiers_from_config(&chord),
+            virtual_key_from_config(&chord.key),
+            binding_config.command.clone(),
+        ));
+        commands.insert(id, command);
     }
 
-    if let Some(workspace) = workspace_from_hotkey(id.0, HOTKEY_MOVE_TO_WORKSPACE_BASE) {
-        return Some(DaemonCommand::MoveFocusedToWorkspace(workspace));
+    Ok((bindings, HotkeyCommandMap { commands }))
+}
+
+fn daemon_command_from_name(command: &str) -> Option<DaemonCommand> {
+    if let Some(workspace) = command
+        .strip_prefix("switch-workspace-")
+        .and_then(|value| value.parse::<u16>().ok())
+    {
+        return Some(DaemonCommand::SwitchWorkspace(WorkspaceId(workspace)));
     }
 
-    match id {
-        HOTKEY_FOCUS_LEFT => Some(DaemonCommand::Focus(FocusDirection::Left)),
-        HOTKEY_FOCUS_DOWN => Some(DaemonCommand::Focus(FocusDirection::Down)),
-        HOTKEY_FOCUS_UP => Some(DaemonCommand::Focus(FocusDirection::Up)),
-        HOTKEY_FOCUS_RIGHT => Some(DaemonCommand::Focus(FocusDirection::Right)),
-        HOTKEY_SWAP_LEFT => Some(DaemonCommand::Swap(FocusDirection::Left)),
-        HOTKEY_SWAP_DOWN => Some(DaemonCommand::Swap(FocusDirection::Down)),
-        HOTKEY_SWAP_UP => Some(DaemonCommand::Swap(FocusDirection::Up)),
-        HOTKEY_SWAP_RIGHT => Some(DaemonCommand::Swap(FocusDirection::Right)),
-        HOTKEY_RETILE => Some(DaemonCommand::Retile),
-        HOTKEY_TOGGLE_FLOAT => Some(DaemonCommand::ToggleFloat),
-        HOTKEY_RELOAD => Some(DaemonCommand::Reload),
-        HOTKEY_QUIT => Some(DaemonCommand::Quit),
+    if let Some(workspace) = command
+        .strip_prefix("move-to-workspace-")
+        .and_then(|value| value.parse::<u16>().ok())
+    {
+        return Some(DaemonCommand::MoveFocusedToWorkspace(WorkspaceId(
+            workspace,
+        )));
+    }
+
+    match command {
+        "focus-left" => Some(DaemonCommand::Focus(FocusDirection::Left)),
+        "focus-down" => Some(DaemonCommand::Focus(FocusDirection::Down)),
+        "focus-up" => Some(DaemonCommand::Focus(FocusDirection::Up)),
+        "focus-right" => Some(DaemonCommand::Focus(FocusDirection::Right)),
+        "swap-left" => Some(DaemonCommand::Swap(FocusDirection::Left)),
+        "swap-down" => Some(DaemonCommand::Swap(FocusDirection::Down)),
+        "swap-up" => Some(DaemonCommand::Swap(FocusDirection::Up)),
+        "swap-right" => Some(DaemonCommand::Swap(FocusDirection::Right)),
+        "retile" => Some(DaemonCommand::Retile),
+        "toggle-float" => Some(DaemonCommand::ToggleFloat),
+        "reload" => Some(DaemonCommand::Reload),
+        "quit" => Some(DaemonCommand::Quit),
         _ => None,
     }
 }
 
-fn default_hotkey_bindings() -> Vec<HotkeyBinding> {
-    let base = HotkeyModifierSet::new().control().alt();
-    let shifted = base.shift();
-
-    let mut bindings = vec![
-        binding(HOTKEY_FOCUS_LEFT, base, b'H', "focus left"),
-        binding(HOTKEY_FOCUS_DOWN, base, b'J', "focus down"),
-        binding(HOTKEY_FOCUS_UP, base, b'K', "focus up"),
-        binding(HOTKEY_FOCUS_RIGHT, base, b'L', "focus right"),
-        binding(HOTKEY_SWAP_LEFT, shifted, b'H', "swap left"),
-        binding(HOTKEY_SWAP_DOWN, shifted, b'J', "swap down"),
-        binding(HOTKEY_SWAP_UP, shifted, b'K', "swap up"),
-        binding(HOTKEY_SWAP_RIGHT, shifted, b'L', "swap right"),
-        binding(HOTKEY_RETILE, base, b'R', "retile"),
-        HotkeyBinding::new(HOTKEY_TOGGLE_FLOAT, base, VirtualKey::SPACE, "toggle float"),
-        binding(HOTKEY_RELOAD, base, b'C', "reload"),
-        binding(HOTKEY_QUIT, base, b'Q', "quit"),
-    ];
-
-    for workspace in 1..=DEFAULT_WORKSPACE_COUNT {
-        let key = b'0' + workspace as u8;
-        bindings.push(binding(
-            HotkeyId(HOTKEY_SWITCH_WORKSPACE_BASE + i32::from(workspace) - 1),
-            base,
-            key,
-            "switch workspace",
-        ));
-        bindings.push(binding(
-            HotkeyId(HOTKEY_MOVE_TO_WORKSPACE_BASE + i32::from(workspace) - 1),
-            shifted,
-            key,
-            "move focused window to workspace",
-        ));
+fn hotkey_modifiers_from_config(chord: &winland_config::HotkeyChord) -> HotkeyModifierSet {
+    let mut modifiers = HotkeyModifierSet::new();
+    for modifier in &chord.modifiers {
+        modifiers = match modifier {
+            HotkeyModifier::Alt => modifiers.alt(),
+            HotkeyModifier::Control => modifiers.control(),
+            HotkeyModifier::Shift => modifiers.shift(),
+            HotkeyModifier::Super => modifiers.super_key(),
+        };
     }
+    modifiers
+}
 
-    bindings
+fn virtual_key_from_config(key: &HotkeyKey) -> VirtualKey {
+    match key {
+        HotkeyKey::Character(ch) => VirtualKey::ascii_uppercase(*ch as u8),
+        HotkeyKey::Space => VirtualKey::SPACE,
+    }
 }
 
 fn log_hotkey_registration(
@@ -885,15 +965,6 @@ fn virtual_key_label(key: VirtualKey) -> String {
     }
 }
 
-fn binding(
-    id: HotkeyId,
-    modifiers: HotkeyModifierSet,
-    key: u8,
-    description: &'static str,
-) -> HotkeyBinding {
-    HotkeyBinding::new(id, modifiers, VirtualKey::ascii_uppercase(key), description)
-}
-
 fn is_fullscreen_window(window: &WindowInfo, monitors: &[MonitorInfo]) -> bool {
     monitors
         .iter()
@@ -906,35 +977,35 @@ mod tests {
     use winland_core::{MonitorId, Rect, WindowStyles};
 
     #[test]
-    fn hotkey_ids_route_to_commands_without_real_hotkeys() {
+    fn config_hotkey_commands_route_without_real_hotkeys() {
         assert_eq!(
-            command_for_hotkey(HOTKEY_FOCUS_RIGHT),
+            daemon_command_from_name("focus-right"),
             Some(DaemonCommand::Focus(FocusDirection::Right))
         );
         assert_eq!(
-            command_for_hotkey(HOTKEY_RETILE),
+            daemon_command_from_name("retile"),
             Some(DaemonCommand::Retile)
         );
         assert_eq!(
-            command_for_hotkey(HOTKEY_TOGGLE_FLOAT),
+            daemon_command_from_name("toggle-float"),
             Some(DaemonCommand::ToggleFloat)
         );
         assert_eq!(
-            command_for_hotkey(HotkeyId(HOTKEY_SWITCH_WORKSPACE_BASE + 1)),
+            daemon_command_from_name("switch-workspace-2"),
             Some(DaemonCommand::SwitchWorkspace(WorkspaceId(2)))
         );
         assert_eq!(
-            command_for_hotkey(HotkeyId(HOTKEY_MOVE_TO_WORKSPACE_BASE + 8)),
+            daemon_command_from_name("move-to-workspace-9"),
             Some(DaemonCommand::MoveFocusedToWorkspace(WorkspaceId(9)))
         );
-        assert_eq!(command_for_hotkey(HOTKEY_QUIT), Some(DaemonCommand::Quit));
-        assert_eq!(command_for_hotkey(HotkeyId(999)), None);
+        assert_eq!(daemon_command_from_name("quit"), Some(DaemonCommand::Quit));
+        assert_eq!(daemon_command_from_name("unknown"), None);
     }
 
     #[test]
     fn hotkey_label_is_human_readable() {
         let binding = HotkeyBinding::new(
-            HOTKEY_TOGGLE_FLOAT,
+            HotkeyId(1),
             HotkeyModifierSet::new().control().alt(),
             VirtualKey::SPACE,
             "toggle float",
@@ -1169,7 +1240,9 @@ mod tests {
             foreground: None,
             tile_order: Vec::new(),
             floating: BTreeSet::new(),
-            workspaces: WorkspaceManager::new(DEFAULT_WORKSPACE_COUNT),
+            workspaces: WorkspaceManager::new(9),
+            config: RuntimeConfig::default(),
+            hotkey_commands: HotkeyCommandMap::default(),
         };
         state.tile_order = state.manageable_handles_sorted();
         state.sync_workspace_state(&[primary_test_monitor()]);

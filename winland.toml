@@ -1,0 +1,133 @@
+# Winland configuration.
+#
+# This file is the built-in default config with commented examples for every
+# supported Phase 7 section. Uncomment and edit examples as needed, then run:
+#   cargo run -p winland-cli -- config validate --path winland.toml
+
+# Window rules are evaluated in order. Later matching rules override earlier
+# action fields, so put broad rules first and specific exceptions later.
+window_rules = []
+
+# Example rule:
+# [[window_rules]]
+# name = "float settings"
+# [window_rules.match]
+# title = { contains = "Settings" }
+# process_name = "SystemSettings.exe"
+# [window_rules.action]
+# float = true
+# workspace = 2
+# always_on_workspace = false
+
+# Example rule:
+# [[window_rules]]
+# name = "ignore desktop helpers"
+# [window_rules.match]
+# class = { suffix = "ToolWindow" }
+# executable_path = { contains = "\\AppData\\Local\\" }
+# [window_rules.action]
+# manage = false
+
+[general]
+# One of: trace, debug, info, warn, error, off.
+log_level = "info"
+
+[hotkeys]
+# Phase 7 supports normal documented RegisterHotKey registration only.
+# Advanced interception is intentionally left for the later hotkey override phase.
+mode = "normal"
+
+# Supported command names:
+# focus-left, focus-down, focus-up, focus-right
+# swap-left, swap-down, swap-up, swap-right
+# retile, toggle-float, reload, quit
+# switch-workspace-N, move-to-workspace-N
+bindings = [
+  { keys = "Ctrl+Alt+H", command = "focus-left" },
+  { keys = "Ctrl+Alt+J", command = "focus-down" },
+  { keys = "Ctrl+Alt+K", command = "focus-up" },
+  { keys = "Ctrl+Alt+L", command = "focus-right" },
+  { keys = "Ctrl+Alt+Shift+H", command = "swap-left" },
+  { keys = "Ctrl+Alt+Shift+J", command = "swap-down" },
+  { keys = "Ctrl+Alt+Shift+K", command = "swap-up" },
+  { keys = "Ctrl+Alt+Shift+L", command = "swap-right" },
+  { keys = "Ctrl+Alt+R", command = "retile" },
+  { keys = "Ctrl+Alt+Space", command = "toggle-float" },
+  { keys = "Ctrl+Alt+C", command = "reload" },
+  { keys = "Ctrl+Alt+Q", command = "quit" },
+  { keys = "Ctrl+Alt+1", command = "switch-workspace-1" },
+  { keys = "Ctrl+Alt+2", command = "switch-workspace-2" },
+  { keys = "Ctrl+Alt+3", command = "switch-workspace-3" },
+  { keys = "Ctrl+Alt+4", command = "switch-workspace-4" },
+  { keys = "Ctrl+Alt+5", command = "switch-workspace-5" },
+  { keys = "Ctrl+Alt+6", command = "switch-workspace-6" },
+  { keys = "Ctrl+Alt+7", command = "switch-workspace-7" },
+  { keys = "Ctrl+Alt+8", command = "switch-workspace-8" },
+  { keys = "Ctrl+Alt+9", command = "switch-workspace-9" },
+  { keys = "Ctrl+Alt+Shift+1", command = "move-to-workspace-1" },
+  { keys = "Ctrl+Alt+Shift+2", command = "move-to-workspace-2" },
+  { keys = "Ctrl+Alt+Shift+3", command = "move-to-workspace-3" },
+  { keys = "Ctrl+Alt+Shift+4", command = "move-to-workspace-4" },
+  { keys = "Ctrl+Alt+Shift+5", command = "move-to-workspace-5" },
+  { keys = "Ctrl+Alt+Shift+6", command = "move-to-workspace-6" },
+  { keys = "Ctrl+Alt+Shift+7", command = "move-to-workspace-7" },
+  { keys = "Ctrl+Alt+Shift+8", command = "move-to-workspace-8" },
+  { keys = "Ctrl+Alt+Shift+9", command = "move-to-workspace-9" },
+]
+
+# Example alternate binding:
+# bindings = [
+#   { keys = "Win+H", command = "focus-left" },
+#   { keys = "Win+Shift+H", command = "swap-left" },
+#   { keys = "Win+R", command = "retile" },
+# ]
+
+[layout]
+# Phase 7 supports the existing master-stack layout.
+default = "master-stack"
+
+# Geometry options are applied to tiling calculations.
+gap = 0
+border = 0
+master_ratio_percent = 50
+
+[layout.per_monitor]
+# Example monitor-specific override. Monitor keys are stable user labels for
+# config and validation today; monitor-name resolution can become richer later.
+# primary = { layout = "master-stack", gap = 8, border = 1, master_ratio_percent = 60 }
+
+[layout.per_workspace]
+# Example workspace-specific overrides.
+# "1" = { layout = "master-stack", gap = 6, master_ratio_percent = 55 }
+# "2" = { layout = "master-stack", gap = 12, border = 1 }
+
+[workspaces]
+count = 9
+
+# Optional display names. The list cannot be longer than count.
+names = []
+# names = ["main", "web", "chat", "code", "docs", "media", "vm", "scratch", "misc"]
+
+# Optional initial monitor assignment by workspace number.
+initial_monitor = {}
+# initial_monitor = { "1" = "primary", "2" = "secondary" }
+
+# One of: keep-current, first.
+startup = "keep-current"
+
+[behavior]
+# Retile existing manageable windows when the daemon starts.
+startup_retile = false
+
+# Reserved for behavior policy. Kept explicit so config can grow without
+# changing the shape users already edit.
+focus_follows_mouse = false
+
+# Preserve previous placement when switching fake workspaces.
+restore_previous_placement = true
+
+# Minimized windows are skipped by default to avoid fighting applications.
+manage_minimized_windows = false
+
+# Fullscreen windows are avoided by default.
+avoid_fullscreen_windows = true

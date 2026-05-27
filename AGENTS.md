@@ -21,11 +21,11 @@ The first priority is a correct, stable tiling core. Visual polish comes after t
 
 ## Crate Boundaries
 
-- `winland-core`: platform-independent state, layout data structures, geometry, window metadata models, workspace models, rules evaluation, and pure tests.
+- `winland-core`: platform-independent state, layout data structures, geometry, window metadata models, workspace models, config-facing domain types, rules evaluation, and pure tests.
 - `winland-win32`: all direct Win32 calls, HWND handling, monitor discovery, window enumeration, event hook registration, hotkey registration, movement and resize calls, and safe wrappers around unsafe code.
 - `winland-daemon`: long-running process orchestration, event loop, state synchronization, IPC server, and integration between `winland-core` and `winland-win32`.
 - `winland-cli`: human and script-facing commands that talk to the daemon or run narrow diagnostics.
-- `winland-config`: config schema, TOML parsing, validation, and defaults.
+- `winland-config`: config schema, TOML parsing, validation, defaults, config file discovery, and conversion from user config into core domain types.
 
 If a module needs `HWND`, `RECT`, `BOOL`, raw pointers, callbacks, or Win32 handles, it belongs in `winland-win32` or behind a type exported by `winland-win32`. If a module can be tested without Windows, it probably belongs in `winland-core`.
 
@@ -37,7 +37,7 @@ If a module needs `HWND`, `RECT`, `BOOL`, raw pointers, callbacks, or Win32 hand
 4. Add keyboard control through documented Win32 mechanisms.
 5. Build a real layout engine in `winland-core`.
 6. Add fake workspaces by hiding, showing, moving, or restoring window sets through documented APIs.
-7. Add window rules and config.
+7. Add the configuration system, including hotkeys, layouts, workspaces, behavior toggles, and window rules.
 8. Add IPC and a stronger CLI.
 9. Add borders or visual feedback only after tiling is stable.
 10. Add optional animations only after layout, events, IPC, and rules are reliable.
@@ -54,6 +54,25 @@ If a module needs `HWND`, `RECT`, `BOOL`, raw pointers, callbacks, or Win32 hand
 - Any test that moves, hides, focuses, or resizes real windows must be opt-in and clearly named.
 - Prefer fake window models in `winland-core` for broad behavioral coverage.
 - Before merging behavior changes, run `cargo fmt`, `cargo clippy --workspace --all-targets`, and `cargo test --workspace` when practical.
+
+## Configuration Policy
+
+- Use TOML for human-edited configuration unless there is a strong reason to change.
+- Keep config parsing, defaults, validation, and file discovery in `winland-config`.
+- Keep config-independent behavior in `winland-core`; do not make core layout logic read files or environment variables.
+- Treat configuration as a stable user interface. Add fields conservatively and validate them with clear errors.
+- Provide sensible defaults so Winland can run without a config file.
+- Once Phase 7 lands, user-facing workflow behavior should be configurable when practical.
+- Cover at least these config areas:
+  - Hotkeys: modifier/key combinations mapped to named commands.
+  - Layouts: default layout, gaps, ratios, per-monitor or per-workspace layout choices, and layout-specific options.
+  - Workspaces: names, count, initial monitor assignment, and startup behavior.
+  - Window rules: match criteria and actions such as manage, ignore, float, target workspace, and always-on-workspace.
+  - Behavior toggles: startup retile, focus behavior, restore behavior, handling of minimized windows, and conservative safety switches.
+  - Visual feedback: border enablement, colors, widths, and related options after Phase 9 exists.
+  - Daemon and IPC: logging level, IPC endpoint selection when needed, reload behavior, and diagnostics settings.
+- Add a `winland config validate` or equivalent CLI command when config files become user-editable.
+- Config reload should be explicit at first. Automatic file watching can come later if it proves useful.
 
 ## Code Style Rules
 

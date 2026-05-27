@@ -10,7 +10,7 @@ The project is intentionally starting with the boring hard parts: window discove
 - `winland-win32`: documented Win32 integration through the `windows` crate.
 - `winland-daemon`: future event-driven background process.
 - `winland-cli`: command-line diagnostics and control.
-- `winland-config`: configuration parsing and validation.
+- `winland-config`: TOML configuration parsing, defaults, validation, and config file discovery.
 
 ## Principles
 
@@ -21,6 +21,7 @@ The project is intentionally starting with the boring hard parts: window discove
 - No permanent render loop.
 - Event-driven behavior before polling.
 - Unsafe Win32 code stays isolated in `winland-win32`.
+- Human-editable config for hotkeys, layouts, workspaces, behavior, and window rules once the core is ready for it.
 
 ## Status
 

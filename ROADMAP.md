@@ -132,27 +132,37 @@ Not yet:
 - No workspace animations.
 - No bar protocol.
 
-## Phase 7: Window Rules
+## Phase 7: Configuration and Window Rules
 
-Goal: Let users classify windows and control how Winland manages them.
+Goal: Add a real user configuration system for hotkeys, layouts, workspaces, behavior, and window rules.
 
 Tasks:
-- Define config schema in `winland-config`.
+- Define a TOML config schema in `winland-config`.
+- Decide config file discovery paths, default file name, and behavior when no config file exists.
+- Add defaults and validation for all supported config sections.
+- Add config for hotkeys as modifier/key combinations mapped to named daemon commands.
+- Add config for layouts, including default layout, gaps, ratios, per-monitor or per-workspace layout choices, and layout-specific options.
+- Add config for workspaces, including names, count, initial monitor assignment, and startup behavior.
+- Add config for behavior toggles such as startup retile, focus behavior, restore behavior, minimized-window handling, and conservative safety switches.
 - Match windows by class, title, executable path, process name, and other stable metadata.
 - Support manage, ignore, float, target workspace, initial layout hints, and always-on-workspace behavior.
-- Validate config with clear errors.
-- Add tests for rule matching and precedence.
+- Add config validation through the CLI, such as `winland config validate`.
+- Add explicit config reload behavior through IPC or CLI.
+- Add tests for config parsing, defaults, validation, rule matching, and precedence.
 
 Done criteria:
-- Rules can be loaded from TOML and applied deterministically.
-- Invalid rules fail with useful messages.
-- Rule behavior is tested without Win32.
+- Winland can run with no config file by using documented defaults.
+- A TOML config can define hotkeys, layout defaults, workspace basics, behavior toggles, and window rules.
+- Invalid config fails with useful messages before daemon state is mutated.
+- Config validation and rule behavior are tested without Win32.
+- Reloading config is explicit and reports success or failure clearly.
 
 Not yet:
 - No scripting language.
 - No remote config service.
 - No visual rule editor.
 - No automatic online rule database.
+- No automatic config file watching unless explicitly requested later.
 
 ## Phase 8: IPC and CLI
 

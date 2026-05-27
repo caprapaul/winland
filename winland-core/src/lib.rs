@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -49,6 +50,19 @@ impl Rect {
     pub fn contains(self, point: Point) -> bool {
         point.x >= self.left && point.x < self.right && point.y >= self.top && point.y < self.bottom
     }
+
+    pub fn inset(self, amount: i32) -> Self {
+        let amount = amount.max(0);
+        let horizontal = amount.min(self.width().saturating_sub(1).max(0) / 2);
+        let vertical = amount.min(self.height().saturating_sub(1).max(0) / 2);
+
+        Self {
+            left: self.left.saturating_add(horizontal),
+            top: self.top.saturating_add(vertical),
+            right: self.right.saturating_sub(horizontal),
+            bottom: self.bottom.saturating_sub(vertical),
+        }
+    }
 }
 
 impl fmt::Display for Rect {
@@ -93,46 +107,310 @@ pub struct TileAssignment {
     pub rect: Rect,
 }
 
-pub fn tile_windows(work_area: Rect, windows: &[WindowHandle]) -> Vec<TileAssignment> {
-    if work_area.is_empty() || windows.is_empty() {
-        return Vec::new();
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutDirection {
+    Left,
+    Down,
+    Up,
+    Right,
+}
+
+impl LayoutDirection {
+    fn is_backward(self) -> bool {
+        matches!(self, Self::Left | Self::Up)
     }
+}
 
-    match windows {
-        [] => Vec::new(),
-        [window] => vec![TileAssignment {
-            window: *window,
-            rect: work_area,
-        }],
-        [master, stack @ ..] => {
-            let master_width = work_area.width() / 2;
-            let master_rect = Rect {
-                left: work_area.left,
-                top: work_area.top,
-                right: work_area.left.saturating_add(master_width),
-                bottom: work_area.bottom,
-            };
-            let stack_area = Rect {
-                left: master_rect.right,
-                top: work_area.top,
-                right: work_area.right,
-                bottom: work_area.bottom,
-            };
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LayoutConfig {
+    pub gap: i32,
+    pub border: i32,
+    pub master_ratio_percent: u8,
+}
 
-            let mut assignments = Vec::with_capacity(windows.len());
-            assignments.push(TileAssignment {
-                window: *master,
-                rect: master_rect,
-            });
-            assignments.extend(split_rows(stack_area, stack.len()).zip(stack).map(
-                |(rect, window)| TileAssignment {
-                    window: *window,
-                    rect,
-                },
-            ));
-            assignments
+impl LayoutConfig {
+    pub const MIN_MASTER_RATIO_PERCENT: u8 = 10;
+    pub const MAX_MASTER_RATIO_PERCENT: u8 = 90;
+
+    pub fn normalized(self) -> Self {
+        Self {
+            gap: self.gap.max(0),
+            border: self.border.max(0),
+            master_ratio_percent: self.master_ratio_percent.clamp(
+                Self::MIN_MASTER_RATIO_PERCENT,
+                Self::MAX_MASTER_RATIO_PERCENT,
+            ),
         }
     }
+}
+
+impl Default for LayoutConfig {
+    fn default() -> Self {
+        Self {
+            gap: 0,
+            border: 0,
+            master_ratio_percent: 50,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MonitorLayoutState {
+    monitor: MonitorId,
+    config: LayoutConfig,
+    windows: Vec<WindowHandle>,
+    focused: Option<WindowHandle>,
+    floating: BTreeSet<WindowHandle>,
+}
+
+impl MonitorLayoutState {
+    pub fn new(monitor: MonitorId) -> Self {
+        Self::with_config(monitor, LayoutConfig::default())
+    }
+
+    pub fn with_config(monitor: MonitorId, config: LayoutConfig) -> Self {
+        Self {
+            monitor,
+            config: config.normalized(),
+            windows: Vec::new(),
+            focused: None,
+            floating: BTreeSet::new(),
+        }
+    }
+
+    pub fn monitor(&self) -> MonitorId {
+        self.monitor
+    }
+
+    pub fn config(&self) -> LayoutConfig {
+        self.config
+    }
+
+    pub fn focused(&self) -> Option<WindowHandle> {
+        self.focused
+    }
+
+    pub fn windows(&self) -> &[WindowHandle] {
+        &self.windows
+    }
+
+    pub fn is_floating(&self, window: WindowHandle) -> bool {
+        self.floating.contains(&window)
+    }
+
+    pub fn insert_window(&mut self, window: WindowHandle) -> bool {
+        if self.windows.contains(&window) {
+            return false;
+        }
+
+        self.windows.push(window);
+        if self.focused.is_none() {
+            self.focused = Some(window);
+        }
+
+        true
+    }
+
+    pub fn remove_window(&mut self, window: WindowHandle) -> bool {
+        let Some(index) = self
+            .windows
+            .iter()
+            .position(|candidate| *candidate == window)
+        else {
+            return false;
+        };
+
+        self.windows.remove(index);
+        self.floating.remove(&window);
+
+        if self.focused == Some(window) {
+            self.focused = if self.windows.is_empty() {
+                None
+            } else {
+                Some(self.windows[index.min(self.windows.len() - 1)])
+            };
+        }
+
+        true
+    }
+
+    pub fn focus_window(&mut self, window: WindowHandle) -> bool {
+        if !self.windows.contains(&window) {
+            return false;
+        }
+
+        self.focused = Some(window);
+        true
+    }
+
+    pub fn move_focus(&mut self, direction: LayoutDirection) -> Option<WindowHandle> {
+        let target = self.neighbor(self.focused, direction)?;
+        self.focused = Some(target);
+        Some(target)
+    }
+
+    pub fn swap_focused(&mut self, direction: LayoutDirection) -> Option<WindowHandle> {
+        let focused = self.focused?;
+        let focused_index = self
+            .windows
+            .iter()
+            .position(|candidate| *candidate == focused)?;
+        let target_index = adjacent_index(focused_index, self.windows.len(), direction)?;
+
+        self.windows.swap(focused_index, target_index);
+        Some(self.windows[focused_index])
+    }
+
+    pub fn toggle_floating(&mut self, window: WindowHandle) -> Option<bool> {
+        if !self.windows.contains(&window) {
+            return None;
+        }
+
+        if self.floating.remove(&window) {
+            Some(false)
+        } else {
+            self.floating.insert(window);
+            Some(true)
+        }
+    }
+
+    pub fn adjust_master_ratio(&mut self, delta_percentage_points: i8) -> u8 {
+        let current = i16::from(self.config.master_ratio_percent);
+        let adjusted = current + i16::from(delta_percentage_points);
+        self.config.master_ratio_percent = adjusted.clamp(
+            i16::from(LayoutConfig::MIN_MASTER_RATIO_PERCENT),
+            i16::from(LayoutConfig::MAX_MASTER_RATIO_PERCENT),
+        ) as u8;
+        self.config.master_ratio_percent
+    }
+
+    pub fn reset_layout(&mut self) {
+        self.config = LayoutConfig::default();
+        self.floating.clear();
+        self.focused = self.windows.first().copied();
+    }
+
+    pub fn assignments(&self, work_area: Rect) -> Vec<TileAssignment> {
+        let tiled_windows: Vec<_> = self
+            .windows
+            .iter()
+            .copied()
+            .filter(|window| !self.floating.contains(window))
+            .collect();
+
+        master_stack_assignments(work_area, &tiled_windows, self.config)
+    }
+
+    fn neighbor(
+        &self,
+        current: Option<WindowHandle>,
+        direction: LayoutDirection,
+    ) -> Option<WindowHandle> {
+        if self.windows.is_empty() {
+            return None;
+        }
+
+        let current_index = current
+            .and_then(|window| {
+                self.windows
+                    .iter()
+                    .position(|candidate| *candidate == window)
+            })
+            .unwrap_or(0);
+        let target_index = adjacent_index(current_index, self.windows.len(), direction)?;
+        Some(self.windows[target_index])
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayoutEngine {
+    default_config: LayoutConfig,
+    monitors: BTreeMap<MonitorId, MonitorLayoutState>,
+}
+
+impl LayoutEngine {
+    pub fn new() -> Self {
+        Self::with_default_config(LayoutConfig::default())
+    }
+
+    pub fn with_default_config(default_config: LayoutConfig) -> Self {
+        Self {
+            default_config: default_config.normalized(),
+            monitors: BTreeMap::new(),
+        }
+    }
+
+    pub fn ensure_monitor(&mut self, monitor: MonitorId) -> &mut MonitorLayoutState {
+        self.monitors
+            .entry(monitor)
+            .or_insert_with(|| MonitorLayoutState::with_config(monitor, self.default_config))
+    }
+
+    pub fn remove_monitor(&mut self, monitor: MonitorId) -> Option<MonitorLayoutState> {
+        self.monitors.remove(&monitor)
+    }
+
+    pub fn monitor(&self, monitor: MonitorId) -> Option<&MonitorLayoutState> {
+        self.monitors.get(&monitor)
+    }
+
+    pub fn monitor_mut(&mut self, monitor: MonitorId) -> Option<&mut MonitorLayoutState> {
+        self.monitors.get_mut(&monitor)
+    }
+
+    pub fn insert_window(&mut self, monitor: MonitorId, window: WindowHandle) -> bool {
+        if self
+            .monitors
+            .get(&monitor)
+            .is_some_and(|state| state.windows.contains(&window))
+        {
+            return false;
+        }
+
+        self.remove_window(window);
+        self.ensure_monitor(monitor).insert_window(window)
+    }
+
+    pub fn remove_window(&mut self, window: WindowHandle) -> bool {
+        self.monitors
+            .values_mut()
+            .any(|monitor| monitor.remove_window(window))
+    }
+
+    pub fn move_window_to_monitor(&mut self, monitor: MonitorId, window: WindowHandle) -> bool {
+        self.insert_window(monitor, window)
+    }
+
+    pub fn reset_monitor(&mut self, monitor: MonitorId) -> bool {
+        let Some(state) = self.monitors.get_mut(&monitor) else {
+            return false;
+        };
+
+        state.reset_layout();
+        true
+    }
+
+    pub fn assignments(&self, monitors: &[MonitorInfo]) -> Vec<TileAssignment> {
+        monitors
+            .iter()
+            .flat_map(|monitor| {
+                self.monitors
+                    .get(&monitor.id)
+                    .map(|state| state.assignments(monitor.work_area))
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+}
+
+impl Default for LayoutEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub fn tile_windows(work_area: Rect, windows: &[WindowHandle]) -> Vec<TileAssignment> {
+    master_stack_assignments(work_area, windows, LayoutConfig::default())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -249,17 +527,105 @@ fn is_shell_class(class_name: &str) -> bool {
     )
 }
 
-fn split_rows(area: Rect, rows: usize) -> impl Iterator<Item = Rect> {
-    let base_height = area.height() / rows as i32;
-    let remainder = area.height() % rows as i32;
+fn master_stack_assignments(
+    work_area: Rect,
+    windows: &[WindowHandle],
+    config: LayoutConfig,
+) -> Vec<TileAssignment> {
+    if work_area.is_empty() || windows.is_empty() {
+        return Vec::new();
+    }
+
+    let config = config.normalized();
+    match windows {
+        [] => Vec::new(),
+        [window] => vec![TileAssignment {
+            window: *window,
+            rect: reserve_window_rect(work_area.inset(config.gap), config),
+        }],
+        [master, stack @ ..] => {
+            let gap = config.gap;
+            let outer_area = work_area.inset(gap);
+            if outer_area.is_empty() {
+                return Vec::new();
+            }
+
+            let available_width = outer_area.width().saturating_sub(gap);
+            if available_width <= 0 {
+                return Vec::new();
+            }
+
+            let master_width = scale_length(available_width, config.master_ratio_percent);
+            let master_rect = Rect::from_size(
+                outer_area.left,
+                outer_area.top,
+                master_width,
+                outer_area.height(),
+            );
+            let stack_area = Rect {
+                left: master_rect.right.saturating_add(gap),
+                top: outer_area.top,
+                right: outer_area.right,
+                bottom: outer_area.bottom,
+            };
+
+            let mut assignments = Vec::with_capacity(windows.len());
+            assignments.push(TileAssignment {
+                window: *master,
+                rect: reserve_window_rect(master_rect, config),
+            });
+            assignments.extend(
+                split_rows_with_gap(stack_area, stack.len(), gap)
+                    .zip(stack)
+                    .map(|(rect, window)| TileAssignment {
+                        window: *window,
+                        rect: reserve_window_rect(rect, config),
+                    }),
+            );
+            assignments
+        }
+    }
+}
+
+fn reserve_window_rect(rect: Rect, config: LayoutConfig) -> Rect {
+    rect.inset(config.border)
+}
+
+fn split_rows_with_gap(area: Rect, rows: usize, gap: i32) -> impl Iterator<Item = Rect> {
+    let gap = gap.max(0);
+    let total_gap = gap.saturating_mul(rows.saturating_sub(1).min(i32::MAX as usize) as i32);
+    let available_height = area.height().saturating_sub(total_gap);
+    let base_height = available_height / rows as i32;
+    let remainder = available_height % rows as i32;
 
     (0..rows).scan(area.top, move |top, index| {
         let extra = if (index as i32) < remainder { 1 } else { 0 };
         let height = base_height.saturating_add(extra);
         let rect = Rect::from_size(area.left, *top, area.width(), height);
-        *top = top.saturating_add(height);
+        *top = top.saturating_add(height).saturating_add(gap);
         Some(rect)
     })
+}
+
+fn scale_length(length: i32, percent: u8) -> i32 {
+    ((i64::from(length) * i64::from(percent)) / 100).clamp(i64::from(i32::MIN), i64::from(i32::MAX))
+        as i32
+}
+
+fn adjacent_index(current_index: usize, len: usize, direction: LayoutDirection) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+
+    if direction.is_backward() {
+        Some(if current_index == 0 {
+            len - 1
+        } else {
+            current_index - 1
+        })
+    } else {
+        Some((current_index + 1) % len)
+    }
 }
 
 #[cfg(test)]
@@ -394,6 +760,233 @@ mod tests {
                     rect: Rect::from_size(500, 401, 500, 400),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn layout_state_inserts_windows_without_duplicates() {
+        let mut layout = MonitorLayoutState::new(MonitorId(1));
+
+        assert!(layout.insert_window(WindowHandle(1)));
+        assert!(layout.insert_window(WindowHandle(2)));
+        assert!(!layout.insert_window(WindowHandle(1)));
+
+        assert_eq!(layout.windows(), &[WindowHandle(1), WindowHandle(2)]);
+        assert_eq!(layout.focused(), Some(WindowHandle(1)));
+    }
+
+    #[test]
+    fn removing_focused_window_selects_next_window() {
+        let mut layout = MonitorLayoutState::new(MonitorId(1));
+        layout.insert_window(WindowHandle(1));
+        layout.insert_window(WindowHandle(2));
+        layout.insert_window(WindowHandle(3));
+        assert!(layout.focus_window(WindowHandle(2)));
+
+        assert!(layout.remove_window(WindowHandle(2)));
+
+        assert_eq!(layout.windows(), &[WindowHandle(1), WindowHandle(3)]);
+        assert_eq!(layout.focused(), Some(WindowHandle(3)));
+    }
+
+    #[test]
+    fn focus_movement_wraps_through_layout_order() {
+        let mut layout = MonitorLayoutState::new(MonitorId(1));
+        layout.insert_window(WindowHandle(1));
+        layout.insert_window(WindowHandle(2));
+        layout.insert_window(WindowHandle(3));
+
+        assert_eq!(
+            layout.move_focus(LayoutDirection::Left),
+            Some(WindowHandle(3))
+        );
+        assert_eq!(
+            layout.move_focus(LayoutDirection::Right),
+            Some(WindowHandle(1))
+        );
+        assert_eq!(
+            layout.move_focus(LayoutDirection::Down),
+            Some(WindowHandle(2))
+        );
+    }
+
+    #[test]
+    fn swapping_focused_window_changes_layout_order() {
+        let mut layout = MonitorLayoutState::new(MonitorId(1));
+        layout.insert_window(WindowHandle(1));
+        layout.insert_window(WindowHandle(2));
+        layout.insert_window(WindowHandle(3));
+        assert!(layout.focus_window(WindowHandle(2)));
+
+        assert_eq!(
+            layout.swap_focused(LayoutDirection::Right),
+            Some(WindowHandle(3))
+        );
+
+        assert_eq!(
+            layout.windows(),
+            &[WindowHandle(1), WindowHandle(3), WindowHandle(2)]
+        );
+        assert_eq!(layout.focused(), Some(WindowHandle(2)));
+    }
+
+    #[test]
+    fn master_ratio_changes_master_stack_geometry() {
+        let mut layout = MonitorLayoutState::new(MonitorId(1));
+        layout.insert_window(WindowHandle(1));
+        layout.insert_window(WindowHandle(2));
+        assert_eq!(layout.adjust_master_ratio(10), 60);
+
+        let assignments = layout.assignments(Rect::from_size(0, 0, 1000, 800));
+
+        assert_eq!(
+            assignments,
+            vec![
+                TileAssignment {
+                    window: WindowHandle(1),
+                    rect: Rect::from_size(0, 0, 600, 800),
+                },
+                TileAssignment {
+                    window: WindowHandle(2),
+                    rect: Rect::from_size(600, 0, 400, 800),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn gaps_and_borders_are_geometry_reservations() {
+        let mut layout = MonitorLayoutState::with_config(
+            MonitorId(1),
+            LayoutConfig {
+                gap: 10,
+                border: 2,
+                master_ratio_percent: 50,
+            },
+        );
+        layout.insert_window(WindowHandle(1));
+        layout.insert_window(WindowHandle(2));
+
+        let assignments = layout.assignments(Rect::from_size(0, 0, 100, 100));
+
+        assert_eq!(
+            assignments,
+            vec![
+                TileAssignment {
+                    window: WindowHandle(1),
+                    rect: Rect::from_size(12, 12, 31, 76),
+                },
+                TileAssignment {
+                    window: WindowHandle(2),
+                    rect: Rect::from_size(57, 12, 31, 76),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn floating_windows_are_excluded_from_tiling_assignments() {
+        let mut layout = MonitorLayoutState::new(MonitorId(1));
+        layout.insert_window(WindowHandle(1));
+        layout.insert_window(WindowHandle(2));
+        layout.insert_window(WindowHandle(3));
+
+        assert_eq!(layout.toggle_floating(WindowHandle(2)), Some(true));
+
+        let assignments = layout.assignments(Rect::from_size(0, 0, 1000, 800));
+
+        assert_eq!(
+            assignments,
+            vec![
+                TileAssignment {
+                    window: WindowHandle(1),
+                    rect: Rect::from_size(0, 0, 500, 800),
+                },
+                TileAssignment {
+                    window: WindowHandle(3),
+                    rect: Rect::from_size(500, 0, 500, 800),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn layout_reset_restores_default_geometry_state() {
+        let mut layout = MonitorLayoutState::with_config(
+            MonitorId(1),
+            LayoutConfig {
+                gap: 12,
+                border: 4,
+                master_ratio_percent: 70,
+            },
+        );
+        layout.insert_window(WindowHandle(1));
+        layout.insert_window(WindowHandle(2));
+        assert!(layout.focus_window(WindowHandle(2)));
+        layout.toggle_floating(WindowHandle(2));
+
+        layout.reset_layout();
+
+        assert_eq!(layout.config(), LayoutConfig::default());
+        assert_eq!(layout.focused(), Some(WindowHandle(1)));
+        assert!(!layout.is_floating(WindowHandle(2)));
+    }
+
+    #[test]
+    fn layout_engine_assigns_multiple_monitors_independently() {
+        let monitors = [
+            MonitorInfo {
+                id: MonitorId(1),
+                is_primary: true,
+                rect: Rect::from_size(0, 0, 1000, 800),
+                work_area: Rect::from_size(0, 0, 1000, 760),
+            },
+            MonitorInfo {
+                id: MonitorId(2),
+                is_primary: false,
+                rect: Rect::from_size(1000, 0, 800, 600),
+                work_area: Rect::from_size(1000, 0, 800, 560),
+            },
+        ];
+        let mut engine = LayoutEngine::new();
+        engine.insert_window(MonitorId(1), WindowHandle(1));
+        engine.insert_window(MonitorId(1), WindowHandle(2));
+        engine.insert_window(MonitorId(2), WindowHandle(3));
+
+        let assignments = engine.assignments(&monitors);
+
+        assert_eq!(
+            assignments,
+            vec![
+                TileAssignment {
+                    window: WindowHandle(1),
+                    rect: Rect::from_size(0, 0, 500, 760),
+                },
+                TileAssignment {
+                    window: WindowHandle(2),
+                    rect: Rect::from_size(500, 0, 500, 760),
+                },
+                TileAssignment {
+                    window: WindowHandle(3),
+                    rect: Rect::from_size(1000, 0, 800, 560),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn layout_engine_does_not_reorder_duplicate_monitor_insert() {
+        let mut engine = LayoutEngine::new();
+        assert!(engine.insert_window(MonitorId(1), WindowHandle(1)));
+        assert!(engine.insert_window(MonitorId(1), WindowHandle(2)));
+
+        assert!(!engine.insert_window(MonitorId(1), WindowHandle(1)));
+
+        assert_eq!(
+            engine
+                .monitor(MonitorId(1))
+                .map(MonitorLayoutState::windows),
+            Some([WindowHandle(1), WindowHandle(2)].as_slice())
         );
     }
 

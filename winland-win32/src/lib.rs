@@ -9,35 +9,43 @@ mod platform {
 
     use tracing::{debug, warn};
     use windows::Win32::Foundation::{
-        BOOL, CloseHandle, HANDLE, HMODULE, HWND, LPARAM, RECT, TRUE,
+        BOOL, CloseHandle, HANDLE, HMODULE, HWND, LPARAM, RECT, TRUE, WPARAM,
     };
     use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
     use windows::Win32::Graphics::Gdi::{
         EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
     };
     use windows::Win32::System::Threading::{
-        OpenProcess, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
+        GetCurrentThreadId, OpenProcess, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
         QueryFullProcessImageNameW,
     };
     use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, RegisterHotKey,
+        UnregisterHotKey,
+    };
     use windows::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE,
         EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW, EVENT_SYSTEM_FOREGROUND,
         EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, EnumWindows, GW_OWNER, GWL_EXSTYLE,
         GWL_STYLE, GetClassNameW, GetForegroundWindow, GetMessageW, GetWindow, GetWindowLongPtrW,
         GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
-        IsWindowVisible, MONITORINFOF_PRIMARY, MSG, OBJID_WINDOW, SWP_NOACTIVATE,
-        SWP_NOOWNERZORDER, SWP_NOZORDER, SetWindowPos, TranslateMessage, WINEVENT_OUTOFCONTEXT,
-        WS_EX_TOOLWINDOW,
+        IsWindowVisible, MONITORINFOF_PRIMARY, MSG, OBJID_WINDOW, PostThreadMessageW,
+        SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER, SetForegroundWindow, SetWindowPos,
+        TranslateMessage, WINEVENT_OUTOFCONTEXT, WM_HOTKEY, WM_QUIT, WS_EX_TOOLWINDOW,
     };
     use windows::core::PWSTR;
     use winland_core::{
         MonitorId, MonitorInfo as CoreMonitorInfo, Rect, WindowHandle, WindowInfo, WindowStyles,
     };
 
-    use crate::{Result, Win32Error, WindowEvent, WindowEventKind};
+    use crate::{
+        HotkeyBinding, HotkeyEvent, HotkeyModifierSet, HotkeyRegistrationFailure, Result,
+        Win32Error, WindowEvent, WindowEventKind,
+    };
 
     static EVENT_SENDER: OnceLock<Mutex<Option<Sender<WindowEvent>>>> = OnceLock::new();
+    static HOTKEY_SENDER: OnceLock<Mutex<Option<HotkeySenderState>>> = OnceLock::new();
 
     pub fn enumerate_windows() -> Result<Vec<WindowInfo>> {
         let mut windows = Vec::new();
@@ -117,6 +125,20 @@ mod platform {
         }
     }
 
+    pub fn focus_window(handle: WindowHandle) -> Result<()> {
+        let hwnd = hwnd_from_handle(handle);
+
+        // SAFETY: hwnd is a top-level window handle tracked from documented
+        // enumeration or foreground APIs. SetForegroundWindow may still be
+        // denied by Windows focus rules; the BOOL return is checked below.
+        let ok = unsafe { SetForegroundWindow(hwnd) };
+        if ok.as_bool() {
+            Ok(())
+        } else {
+            Err(Win32Error::last_error("SetForegroundWindow"))
+        }
+    }
+
     pub fn subscribe_window_events(sender: Sender<WindowEvent>) -> Result<WindowEventSubscription> {
         {
             let mut guard = event_sender_slot()
@@ -138,6 +160,85 @@ mod platform {
         }
     }
 
+    pub fn register_hotkeys(
+        bindings: Vec<HotkeyBinding>,
+        sender: Sender<HotkeyEvent>,
+    ) -> Result<HotkeyRegistration> {
+        {
+            let mut guard = hotkey_sender_slot()
+                .lock()
+                .map_err(|_| Win32Error::HotkeySenderLockPoisoned)?;
+            if guard.is_some() {
+                return Err(Win32Error::HotkeysAlreadyRegistered);
+            }
+
+            // SAFETY: This reads the id of the current thread. Hotkeys are
+            // registered against this same thread below, and the message loop is
+            // expected to run on this thread.
+            let message_thread_id = unsafe { GetCurrentThreadId() };
+            *guard = Some(HotkeySenderState {
+                sender,
+                message_thread_id,
+            });
+        }
+
+        let mut registered = Vec::with_capacity(bindings.len());
+        let mut failures = Vec::new();
+        for binding in &bindings {
+            match register_hotkey(binding) {
+                Ok(()) => registered.push(binding.clone()),
+                Err(error) => {
+                    failures.push(HotkeyRegistrationFailure {
+                        id: binding.id,
+                        description: binding.description.clone(),
+                        error: error.to_string(),
+                    });
+                }
+            }
+        }
+
+        if registered.is_empty() {
+            clear_hotkey_sender();
+            return Err(Win32Error::NoHotkeysRegistered { failures });
+        }
+
+        debug!(
+            registered = registered.len(),
+            failed = failures.len(),
+            "registered daemon hotkeys"
+        );
+        Ok(HotkeyRegistration {
+            bindings: registered,
+            failures,
+        })
+    }
+
+    pub fn request_message_loop_stop() -> Result<()> {
+        let thread_id = {
+            let guard = hotkey_sender_slot()
+                .lock()
+                .map_err(|_| Win32Error::HotkeySenderLockPoisoned)?;
+            guard
+                .as_ref()
+                .map(|state| state.message_thread_id)
+                .ok_or(Win32Error::HotkeysNotRegistered)?
+        };
+
+        // SAFETY: thread_id is the thread where hotkeys were registered and
+        // where the daemon message loop runs. Posting WM_QUIT requests a clean
+        // GetMessageW exit without touching other thread state.
+        unsafe {
+            PostThreadMessageW(thread_id, WM_QUIT, WPARAM(0), LPARAM(0)).map_err(|source| {
+                Win32Error::Windows {
+                    context: "PostThreadMessageW(WM_QUIT)",
+                    source,
+                }
+            })?;
+        }
+
+        Ok(())
+    }
+
     pub fn run_message_loop() -> Result<()> {
         let mut message = MSG::default();
 
@@ -149,6 +250,11 @@ mod platform {
                 -1 => return Err(Win32Error::last_error("GetMessageW")),
                 0 => return Ok(()),
                 _ => {
+                    if message.message == WM_HOTKEY {
+                        dispatch_hotkey_message(message.wParam.0 as i32);
+                        continue;
+                    }
+
                     // SAFETY: message was just filled by GetMessageW.
                     unsafe {
                         let _ = TranslateMessage(&message);
@@ -176,6 +282,32 @@ mod platform {
 
             clear_event_sender();
         }
+    }
+
+    pub struct HotkeyRegistration {
+        bindings: Vec<HotkeyBinding>,
+        failures: Vec<HotkeyRegistrationFailure>,
+    }
+
+    impl HotkeyRegistration {
+        pub fn failures(&self) -> &[HotkeyRegistrationFailure] {
+            &self.failures
+        }
+    }
+
+    impl Drop for HotkeyRegistration {
+        fn drop(&mut self) {
+            for binding in self.bindings.drain(..) {
+                unregister_hotkey(binding);
+            }
+
+            clear_hotkey_sender();
+        }
+    }
+
+    struct HotkeySenderState {
+        sender: Sender<HotkeyEvent>,
+        message_thread_id: u32,
     }
 
     struct EnumState<'a> {
@@ -220,6 +352,81 @@ mod platform {
             }
             Err(_) => warn!("window event sender lock is poisoned"),
         }
+    }
+
+    fn register_hotkey(binding: &HotkeyBinding) -> Result<()> {
+        let modifiers = hotkey_modifiers(binding.modifiers);
+
+        // SAFETY: A null HWND registers the hotkey for the current thread, which
+        // owns the daemon message loop. The id is supplied by daemon-owned
+        // bindings and unregistered by HotkeyRegistration::drop.
+        unsafe {
+            RegisterHotKey(
+                HWND::default(),
+                binding.id.0,
+                modifiers,
+                binding.virtual_key.0,
+            )
+            .map_err(|source| Win32Error::HotkeyRegistration {
+                id: binding.id.0,
+                description: binding.description.clone(),
+                source,
+            })?;
+        }
+
+        Ok(())
+    }
+
+    fn unregister_hotkey(binding: HotkeyBinding) {
+        // SAFETY: The id belongs to a binding that was successfully registered
+        // for this thread by register_hotkeys and is unregistered at most once
+        // during HotkeyRegistration::drop or rollback.
+        let result = unsafe { UnregisterHotKey(HWND::default(), binding.id.0) };
+        if let Err(error) = result {
+            warn!(
+                id = binding.id.0,
+                description = %binding.description,
+                %error,
+                "failed to unregister hotkey"
+            );
+        }
+    }
+
+    fn dispatch_hotkey_message(id: i32) {
+        let Some(slot) = HOTKEY_SENDER.get() else {
+            return;
+        };
+
+        match slot.lock() {
+            Ok(guard) => {
+                if let Some(state) = guard.as_ref() {
+                    let _ = state.sender.send(HotkeyEvent { id: id.into() });
+                }
+            }
+            Err(_) => warn!("hotkey sender lock is poisoned"),
+        }
+    }
+
+    fn hotkey_modifiers(modifiers: HotkeyModifierSet) -> HOT_KEY_MODIFIERS {
+        let mut value = HOT_KEY_MODIFIERS(0);
+
+        if modifiers.alt {
+            value |= MOD_ALT;
+        }
+        if modifiers.control {
+            value |= MOD_CONTROL;
+        }
+        if modifiers.shift {
+            value |= MOD_SHIFT;
+        }
+        if modifiers.super_key {
+            value |= MOD_WIN;
+        }
+        if modifiers.no_repeat {
+            value |= MOD_NOREPEAT;
+        }
+
+        value
     }
 
     struct MonitorEnumState<'a> {
@@ -510,10 +717,21 @@ mod platform {
         EVENT_SENDER.get_or_init(|| Mutex::new(None))
     }
 
+    fn hotkey_sender_slot() -> &'static Mutex<Option<HotkeySenderState>> {
+        HOTKEY_SENDER.get_or_init(|| Mutex::new(None))
+    }
+
     fn clear_event_sender() {
         match event_sender_slot().lock() {
             Ok(mut guard) => *guard = None,
             Err(_) => warn!("window event sender lock is poisoned while clearing"),
+        }
+    }
+
+    fn clear_hotkey_sender() {
+        match hotkey_sender_slot().lock() {
+            Ok(mut guard) => *guard = None,
+            Err(_) => warn!("hotkey sender lock is poisoned while clearing"),
         }
     }
 
@@ -536,7 +754,7 @@ mod platform {
 mod platform {
     use std::sync::mpsc::Sender;
 
-    use crate::{Result, Win32Error};
+    use crate::{HotkeyBinding, HotkeyEvent, Result, Win32Error};
     use winland_core::{MonitorInfo, Rect, WindowHandle, WindowInfo};
 
     use crate::WindowEvent;
@@ -557,9 +775,24 @@ mod platform {
         Err(Win32Error::UnsupportedPlatform)
     }
 
+    pub fn focus_window(_handle: WindowHandle) -> Result<()> {
+        Err(Win32Error::UnsupportedPlatform)
+    }
+
     pub fn subscribe_window_events(
         _sender: Sender<WindowEvent>,
     ) -> Result<WindowEventSubscription> {
+        Err(Win32Error::UnsupportedPlatform)
+    }
+
+    pub fn register_hotkeys(
+        _bindings: Vec<HotkeyBinding>,
+        _sender: Sender<HotkeyEvent>,
+    ) -> Result<HotkeyRegistration> {
+        Err(Win32Error::UnsupportedPlatform)
+    }
+
+    pub fn request_message_loop_stop() -> Result<()> {
         Err(Win32Error::UnsupportedPlatform)
     }
 
@@ -568,16 +801,130 @@ mod platform {
     }
 
     pub struct WindowEventSubscription;
+    pub struct HotkeyRegistration;
+
+    impl HotkeyRegistration {
+        pub fn failures(&self) -> &[HotkeyRegistrationFailure] {
+            &[]
+        }
+    }
 }
 
+pub use platform::HotkeyRegistration;
 pub use platform::WindowEventSubscription;
 pub use platform::enumerate_monitors;
 pub use platform::enumerate_windows;
+pub use platform::focus_window;
 pub use platform::foreground_window;
 pub use platform::move_resize_window;
+pub use platform::register_hotkeys;
+pub use platform::request_message_loop_stop;
 pub use platform::run_message_loop;
 pub use platform::subscribe_window_events;
 use winland_core::WindowHandle;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HotkeyBinding {
+    pub id: HotkeyId,
+    pub modifiers: HotkeyModifierSet,
+    pub virtual_key: VirtualKey,
+    pub description: String,
+}
+
+impl HotkeyBinding {
+    pub fn new(
+        id: HotkeyId,
+        modifiers: HotkeyModifierSet,
+        virtual_key: VirtualKey,
+        description: impl Into<String>,
+    ) -> Self {
+        Self {
+            id,
+            modifiers,
+            virtual_key,
+            description: description.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HotkeyRegistrationFailure {
+    pub id: HotkeyId,
+    pub description: String,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct HotkeyId(pub i32);
+
+impl From<i32> for HotkeyId {
+    fn from(value: i32) -> Self {
+        Self(value)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HotkeyModifierSet {
+    pub alt: bool,
+    pub control: bool,
+    pub shift: bool,
+    pub super_key: bool,
+    pub no_repeat: bool,
+}
+
+impl HotkeyModifierSet {
+    pub const fn new() -> Self {
+        Self {
+            alt: false,
+            control: false,
+            shift: false,
+            super_key: false,
+            no_repeat: true,
+        }
+    }
+
+    pub const fn alt(mut self) -> Self {
+        self.alt = true;
+        self
+    }
+
+    pub const fn control(mut self) -> Self {
+        self.control = true;
+        self
+    }
+
+    pub const fn shift(mut self) -> Self {
+        self.shift = true;
+        self
+    }
+
+    pub const fn super_key(mut self) -> Self {
+        self.super_key = true;
+        self
+    }
+}
+
+impl Default for HotkeyModifierSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtualKey(pub u32);
+
+impl VirtualKey {
+    pub const fn ascii_uppercase(byte: u8) -> Self {
+        Self(byte as u32)
+    }
+
+    pub const SPACE: Self = Self(0x20);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HotkeyEvent {
+    pub id: HotkeyId,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowEvent {
@@ -616,6 +963,24 @@ pub enum Win32Error {
     EventHooksAlreadyInstalled,
     #[error("window event sender lock is poisoned")]
     EventSenderLockPoisoned,
+    #[error("hotkeys are already registered")]
+    HotkeysAlreadyRegistered,
+    #[error("hotkeys are not registered")]
+    HotkeysNotRegistered,
+    #[cfg(windows)]
+    #[error("failed to register hotkey {id} ({description}): {source}")]
+    HotkeyRegistration {
+        id: i32,
+        description: String,
+        #[source]
+        source: windows::core::Error,
+    },
+    #[error("no daemon hotkeys could be registered: {failures:?}")]
+    NoHotkeysRegistered {
+        failures: Vec<HotkeyRegistrationFailure>,
+    },
+    #[error("hotkey sender lock is poisoned")]
+    HotkeySenderLockPoisoned,
     #[error("winland-win32 is only supported on Windows")]
     UnsupportedPlatform,
 }

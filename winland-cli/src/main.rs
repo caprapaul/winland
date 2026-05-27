@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use tracing::debug;
 use tracing_subscriber::EnvFilter;
-use winland_core::{Manageability, WindowInfo};
+use winland_core::{Manageability, MonitorInfo, WindowInfo, tile_windows};
 
 #[derive(Debug, Parser)]
 #[command(name = "winland")]
@@ -16,6 +16,8 @@ struct Cli {
 enum Command {
     /// List discovered desktop windows and explain Winland's conservative filter.
     Windows(WindowsArgs),
+    /// Arrange manageable windows on the primary monitor once.
+    TileOnce,
 }
 
 #[derive(Debug, Args)]
@@ -32,6 +34,7 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::Windows(args) => list_windows(args),
+        Command::TileOnce => tile_once(),
     }
 }
 
@@ -55,6 +58,76 @@ fn list_windows(args: WindowsArgs) -> Result<()> {
 
     print_table(&listed);
     Ok(())
+}
+
+fn tile_once() -> Result<()> {
+    let windows = winland_win32::enumerate_windows()?;
+    let monitors = winland_win32::enumerate_monitors()?;
+    let monitor = primary_monitor(&monitors)?;
+
+    let selected: Vec<_> = windows
+        .iter()
+        .filter(|window| window.is_manageable())
+        .filter(|window| monitor.rect.contains(window.rect.center()))
+        .collect();
+    let handles: Vec<_> = selected.iter().map(|window| window.handle).collect();
+    let assignments = tile_windows(monitor.work_area, &handles);
+
+    if assignments.is_empty() {
+        println!(
+            "No manageable windows found on primary monitor {} (work area {}).",
+            monitor.id, monitor.work_area
+        );
+        return Ok(());
+    }
+
+    println!(
+        "Tiling {} window(s) on primary monitor {} (work area {}).",
+        assignments.len(),
+        monitor.id,
+        monitor.work_area
+    );
+
+    let mut failures = Vec::new();
+    let mut rows = Vec::new();
+    for assignment in &assignments {
+        let title = selected
+            .iter()
+            .find(|window| window.handle == assignment.window)
+            .map(|window| truncate(&window.title, 48))
+            .unwrap_or_else(|| "-".to_owned());
+
+        match winland_win32::move_resize_window(assignment.window, assignment.rect) {
+            Ok(()) => rows.push(vec![
+                assignment.window.to_string(),
+                title,
+                assignment.rect.to_string(),
+                "ok".to_owned(),
+            ]),
+            Err(error) => {
+                let message = error.to_string();
+                failures.push((assignment.window, message.clone()));
+                rows.push(vec![
+                    assignment.window.to_string(),
+                    title,
+                    assignment.rect.to_string(),
+                    truncate(&message, 64),
+                ]);
+            }
+        }
+    }
+
+    print_move_results(&rows);
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "failed to move {} of {} window(s)",
+            failures.len(),
+            assignments.len()
+        ))
+    }
 }
 
 fn print_table(windows: &[&WindowInfo]) {
@@ -110,6 +183,25 @@ fn print_table(windows: &[&WindowInfo]) {
     for row in rows {
         print_row(&row, &widths);
     }
+}
+
+fn print_move_results(rows: &[Vec<String>]) {
+    let headers = ["HWND", "Title", "Target Rect", "Result"];
+    let widths = column_widths(&headers, rows);
+
+    print_row(&headers, &widths);
+    print_separator(&widths);
+    for row in rows {
+        print_row(row, &widths);
+    }
+}
+
+fn primary_monitor(monitors: &[MonitorInfo]) -> Result<&MonitorInfo> {
+    monitors
+        .iter()
+        .find(|monitor| monitor.is_primary)
+        .or_else(|| monitors.first())
+        .ok_or_else(|| anyhow::anyhow!("no monitors were discovered"))
 }
 
 fn column_widths(headers: &[&str], rows: &[Vec<String>]) -> Vec<usize> {

@@ -32,11 +32,22 @@ If a module needs `HWND`, `RECT`, `BOOL`, raw pointers, callbacks, or Win32 hand
 
 ## Delivery Model
 
-- Work from `ROADMAP.md` as an agile backlog, not a fixed sequence.
+- Use a requirement-first workflow in the current chat. Do not make the user manage a separate roadmap chat or manually switch between planning files before implementation.
+- Start from the user's plain-language task description, even when it is rough or incomplete.
+- Before coding, ask focused requirement questions when behavior, safety, configuration, or done criteria are unclear.
+- Keep questions short and practical. Prefer asking only what is needed to turn the task into an implementable slice.
+- After questions are answered, summarize the requirement back to the user in concrete terms:
+  - desired behavior
+  - important exceptions or safety rules
+  - configuration or CLI surface, if any
+  - done criteria
+  - tests or manual verification expected
+- Wait for confirmation or correction before implementing when the requirement changes product behavior in a meaningful way.
+- Once confirmed, implement the slice end to end in the same chat: core model, Win32 integration, config if user-facing, diagnostics or CLI hooks when useful, and tests.
 - Prefer thin vertical slices that deliver usable behavior end to end.
-- Keep the current focus small enough to finish, test, and explain.
-- Reorder upcoming work when user needs or implementation risks change.
-- Each slice should cover the core model, Win32 integration, config if user-facing, diagnostics or CLI hooks when useful, and tests.
+- Keep the active task small enough to finish, test, and explain.
+- Use `ROADMAP.md` only as background context when useful. Do not treat it as the source of truth over the user's current task.
+- Update planning documents only when the user explicitly asks for documentation changes or when a durable rule should guide future agents.
 - Treat shell replacement as experimental work: it must be opt-in, VM-tested first, documented, and include a recovery command before any persistent shell setting is changed.
 - Do not start visual polish while core tiling behavior is unstable.
 

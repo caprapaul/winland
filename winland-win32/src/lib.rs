@@ -1215,6 +1215,8 @@ mod platform {
     }
 }
 
+mod shell;
+
 #[cfg(not(windows))]
 mod platform {
     use std::sync::mpsc::Sender;
@@ -1322,6 +1324,22 @@ pub use platform::send_ipc_request;
 pub use platform::show_window_without_activate;
 pub use platform::spawn_ipc_server;
 pub use platform::subscribe_window_events;
+pub use shell::ShellReplacementChange;
+pub use shell::ShellReplacementStatus;
+pub use shell::USER_WINLOGON_KEY;
+pub use shell::elevated_daemon_task_installed;
+pub use shell::install_elevated_daemon_task;
+pub use shell::install_shell_replacement;
+pub use shell::launch_elevated_process_and_wait;
+pub use shell::launch_explorer;
+pub use shell::launch_shell_test;
+pub use shell::quote_windows_arg;
+pub use shell::restore_shell_replacement;
+pub use shell::run_elevated_daemon_task;
+pub use shell::shell_command_for_executable;
+pub use shell::shell_command_with_daemon;
+pub use shell::shell_replacement_status;
+pub use shell::uninstall_elevated_daemon_task;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
@@ -1676,6 +1694,26 @@ pub enum Win32Error {
     HotkeySenderLockPoisoned,
     #[error("Winland daemon is not running on {pipe_name}")]
     DaemonNotRunning { pipe_name: String },
+    #[error("{context} failed with Win32 error {code}")]
+    Registry { context: &'static str, code: u32 },
+    #[error("registry value {name} has type {actual}; expected {expected}")]
+    UnexpectedRegistryValueType {
+        name: String,
+        expected: &'static str,
+        actual: u32,
+    },
+    #[error("no Winland shell replacement backup is present")]
+    MissingShellBackup,
+    #[error("shell command must not be empty")]
+    InvalidShellCommand,
+    #[cfg(windows)]
+    #[error("{context} returned an invalid process handle")]
+    InvalidProcessHandle { context: &'static str },
+    #[error("{operation} failed: {message}")]
+    ShellOperation {
+        operation: &'static str,
+        message: String,
+    },
     #[cfg(windows)]
     #[error("failed to spawn thread {name}: {message}")]
     ThreadSpawn { name: &'static str, message: String },

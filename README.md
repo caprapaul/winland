@@ -9,6 +9,7 @@ The project is intentionally starting with the boring hard parts: window discove
 - `winland-core`: platform-independent layout and window state logic.
 - `winland-win32`: documented Win32 integration through the `windows` crate.
 - `winland-daemon`: event-driven background process with local IPC foundations.
+- `winland-shell`: experimental user-shell entrypoint that starts the daemon without Explorer.
 - `winland-cli`: command-line diagnostics and local daemon control.
 - `winland-config`: TOML configuration parsing, defaults, validation, and config file discovery.
 
@@ -26,6 +27,10 @@ The project is intentionally starting with the boring hard parts: window discove
 ## Status
 
 This repo is in the planning and early implementation stage. See [ROADMAP.md](ROADMAP.md) for the agile backlog and [AGENTS.md](AGENTS.md) for project rules.
+
+## Experimental Shell Replacement
+
+The shell replacement prototype is VM-only, opt-in, and reversible. It uses `winland-shell` as a small user-shell entrypoint and can optionally start `winland-daemon` elevated through a scheduled task so elevated windows can be tiled. See [docs/experimental-shell-replacement.md](docs/experimental-shell-replacement.md) before installing it.
 
 ## Current IPC Slice
 

@@ -18,7 +18,7 @@ The first priority is a correct, stable tiling core. Visual polish comes after t
 - Prefer event-driven behavior over polling.
 - Do not use undocumented or private Windows APIs unless the user explicitly asks for that.
 - Do not implement visual effects before the tiling core is stable.
-- Do not change Windows shell startup behavior, replace Explorer, or persist shell-related settings unless the user explicitly asks for that experimental path.
+- Do not change Windows shell startup behavior, replace Explorer, or persist shell-related settings outside the explicitly requested experimental shell replacement path.
 
 ## Crate Boundaries
 
@@ -37,7 +37,7 @@ If a module needs `HWND`, `RECT`, `BOOL`, raw pointers, callbacks, or Win32 hand
 - Keep the current focus small enough to finish, test, and explain.
 - Reorder upcoming work when user needs or implementation risks change.
 - Each slice should cover the core model, Win32 integration, config if user-facing, diagnostics or CLI hooks when useful, and tests.
-- Treat lower-level shell integration or shell swapping as research-first work with a written recovery plan before any prototype.
+- Treat shell replacement as experimental work: it must be opt-in, VM-tested first, documented, and include a recovery command before any persistent shell setting is changed.
 - Do not start visual polish while core tiling behavior is unstable.
 
 ## Testing Rules

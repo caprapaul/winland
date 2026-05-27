@@ -27,6 +27,8 @@ enum Command {
     TileOnce,
     /// Inspect or validate Winland configuration.
     Config(ConfigArgs),
+    /// Experimental per-user shell replacement commands.
+    Shell(ShellArgs),
 }
 
 #[derive(Debug, Args)]
@@ -47,6 +49,86 @@ struct WindowsArgs {
 struct ConfigArgs {
     #[command(subcommand)]
     command: ConfigCommand,
+}
+
+#[derive(Debug, Args)]
+struct ShellArgs {
+    #[command(subcommand)]
+    command: ShellCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum ShellCommand {
+    /// Show the current experimental shell replacement status.
+    Status,
+    /// Install Winland as the per-user experimental shell.
+    Install(ShellInstallArgs),
+    /// Restore the previous per-user shell value captured by install.
+    Uninstall(ShellExperimentalArgs),
+    /// Recovery alias for uninstall when running from shell mode.
+    Recover(ShellExperimentalArgs),
+    /// Launch Winland shell mode for this session without changing the registry.
+    Test(ShellLaunchArgs),
+    /// Create or update the no-prompt elevated daemon scheduled task.
+    InstallElevatedTask(ShellElevatedTaskInstallArgs),
+    /// Delete the elevated daemon scheduled task.
+    UninstallElevatedTask(ShellExperimentalArgs),
+    /// Show whether the elevated daemon scheduled task exists.
+    ElevatedTaskStatus,
+    /// Launch Explorer manually from Winland shell mode.
+    Explorer,
+}
+
+#[derive(Debug, Args)]
+struct ShellInstallArgs {
+    /// Required acknowledgement for persistent experimental shell changes.
+    #[arg(long)]
+    experimental: bool,
+    /// Path to winland-shell.exe. Defaults to winland-shell.exe next to this CLI.
+    #[arg(long, conflicts_with = "command")]
+    shell: Option<PathBuf>,
+    /// Path to winland-daemon.exe passed through to winland-shell.
+    #[arg(long, conflicts_with = "command")]
+    daemon: Option<PathBuf>,
+    /// Ask winland-shell to start the daemon elevated so elevated windows can be tiled.
+    #[arg(long, conflicts_with = "command")]
+    elevated_daemon: bool,
+    /// Full shell command to write. Intended for VM experiments and tests.
+    #[arg(long)]
+    command: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ShellExperimentalArgs {
+    /// Required acknowledgement for persistent experimental shell changes.
+    #[arg(long)]
+    experimental: bool,
+}
+
+#[derive(Debug, Args)]
+struct ShellLaunchArgs {
+    /// Path to winland-shell.exe. Defaults to winland-shell.exe next to this CLI.
+    #[arg(long, conflicts_with = "command")]
+    shell: Option<PathBuf>,
+    /// Path to winland-daemon.exe passed through to winland-shell.
+    #[arg(long, conflicts_with = "command")]
+    daemon: Option<PathBuf>,
+    /// Ask winland-shell to start the daemon elevated so elevated windows can be tiled.
+    #[arg(long, conflicts_with = "command")]
+    elevated_daemon: bool,
+    /// Full shell command to launch. Intended for VM experiments and tests.
+    #[arg(long)]
+    command: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ShellElevatedTaskInstallArgs {
+    /// Required acknowledgement for persistent experimental scheduled task changes.
+    #[arg(long)]
+    experimental: bool,
+    /// Path to winland-daemon.exe. Defaults to winland-daemon.exe next to this CLI.
+    #[arg(long)]
+    daemon: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -72,6 +154,7 @@ fn main() -> Result<()> {
         Command::Windows(args) => list_windows(args),
         Command::TileOnce => tile_once(),
         Command::Config(args) => handle_config(args),
+        Command::Shell(args) => handle_shell(args),
     }
 }
 
@@ -111,6 +194,209 @@ fn validate_config(args: ConfigValidateArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn handle_shell(args: ShellArgs) -> Result<()> {
+    match args.command {
+        ShellCommand::Status => shell_status(),
+        ShellCommand::Install(args) => shell_install(args),
+        ShellCommand::Uninstall(args) | ShellCommand::Recover(args) => shell_uninstall(args),
+        ShellCommand::Test(args) => shell_test(args),
+        ShellCommand::InstallElevatedTask(args) => shell_install_elevated_task(args),
+        ShellCommand::UninstallElevatedTask(args) => shell_uninstall_elevated_task(args),
+        ShellCommand::ElevatedTaskStatus => shell_elevated_task_status(),
+        ShellCommand::Explorer => shell_explorer(),
+    }
+}
+
+fn shell_status() -> Result<()> {
+    let status = winland_win32::shell_replacement_status()?;
+
+    println!("Experimental shell replacement status");
+    println!("Registry value: {}\\Shell", status.registry_key);
+    println!(
+        "Current shell: {}",
+        status.current_shell.as_deref().unwrap_or("<not set>")
+    );
+    println!(
+        "Winland shell mode: {}",
+        if status.is_winland_shell { "yes" } else { "no" }
+    );
+    println!(
+        "Stored previous shell: {}",
+        status.backup_shell.as_deref().unwrap_or("<not stored>")
+    );
+    println!(
+        "Previous Shell value existed: {}",
+        status
+            .backup_shell_was_present
+            .map(yes_no)
+            .unwrap_or("<not stored>")
+    );
+
+    Ok(())
+}
+
+fn shell_install(args: ShellInstallArgs) -> Result<()> {
+    require_experimental(args.experimental)?;
+    let shell_command = shell_command(
+        args.shell.as_deref(),
+        args.daemon.as_deref(),
+        args.elevated_daemon,
+        args.command.as_deref(),
+    )?;
+    let status = winland_win32::shell_replacement_status()?;
+
+    println!("Installing experimental per-user shell replacement.");
+    println!("Registry value: {}\\Shell", status.registry_key);
+    println!(
+        "Current shell: {}",
+        status.current_shell.as_deref().unwrap_or("<not set>")
+    );
+    println!("New shell: {shell_command}");
+    println!("Undo command: winland shell uninstall --experimental");
+
+    let change = winland_win32::install_shell_replacement(&shell_command)?;
+    println!(
+        "Updated {}\\Shell from {} to {}.",
+        change.registry_key,
+        change.previous_shell.as_deref().unwrap_or("<not set>"),
+        change.new_shell.as_deref().unwrap_or("<not set>")
+    );
+    println!("Sign out or restart the VM user to enter Winland shell mode.");
+
+    Ok(())
+}
+
+fn shell_uninstall(args: ShellExperimentalArgs) -> Result<()> {
+    require_experimental(args.experimental)?;
+    let change = winland_win32::restore_shell_replacement()?;
+    if winland_win32::elevated_daemon_task_installed()? {
+        winland_win32::uninstall_elevated_daemon_task()?;
+        println!("Deleted elevated daemon scheduled task.");
+    }
+
+    println!(
+        "Restored {}\\Shell from {} to {}.",
+        change.registry_key,
+        change.previous_shell.as_deref().unwrap_or("<not set>"),
+        change.new_shell.as_deref().unwrap_or("<not set>")
+    );
+    println!("Launch Explorer now with: winland shell explorer");
+
+    Ok(())
+}
+
+fn shell_install_elevated_task(args: ShellElevatedTaskInstallArgs) -> Result<()> {
+    require_experimental(args.experimental)?;
+    let daemon = match args.daemon {
+        Some(path) => path,
+        None => default_daemon_path()?,
+    };
+
+    println!("Creating experimental elevated daemon scheduled task.");
+    println!("Daemon: {}", daemon.display());
+    println!(
+        "This may show one UAC prompt. Later shell starts can use --elevated-daemon without a prompt."
+    );
+    winland_win32::install_elevated_daemon_task(&daemon)?;
+    println!("Elevated daemon scheduled task is installed.");
+
+    Ok(())
+}
+
+fn shell_uninstall_elevated_task(args: ShellExperimentalArgs) -> Result<()> {
+    require_experimental(args.experimental)?;
+    winland_win32::uninstall_elevated_daemon_task()?;
+    println!("Elevated daemon scheduled task is deleted.");
+    Ok(())
+}
+
+fn shell_elevated_task_status() -> Result<()> {
+    let installed = winland_win32::elevated_daemon_task_installed()?;
+    println!(
+        "Elevated daemon scheduled task: {}",
+        if installed {
+            "installed"
+        } else {
+            "not installed"
+        }
+    );
+    Ok(())
+}
+
+fn shell_test(args: ShellLaunchArgs) -> Result<()> {
+    let shell_command = shell_command(
+        args.shell.as_deref(),
+        args.daemon.as_deref(),
+        args.elevated_daemon,
+        args.command.as_deref(),
+    )?;
+    println!("Launching one-session Winland shell test without registry changes.");
+    println!("Command: {shell_command}");
+    winland_win32::launch_shell_test(&shell_command)?;
+    Ok(())
+}
+
+fn shell_explorer() -> Result<()> {
+    winland_win32::launch_explorer()?;
+    println!("Launched explorer.exe.");
+    Ok(())
+}
+
+fn require_experimental(experimental: bool) -> Result<()> {
+    if experimental {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "persistent shell replacement is experimental; rerun with --experimental after taking a VM checkpoint"
+        ))
+    }
+}
+
+fn shell_command(
+    shell: Option<&std::path::Path>,
+    daemon: Option<&std::path::Path>,
+    elevated_daemon: bool,
+    command: Option<&str>,
+) -> Result<String> {
+    if let Some(command) = command {
+        let command = command.trim();
+        if command.is_empty() {
+            return Err(anyhow::anyhow!("shell command must not be empty"));
+        }
+        return Ok(command.to_owned());
+    }
+
+    let shell = match shell {
+        Some(path) => path.to_owned(),
+        None => default_shell_path()?,
+    };
+
+    Ok(winland_win32::shell_command_with_daemon(
+        &shell,
+        daemon,
+        elevated_daemon,
+    ))
+}
+
+fn default_shell_path() -> Result<PathBuf> {
+    executable_next_to_current("winland-shell")
+}
+
+fn default_daemon_path() -> Result<PathBuf> {
+    executable_next_to_current("winland-daemon")
+}
+
+fn executable_next_to_current(stem: &str) -> Result<PathBuf> {
+    let current = std::env::current_exe()?;
+    let extension = current.extension().and_then(|value| value.to_str());
+    let file_name = match extension {
+        Some(extension) if !extension.is_empty() => format!("{stem}.{extension}"),
+        _ => stem.to_owned(),
+    };
+
+    Ok(current.with_file_name(file_name))
 }
 
 fn daemon_state(args: StateArgs) -> Result<()> {

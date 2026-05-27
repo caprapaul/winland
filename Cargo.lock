@@ -676,6 +676,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "winland-shell"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "tracing",
+ "tracing-subscriber",
+ "winland-win32",
+]
+
+[[package]]
 name = "winland-win32"
 version = "0.1.0"
 dependencies = [

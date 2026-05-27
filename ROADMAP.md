@@ -30,35 +30,42 @@ These capabilities are treated as the working baseline for planning:
 - Live tiling loop: startup retile, dynamic retile, drag-to-float during interactive move/resize, and retile-on-drag-end.
 - Keyboard command foundations.
 - Hotkey override mode with documented low-level hook support, opt-in interception, game-safe bypass rules, and measured hook decision latency.
+- IPC and CLI control with a versioned local protocol and state/query commands.
 - A platform-independent layout core.
 - Fake workspace foundations where present.
 - TOML config and window rules.
 
-## Current Focus: IPC and CLI Control
+## Current Focus: Experimental Shell Replacement
 
-Goal: Make the daemon controllable and observable from command-line tools.
+Goal: Implement an opt-in, reversible experimental shell replacement path so Winland can run as the user shell in the VM while keeping DWM in place and preserving a clear recovery path.
 
 Tasks:
-- Define a local IPC protocol.
-- Add CLI commands for state, windows, monitors, workspaces, focus, move, swap, retile, reload, and quit.
-- Support human-readable output first and explicit JSON output where useful.
-- Add protocol versioning from the start.
-- Handle daemon-not-running errors cleanly.
-
-Current slice:
-- Ship a versioned local named-pipe protocol with a `state` request.
-- Add `winland state` and `winland state --json` for daemon health and snapshot counts.
-- Defer mutating IPC commands until the protocol and daemon request path are proven.
+- Add a small shell-mode executable or daemon mode that starts Winland without assuming Explorer is already running.
+- Add explicit CLI commands for the experimental path, such as installing, uninstalling, showing status, and launching a one-session shell test.
+- Restrict persistent shell changes to an explicit command that prints what will change and how to undo it.
+- Prefer per-user shell replacement in the VM over machine-wide replacement for the first prototype.
+- Store the previous shell value before changing it and provide a recovery command that restores it.
+- Add a command to launch or restore `explorer.exe` manually from Winland shell mode.
+- Write a short design note alongside the prototype explaining the chosen registry key or documented mechanism, VM checkpoint workflow, recovery steps, and known failure modes.
+- Keep DWM in place. This must not become compositor replacement work.
+- Keep the normal Winland daemon path working without shell swapping.
 
 Done criteria:
-- CLI commands can control a running daemon.
-- State inspection is good enough for troubleshooting.
-- IPC errors do not crash the daemon.
+- A VM user can opt into Winland shell mode, sign out or restart, and land in Winland instead of Explorer.
+- The same user can restore Explorer through a documented Winland recovery command.
+- The previous shell setting is captured before modification and can be restored.
+- The implementation refuses to run persistent shell changes unless an explicit experimental flag or command is used.
+- The design note states the VM setup and checkpoint workflow used for tests.
+- The prototype is reversible, opt-in, and isolated from the default daemon.
+- The project can still run as a normal layer over DWM and Explorer.
 
 Not doing yet:
-- No network IPC.
-- No remote control from other machines.
-- No plugin system.
+- No default shell replacement.
+- No machine-wide shell replacement.
+- No persistent registry changes without an explicit user command, stored previous value, and recovery command.
+- No private shell APIs.
+- No DWM replacement.
+- No kiosk-only or enterprise-only assumption unless clearly documented as such.
 
 ## Backlog
 
@@ -77,27 +84,6 @@ Window rule hardening:
 Config polish:
 - Improve validation, defaults, examples, and reload diagnostics.
 - Keep config reload explicit until automatic file watching proves useful.
-
-Lower-level shell integration research:
-- Investigate whether Winland can offer a lower-level desktop experience through documented Windows shell mechanisms, custom shell modes, or reversible "shell swapping" experiments.
-- Treat this as a research spike before any implementation. Write down what "shell swapping" means for Winland: replacing Explorer as the shell, supervising Explorer, launching beside Explorer, or switching between shells for a session.
-- Identify documented APIs, registry settings, Windows editions, permission requirements, recovery steps, and failure modes.
-- Keep DWM in place. This must not become compositor replacement work.
-- Require an explicit opt-in experimental mode before changing shell startup behavior, Explorer behavior, or session-level shell settings.
-- Design a safe recovery path before any prototype, including restoring Explorer and undoing any persistent setting.
-- Keep the normal Winland daemon path working without shell swapping.
-
-Done criteria:
-- A written design note explains viable documented approaches, risks, recovery steps, and why the preferred approach is safe enough to prototype.
-- Any prototype is reversible, opt-in, and isolated from the default daemon.
-- The project can still run as a normal layer over DWM and Explorer.
-
-Not doing yet:
-- No default shell replacement.
-- No persistent registry changes without an explicit user command and recovery command.
-- No private shell APIs.
-- No DWM replacement.
-- No kiosk-only or enterprise-only assumption unless clearly documented as such.
 
 Visual feedback:
 - Add optional focus borders or lightweight indicators after tiling behavior is stable.

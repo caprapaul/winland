@@ -23,6 +23,7 @@ use winland_win32::{
 
 const RECONCILE_DEBOUNCE: Duration = Duration::from_millis(50);
 const MAX_BATCH_SIZE: usize = 512;
+
 fn main() -> Result<()> {
     let loaded_config = winland_config::load_or_default(None).context("load Winland config")?;
     init_tracing(&loaded_config.config.general.log_level);

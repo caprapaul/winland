@@ -635,7 +635,10 @@ name = "winland-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "tracing",
  "tracing-subscriber",
+ "winland-core",
+ "winland-win32",
 ]
 
 [[package]]

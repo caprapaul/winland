@@ -4,9 +4,13 @@ mod platform {
     use std::ffi::c_void;
     use std::mem::size_of;
     use std::os::windows::ffi::OsStringExt;
+    use std::sync::mpsc::Sender;
+    use std::sync::{Mutex, OnceLock};
 
-    use tracing::debug;
-    use windows::Win32::Foundation::{BOOL, CloseHandle, HANDLE, HWND, LPARAM, RECT, TRUE};
+    use tracing::{debug, warn};
+    use windows::Win32::Foundation::{
+        BOOL, CloseHandle, HANDLE, HMODULE, HWND, LPARAM, RECT, TRUE,
+    };
     use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
     use windows::Win32::Graphics::Gdi::{
         EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
@@ -15,18 +19,25 @@ mod platform {
         OpenProcess, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
         QueryFullProcessImageNameW,
     };
+    use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
     use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetClassNameW, GetWindow, GetWindowLongPtrW,
+        DispatchMessageW, EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE,
+        EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW, EVENT_SYSTEM_FOREGROUND,
+        EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, EnumWindows, GW_OWNER, GWL_EXSTYLE,
+        GWL_STYLE, GetClassNameW, GetForegroundWindow, GetMessageW, GetWindow, GetWindowLongPtrW,
         GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
-        IsWindowVisible, MONITORINFOF_PRIMARY, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER,
-        SetWindowPos, WS_EX_TOOLWINDOW,
+        IsWindowVisible, MONITORINFOF_PRIMARY, MSG, OBJID_WINDOW, SWP_NOACTIVATE,
+        SWP_NOOWNERZORDER, SWP_NOZORDER, SetWindowPos, TranslateMessage, WINEVENT_OUTOFCONTEXT,
+        WS_EX_TOOLWINDOW,
     };
     use windows::core::PWSTR;
     use winland_core::{
         MonitorId, MonitorInfo as CoreMonitorInfo, Rect, WindowHandle, WindowInfo, WindowStyles,
     };
 
-    use crate::{Result, Win32Error};
+    use crate::{Result, Win32Error, WindowEvent, WindowEventKind};
+
+    static EVENT_SENDER: OnceLock<Mutex<Option<Sender<WindowEvent>>>> = OnceLock::new();
 
     pub fn enumerate_windows() -> Result<Vec<WindowInfo>> {
         let mut windows = Vec::new();
@@ -95,6 +106,78 @@ mod platform {
         Ok(())
     }
 
+    pub fn foreground_window() -> Result<Option<WindowHandle>> {
+        // SAFETY: GetForegroundWindow reads the current foreground HWND and does
+        // not require ownership of that window handle.
+        let hwnd = unsafe { GetForegroundWindow() };
+        if hwnd.0.is_null() {
+            Ok(None)
+        } else {
+            Ok(Some(handle_from_hwnd(hwnd)))
+        }
+    }
+
+    pub fn subscribe_window_events(sender: Sender<WindowEvent>) -> Result<WindowEventSubscription> {
+        {
+            let mut guard = event_sender_slot()
+                .lock()
+                .map_err(|_| Win32Error::EventSenderLockPoisoned)?;
+            if guard.is_some() {
+                return Err(Win32Error::EventHooksAlreadyInstalled);
+            }
+
+            *guard = Some(sender);
+        }
+
+        match install_window_event_hooks() {
+            Ok(subscription) => Ok(subscription),
+            Err(error) => {
+                clear_event_sender();
+                Err(error)
+            }
+        }
+    }
+
+    pub fn run_message_loop() -> Result<()> {
+        let mut message = MSG::default();
+
+        loop {
+            // SAFETY: message points to valid writable storage. A null HWND
+            // receives thread messages, which is what WinEvent delivery needs.
+            let result = unsafe { GetMessageW(&mut message, HWND::default(), 0, 0) };
+            match result.0 {
+                -1 => return Err(Win32Error::last_error("GetMessageW")),
+                0 => return Ok(()),
+                _ => {
+                    // SAFETY: message was just filled by GetMessageW.
+                    unsafe {
+                        let _ = TranslateMessage(&message);
+                        DispatchMessageW(&message);
+                    }
+                }
+            }
+        }
+    }
+
+    pub struct WindowEventSubscription {
+        hooks: Vec<HWINEVENTHOOK>,
+    }
+
+    impl Drop for WindowEventSubscription {
+        fn drop(&mut self) {
+            for hook in self.hooks.drain(..) {
+                // SAFETY: These hook handles were returned by SetWinEventHook
+                // for this subscription and are unhooked at most once here.
+                let ok = unsafe { UnhookWinEvent(hook) };
+                if !ok.as_bool() {
+                    warn!(?hook, "failed to unhook WinEvent hook");
+                }
+            }
+
+            clear_event_sender();
+        }
+    }
+
     struct EnumState<'a> {
         windows: &'a mut Vec<WindowInfo>,
     }
@@ -110,6 +193,33 @@ mod platform {
         }
 
         TRUE
+    }
+
+    unsafe extern "system" fn win_event_proc(
+        _hook: HWINEVENTHOOK,
+        event: u32,
+        hwnd: HWND,
+        id_object: i32,
+        id_child: i32,
+        _event_thread: u32,
+        event_time: u32,
+    ) {
+        let Some(event) = window_event(event, hwnd, id_object, id_child, event_time) else {
+            return;
+        };
+
+        let Some(slot) = EVENT_SENDER.get() else {
+            return;
+        };
+
+        match slot.lock() {
+            Ok(guard) => {
+                if let Some(sender) = guard.as_ref() {
+                    let _ = sender.send(event);
+                }
+            }
+            Err(_) => warn!("window event sender lock is poisoned"),
+        }
     }
 
     struct MonitorEnumState<'a> {
@@ -152,6 +262,83 @@ mod platform {
             is_primary: info.dwFlags & MONITORINFOF_PRIMARY != 0,
             rect: rect_from_win32(info.rcMonitor),
             work_area: rect_from_win32(info.rcWork),
+        })
+    }
+
+    fn install_window_event_hooks() -> Result<WindowEventSubscription> {
+        let mut hooks = Vec::with_capacity(3);
+
+        for (event_min, event_max) in [
+            (EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND),
+            (EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND),
+            (EVENT_OBJECT_CREATE, EVENT_OBJECT_LOCATIONCHANGE),
+        ] {
+            match install_window_event_hook(event_min, event_max) {
+                Ok(hook) => hooks.push(hook),
+                Err(error) => {
+                    for hook in hooks.drain(..) {
+                        // SAFETY: The handle came from SetWinEventHook in this
+                        // function and has not been unhooked yet.
+                        let _ = unsafe { UnhookWinEvent(hook) };
+                    }
+                    return Err(error);
+                }
+            }
+        }
+
+        Ok(WindowEventSubscription { hooks })
+    }
+
+    fn install_window_event_hook(event_min: u32, event_max: u32) -> Result<HWINEVENTHOOK> {
+        // SAFETY: The callback is a process-static function pointer. Passing
+        // process/thread id 0 subscribes to all processes on the current desktop,
+        // and WINEVENT_OUTOFCONTEXT avoids injecting code into other processes.
+        let hook = unsafe {
+            SetWinEventHook(
+                event_min,
+                event_max,
+                HMODULE::default(),
+                Some(win_event_proc),
+                0,
+                0,
+                WINEVENT_OUTOFCONTEXT,
+            )
+        };
+
+        if hook.0.is_null() {
+            return Err(Win32Error::last_error("SetWinEventHook"));
+        }
+
+        Ok(hook)
+    }
+
+    fn window_event(
+        event: u32,
+        hwnd: HWND,
+        id_object: i32,
+        id_child: i32,
+        event_time: u32,
+    ) -> Option<WindowEvent> {
+        if hwnd.0.is_null() || id_object != OBJID_WINDOW.0 || id_child != 0 {
+            return None;
+        }
+
+        let kind = match event {
+            EVENT_OBJECT_CREATE => WindowEventKind::Created,
+            EVENT_OBJECT_DESTROY => WindowEventKind::Destroyed,
+            EVENT_OBJECT_SHOW => WindowEventKind::Shown,
+            EVENT_OBJECT_HIDE => WindowEventKind::Hidden,
+            EVENT_OBJECT_LOCATIONCHANGE => WindowEventKind::Moved,
+            EVENT_SYSTEM_MINIMIZESTART => WindowEventKind::Minimized,
+            EVENT_SYSTEM_MINIMIZEEND => WindowEventKind::Restored,
+            EVENT_SYSTEM_FOREGROUND => WindowEventKind::ForegroundChanged,
+            _ => return None,
+        };
+
+        Some(WindowEvent {
+            kind,
+            window: handle_from_hwnd(hwnd),
+            event_time,
         })
     }
 
@@ -315,6 +502,21 @@ mod platform {
         HWND(handle.0 as usize as *mut c_void)
     }
 
+    fn handle_from_hwnd(hwnd: HWND) -> WindowHandle {
+        WindowHandle(hwnd.0 as usize as u64)
+    }
+
+    fn event_sender_slot() -> &'static Mutex<Option<Sender<WindowEvent>>> {
+        EVENT_SENDER.get_or_init(|| Mutex::new(None))
+    }
+
+    fn clear_event_sender() {
+        match event_sender_slot().lock() {
+            Ok(mut guard) => *guard = None,
+            Err(_) => warn!("window event sender lock is poisoned while clearing"),
+        }
+    }
+
     fn wide_to_string(slice: &[u16]) -> String {
         OsString::from_wide(slice).to_string_lossy().into_owned()
     }
@@ -332,8 +534,12 @@ mod platform {
 
 #[cfg(not(windows))]
 mod platform {
+    use std::sync::mpsc::Sender;
+
     use crate::{Result, Win32Error};
     use winland_core::{MonitorInfo, Rect, WindowHandle, WindowInfo};
+
+    use crate::WindowEvent;
 
     pub fn enumerate_windows() -> Result<Vec<WindowInfo>> {
         Err(Win32Error::UnsupportedPlatform)
@@ -346,11 +552,51 @@ mod platform {
     pub fn move_resize_window(_handle: WindowHandle, _rect: Rect) -> Result<()> {
         Err(Win32Error::UnsupportedPlatform)
     }
+
+    pub fn foreground_window() -> Result<Option<WindowHandle>> {
+        Err(Win32Error::UnsupportedPlatform)
+    }
+
+    pub fn subscribe_window_events(
+        _sender: Sender<WindowEvent>,
+    ) -> Result<WindowEventSubscription> {
+        Err(Win32Error::UnsupportedPlatform)
+    }
+
+    pub fn run_message_loop() -> Result<()> {
+        Err(Win32Error::UnsupportedPlatform)
+    }
+
+    pub struct WindowEventSubscription;
 }
 
+pub use platform::WindowEventSubscription;
 pub use platform::enumerate_monitors;
 pub use platform::enumerate_windows;
+pub use platform::foreground_window;
 pub use platform::move_resize_window;
+pub use platform::run_message_loop;
+pub use platform::subscribe_window_events;
+use winland_core::WindowHandle;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowEvent {
+    pub kind: WindowEventKind,
+    pub window: WindowHandle,
+    pub event_time: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum WindowEventKind {
+    Created,
+    Destroyed,
+    Shown,
+    Hidden,
+    Moved,
+    Minimized,
+    Restored,
+    ForegroundChanged,
+}
 
 pub type Result<T> = std::result::Result<T, Win32Error>;
 
@@ -366,6 +612,10 @@ pub enum Win32Error {
     #[cfg(windows)]
     #[error(transparent)]
     Api(#[from] windows::core::Error),
+    #[error("window event hooks are already installed")]
+    EventHooksAlreadyInstalled,
+    #[error("window event sender lock is poisoned")]
+    EventSenderLockPoisoned,
     #[error("winland-win32 is only supported on Windows")]
     UnsupportedPlatform,
 }

@@ -6,4 +6,7 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+tracing.workspace = true
 tracing-subscriber.workspace = true
+winland-core = { path = "../winland-core" }
+winland-win32 = { path = "../winland-win32" }

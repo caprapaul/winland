@@ -1502,9 +1502,7 @@ fn apply_tile_assignments(assignments: &[TileAssignment], operation: &'static st
 }
 
 fn is_fullscreen_window(window: &WindowInfo, monitors: &[MonitorInfo]) -> bool {
-    monitors
-        .iter()
-        .any(|monitor| window.rect == monitor.rect || window.rect == monitor.work_area)
+    monitors.iter().any(|monitor| window.rect == monitor.rect)
 }
 
 fn monitor_for_rect(rect: Rect, monitors: &[MonitorInfo]) -> Option<winland_core::MonitorId> {
@@ -1831,6 +1829,23 @@ mod tests {
                 rect: primary_test_monitor().work_area,
             }]
         );
+    }
+
+    #[test]
+    fn work_area_sized_window_on_inactive_workspace_is_hidden() {
+        let mut state = daemon_state([window(1, "One", primary_test_monitor().work_area)]);
+        state
+            .workspaces
+            .move_window_to_workspace(WindowHandle(1), WorkspaceId(2));
+        state.workspaces.switch_to(WorkspaceId(2));
+
+        let plan = state.plan_command(
+            DaemonCommand::SwitchWorkspace(WorkspaceId(1)),
+            &[primary_test_monitor()],
+        );
+
+        assert_eq!(plan.hide, vec![WindowHandle(1)]);
+        assert!(plan.moves.is_empty());
     }
 
     #[test]

@@ -14,7 +14,9 @@ mod platform {
         BOOL, CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
         GENERIC_READ, GENERIC_WRITE, HANDLE, HMODULE, HWND, LPARAM, LRESULT, RECT, TRUE, WPARAM,
     };
-    use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
+    use windows::Win32::Graphics::Dwm::{
+        DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute,
+    };
     use windows::Win32::Graphics::Gdi::{
         EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
     };
@@ -46,7 +48,7 @@ mod platform {
         PostThreadMessageW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOOWNERZORDER,
         SWP_NOZORDER, SetForegroundWindow, SetWindowPos, SetWindowsHookExW, ShowWindow,
         TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WINEVENT_OUTOFCONTEXT, WM_HOTKEY,
-        WM_KEYDOWN, WM_QUIT, WM_SYSKEYDOWN, WS_EX_TOOLWINDOW,
+        WM_KEYDOWN, WM_QUIT, WM_SYSKEYDOWN, WS_CAPTION, WS_EX_TOOLWINDOW, WS_THICKFRAME,
     };
     use windows::core::{PCWSTR, PWSTR};
     use winland_core::{
@@ -57,7 +59,7 @@ mod platform {
         HotkeyBinding, HotkeyEvent, HotkeyInterceptionDecision, HotkeyLowLevelEvent,
         HotkeyModifierSet, HotkeyOverrideOptions, HotkeyRegistrationFailure, HotkeyWindowContext,
         IPC_BUFFER_SIZE, IpcTransportRequest, Result, VirtualKey, Win32Error, WindowEvent,
-        WindowEventKind, classify_intercepted_hotkey,
+        WindowEventKind, classify_intercepted_hotkey, rect_covers_any_monitor,
     };
 
     static EVENT_SENDER: OnceLock<Mutex<Option<Sender<WindowEvent>>>> = OnceLock::new();
@@ -823,7 +825,8 @@ mod platform {
             return None;
         }
 
-        let rect = window_rect(hwnd).ok();
+        let rect = visible_window_rect(hwnd).or_else(|| window_rect(hwnd).ok());
+        let styles = window_styles(hwnd);
         let executable_path = if options.bypass.needs_process_metadata() {
             foreground_executable_path(hwnd)
         } else {
@@ -833,7 +836,9 @@ mod platform {
         Some(HotkeyWindowContext {
             class_name: class_name(hwnd).unwrap_or_default(),
             executable_path,
-            is_fullscreen: rect.is_some_and(rect_matches_monitor),
+            is_fullscreen: rect.is_some_and(|rect| {
+                rect_matches_monitor(rect) && window_style_is_borderless(styles)
+            }),
         })
     }
 
@@ -850,12 +855,12 @@ mod platform {
 
     fn rect_matches_monitor(rect: Rect) -> bool {
         enumerate_monitors()
-            .map(|monitors| {
-                monitors
-                    .iter()
-                    .any(|monitor| rect == monitor.rect || rect == monitor.work_area)
-            })
+            .map(|monitors| rect_covers_any_monitor(rect, &monitors))
             .unwrap_or(false)
+    }
+
+    fn window_style_is_borderless(styles: WindowStyles) -> bool {
+        styles.style & (WS_CAPTION.0 | WS_THICKFRAME.0) == 0
     }
 
     fn hotkey_modifiers(modifiers: HotkeyModifierSet) -> HOT_KEY_MODIFIERS {
@@ -1150,6 +1155,22 @@ mod platform {
         Ok(rect_from_win32(rect))
     }
 
+    fn visible_window_rect(hwnd: HWND) -> Option<Rect> {
+        let mut rect = RECT::default();
+        // SAFETY: rect points to valid writable storage sized as passed, and
+        // hwnd is only queried for a documented DWM frame-bounds attribute.
+        let result = unsafe {
+            DwmGetWindowAttribute(
+                hwnd,
+                DWMWA_EXTENDED_FRAME_BOUNDS,
+                &mut rect as *mut RECT as *mut _,
+                size_of::<RECT>() as u32,
+            )
+        };
+
+        result.ok().map(|()| rect_from_win32(rect))
+    }
+
     fn rect_from_win32(rect: RECT) -> Rect {
         Rect {
             left: rect.left,
@@ -1344,7 +1365,7 @@ pub use shell::uninstall_elevated_daemon_task;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
-use winland_core::{TextMatcher, WindowHandle};
+use winland_core::{MonitorInfo, Rect, TextMatcher, WindowHandle};
 
 pub const DEFAULT_IPC_PIPE_NAME: &str = r"\\.\pipe\winland-ipc";
 const IPC_BUFFER_SIZE: u32 = 64 * 1024;
@@ -1630,6 +1651,10 @@ fn process_name(path: &str) -> Option<String> {
         .map(|name| name.to_string_lossy().into_owned())
 }
 
+fn rect_covers_any_monitor(rect: Rect, monitors: &[MonitorInfo]) -> bool {
+    monitors.iter().any(|monitor| rect == monitor.rect)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowEvent {
     pub kind: WindowEventKind,
@@ -1830,6 +1855,19 @@ mod tests {
                 reason: "game-safe bypass",
             }
         );
+    }
+
+    #[test]
+    fn work_area_rect_is_not_fullscreen_for_hotkey_bypass() {
+        let monitors = [MonitorInfo {
+            id: winland_core::MonitorId(1),
+            is_primary: true,
+            rect: Rect::from_size(0, 0, 1000, 800),
+            work_area: Rect::from_size(0, 0, 1000, 760),
+        }];
+
+        assert!(rect_covers_any_monitor(monitors[0].rect, &monitors));
+        assert!(!rect_covers_any_monitor(monitors[0].work_area, &monitors));
     }
 
     #[test]

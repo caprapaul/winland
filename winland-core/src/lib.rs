@@ -80,6 +80,88 @@ impl fmt::Display for Rect {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Size {
+    pub width: i32,
+    pub height: i32,
+}
+
+impl Size {
+    pub const ZERO: Self = Self {
+        width: 0,
+        height: 0,
+    };
+
+    pub fn new(width: i32, height: i32) -> Self {
+        Self {
+            width: width.max(0),
+            height: height.max(0),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowSizeConstraints {
+    pub min: Size,
+    pub max: Option<Size>,
+}
+
+impl WindowSizeConstraints {
+    pub const NONE: Self = Self {
+        min: Size::ZERO,
+        max: None,
+    };
+
+    pub fn minimum(width: i32, height: i32) -> Self {
+        Self {
+            min: Size::new(width, height),
+            max: None,
+        }
+    }
+
+    pub fn fixed(width: i32, height: i32) -> Self {
+        let size = Size::new(width, height);
+        Self {
+            min: size,
+            max: Some(size),
+        }
+    }
+
+    pub fn normalized(self) -> Self {
+        let min = Size::new(self.min.width, self.min.height);
+        let max = self
+            .max
+            .map(|max| Size::new(max.width.max(min.width), max.height.max(min.height)));
+
+        Self { min, max }
+    }
+
+    pub fn is_unconstrained(self) -> bool {
+        self.normalized() == Self::NONE
+    }
+}
+
+impl Default for WindowSizeConstraints {
+    fn default() -> Self {
+        Self::NONE
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowLayoutInfo {
+    pub handle: WindowHandle,
+    pub size_constraints: WindowSizeConstraints,
+}
+
+impl WindowLayoutInfo {
+    pub fn unconstrained(handle: WindowHandle) -> Self {
+        Self {
+            handle,
+            size_constraints: WindowSizeConstraints::NONE,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Point {
     pub x: i32,
     pub y: i32,
@@ -751,6 +833,14 @@ pub fn tile_windows_with_config(
     tile_windows_with_state(work_area, windows, config, None, None)
 }
 
+pub fn tile_layout_windows_with_config(
+    work_area: Rect,
+    windows: &[WindowLayoutInfo],
+    config: LayoutConfig,
+) -> Vec<TileAssignment> {
+    tile_layout_windows_with_state(work_area, windows, config, None, None)
+}
+
 pub fn tile_windows_with_state(
     work_area: Rect,
     windows: &[WindowHandle],
@@ -758,17 +848,72 @@ pub fn tile_windows_with_state(
     cursor_position: Option<Point>,
     dwindle_splits: Option<&mut Vec<DwindleSplit>>,
 ) -> Vec<TileAssignment> {
+    let windows: Vec<_> = windows
+        .iter()
+        .copied()
+        .map(WindowLayoutInfo::unconstrained)
+        .collect();
+    tile_layout_windows_with_state(work_area, &windows, config, cursor_position, dwindle_splits)
+}
+
+pub fn tile_layout_windows_with_state(
+    work_area: Rect,
+    windows: &[WindowLayoutInfo],
+    config: LayoutConfig,
+    cursor_position: Option<Point>,
+    dwindle_splits: Option<&mut Vec<DwindleSplit>>,
+) -> Vec<TileAssignment> {
     let config = config.normalized();
     match config.kind {
-        LayoutKind::MasterStack => master_stack_assignments(work_area, windows, config),
+        LayoutKind::MasterStack => master_stack_layout_assignments(work_area, windows, config),
         LayoutKind::Dwindle => {
-            dwindle_assignments(work_area, windows, config, cursor_position, dwindle_splits)
+            dwindle_layout_assignments(work_area, windows, config, cursor_position, dwindle_splits)
         }
-        LayoutKind::VerticalStack => stack_assignments(work_area, windows, config, StackAxis::Rows),
+        LayoutKind::VerticalStack => {
+            stack_layout_assignments(work_area, windows, config, StackAxis::Rows)
+        }
         LayoutKind::HorizontalStack => {
-            stack_assignments(work_area, windows, config, StackAxis::Columns)
+            stack_layout_assignments(work_area, windows, config, StackAxis::Columns)
         }
     }
+}
+
+pub fn tile_assignments_fit_work_area(work_area: Rect, assignments: &[TileAssignment]) -> bool {
+    if work_area.is_empty() {
+        return assignments.is_empty();
+    }
+
+    for assignment in assignments {
+        if assignment.rect.is_empty() || !rect_contains_rect(work_area, assignment.rect) {
+            return false;
+        }
+    }
+
+    for (index, first) in assignments.iter().enumerate() {
+        if assignments
+            .iter()
+            .skip(index + 1)
+            .any(|second| rects_overlap(first.rect, second.rect))
+        {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn rect_contains_rect(outer: Rect, inner: Rect) -> bool {
+    inner.left >= outer.left
+        && inner.top >= outer.top
+        && inner.right <= outer.right
+        && inner.bottom <= outer.bottom
+}
+
+fn rects_overlap(first: Rect, second: Rect) -> bool {
+    first.left < second.right
+        && second.left < first.right
+        && first.top < second.bottom
+        && second.top < first.bottom
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -903,6 +1048,7 @@ pub struct WindowInfo {
     pub has_owner: bool,
     pub is_tool_window: bool,
     pub styles: WindowStyles,
+    pub size_constraints: WindowSizeConstraints,
     pub rect: Rect,
 }
 
@@ -1077,6 +1223,19 @@ fn master_stack_assignments(
     windows: &[WindowHandle],
     config: LayoutConfig,
 ) -> Vec<TileAssignment> {
+    let windows: Vec<_> = windows
+        .iter()
+        .copied()
+        .map(WindowLayoutInfo::unconstrained)
+        .collect();
+    master_stack_layout_assignments(work_area, &windows, config)
+}
+
+fn master_stack_layout_assignments(
+    work_area: Rect,
+    windows: &[WindowLayoutInfo],
+    config: LayoutConfig,
+) -> Vec<TileAssignment> {
     if work_area.is_empty() || windows.is_empty() {
         return Vec::new();
     }
@@ -1085,8 +1244,12 @@ fn master_stack_assignments(
     match windows {
         [] => Vec::new(),
         [window] => vec![TileAssignment {
-            window: *window,
-            rect: reserve_window_rect(work_area.inset(config.gap), config),
+            window: window.handle,
+            rect: reserve_constrained_window_rect(
+                work_area.inset(config.gap),
+                config,
+                window.size_constraints,
+            ),
         }],
         [master, stack @ ..] => {
             let gap = config.gap;
@@ -1100,7 +1263,13 @@ fn master_stack_assignments(
                 return Vec::new();
             }
 
-            let master_width = scale_length(available_width, config.master_ratio_percent);
+            let (master_width, stack_width) = allocate_pair_with_constraints(
+                outer_area.width(),
+                gap,
+                config.master_ratio_percent,
+                effective_axis_constraint(master.size_constraints, config, Axis::Horizontal),
+                stack_cross_axis_constraint(stack, config, Axis::Horizontal),
+            );
             let master_rect = Rect::from_size(
                 outer_area.left,
                 outer_area.top,
@@ -1110,21 +1279,28 @@ fn master_stack_assignments(
             let stack_area = Rect {
                 left: master_rect.right.saturating_add(gap),
                 top: outer_area.top,
-                right: outer_area.right,
+                right: master_rect
+                    .right
+                    .saturating_add(gap)
+                    .saturating_add(stack_width),
                 bottom: outer_area.bottom,
             };
 
             let mut assignments = Vec::with_capacity(windows.len());
             assignments.push(TileAssignment {
-                window: *master,
-                rect: reserve_window_rect(master_rect, config),
+                window: master.handle,
+                rect: reserve_constrained_window_rect(master_rect, config, master.size_constraints),
             });
             assignments.extend(
-                split_rows_with_gap(stack_area, stack.len(), gap)
+                split_rows_for_layout_windows(stack_area, stack, config)
                     .zip(stack)
                     .map(|(rect, window)| TileAssignment {
-                        window: *window,
-                        rect: reserve_window_rect(rect, config),
+                        window: window.handle,
+                        rect: reserve_constrained_window_rect(
+                            rect,
+                            config,
+                            window.size_constraints,
+                        ),
                     }),
             );
             assignments
@@ -1138,9 +1314,9 @@ enum StackAxis {
     Columns,
 }
 
-fn stack_assignments(
+fn stack_layout_assignments(
     work_area: Rect,
-    windows: &[WindowHandle],
+    windows: &[WindowLayoutInfo],
     config: LayoutConfig,
     axis: StackAxis,
 ) -> Vec<TileAssignment> {
@@ -1155,9 +1331,9 @@ fn stack_assignments(
     }
 
     let rects: Vec<_> = match axis {
-        StackAxis::Rows => split_rows_with_gap(outer_area, windows.len(), config.gap).collect(),
+        StackAxis::Rows => split_rows_for_layout_windows(outer_area, windows, config).collect(),
         StackAxis::Columns => {
-            split_columns_with_gap(outer_area, windows.len(), config.gap).collect()
+            split_columns_for_layout_windows(outer_area, windows, config).collect()
         }
     };
 
@@ -1165,15 +1341,15 @@ fn stack_assignments(
         .into_iter()
         .zip(windows)
         .map(|(rect, window)| TileAssignment {
-            window: *window,
-            rect: reserve_window_rect(rect, config),
+            window: window.handle,
+            rect: reserve_constrained_window_rect(rect, config, window.size_constraints),
         })
         .collect()
 }
 
-fn dwindle_assignments(
+fn dwindle_layout_assignments(
     work_area: Rect,
-    windows: &[WindowHandle],
+    windows: &[WindowLayoutInfo],
     config: LayoutConfig,
     cursor_position: Option<Point>,
     dwindle_splits: Option<&mut Vec<DwindleSplit>>,
@@ -1196,28 +1372,33 @@ fn dwindle_assignments(
             splits.clear();
         }
         return vec![TileAssignment {
-            window: windows[0],
-            rect: reserve_window_rect(outer_area, config),
+            window: windows[0].handle,
+            rect: reserve_constrained_window_rect(outer_area, config, windows[0].size_constraints),
         }];
     }
 
-    let current_windows: BTreeSet<_> = windows.iter().copied().collect();
+    let handles: Vec<_> = windows.iter().map(|window| window.handle).collect();
+    let constraints: BTreeMap<_, _> = windows
+        .iter()
+        .map(|window| (window.handle, window.size_constraints))
+        .collect();
+    let current_windows: BTreeSet<_> = handles.iter().copied().collect();
     let split_state = dwindle_splits;
     let historical_splits = split_state
         .as_ref()
         .map(|splits| splits.as_slice())
         .unwrap_or(&[]);
-    let root = dwindle_root_window(windows, historical_splits);
+    let root = dwindle_root_window(&handles, historical_splits);
     let mut tree = prune_dwindle_tree(
         build_dwindle_tree(root, historical_splits),
         &current_windows,
     )
-    .unwrap_or(DwindleTree::Leaf(windows[0]));
+    .unwrap_or(DwindleTree::Leaf(windows[0].handle));
 
     let mut assignments = Vec::new();
-    collect_dwindle_assignments(&tree, outer_area, config, &mut assignments);
+    collect_dwindle_assignments(&tree, outer_area, config, &constraints, &mut assignments);
 
-    let initial_missing_count = windows
+    let initial_missing_count = handles
         .iter()
         .filter(|window| {
             !assignments
@@ -1227,7 +1408,7 @@ fn dwindle_assignments(
         .count();
     let use_smart_split_for_new_window = config.smart_split && initial_missing_count == 1;
 
-    for window in windows.iter().copied() {
+    for window in handles.iter().copied() {
         if assignments
             .iter()
             .any(|assignment| assignment.window == window)
@@ -1252,7 +1433,7 @@ fn dwindle_assignments(
 
         insert_dwindle_split(&mut tree, split);
         assignments.clear();
-        collect_dwindle_assignments(&tree, outer_area, config, &mut assignments);
+        collect_dwindle_assignments(&tree, outer_area, config, &constraints, &mut assignments);
     }
 
     if let Some(splits) = split_state {
@@ -1260,13 +1441,20 @@ fn dwindle_assignments(
         serialize_dwindle_tree(&tree, splits);
     }
 
-    sort_assignments_by_window_order(&mut assignments, windows);
+    sort_assignments_by_window_order(&mut assignments, &handles);
 
     assignments
         .into_iter()
         .map(|assignment| TileAssignment {
             window: assignment.window,
-            rect: reserve_window_rect(assignment.rect, config),
+            rect: reserve_constrained_window_rect(
+                assignment.rect,
+                config,
+                constraints
+                    .get(&assignment.window)
+                    .copied()
+                    .unwrap_or_default(),
+            ),
         })
         .collect()
 }
@@ -1366,6 +1554,7 @@ fn collect_dwindle_assignments(
     tree: &DwindleTree,
     rect: Rect,
     config: LayoutConfig,
+    constraints: &BTreeMap<WindowHandle, WindowSizeConstraints>,
     assignments: &mut Vec<TileAssignment>,
 ) {
     match tree {
@@ -1378,9 +1567,10 @@ fn collect_dwindle_assignments(
             existing,
             new,
         } => {
-            let (existing_rect, new_rect) = split_for_direction(rect, *direction, config);
-            collect_dwindle_assignments(existing, existing_rect, config, assignments);
-            collect_dwindle_assignments(new, new_rect, config, assignments);
+            let (existing_rect, new_rect) =
+                split_for_direction(rect, *direction, config, constraints, existing, new);
+            collect_dwindle_assignments(existing, existing_rect, config, constraints, assignments);
+            collect_dwindle_assignments(new, new_rect, config, constraints, assignments);
         }
     }
 }
@@ -1469,10 +1659,36 @@ pub fn split_direction_for_point(rect: Rect, point: Point) -> SplitDirection {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Axis {
+    Horizontal,
+    Vertical,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AxisConstraint {
+    min: i32,
+    max: Option<i32>,
+}
+
+impl AxisConstraint {
+    const NONE: Self = Self { min: 0, max: None };
+
+    fn normalized(self) -> Self {
+        Self {
+            min: self.min.max(0),
+            max: self.max.map(|max| max.max(self.min.max(0))),
+        }
+    }
+}
+
 fn split_for_direction(
     rect: Rect,
     direction: SplitDirection,
     config: LayoutConfig,
+    constraints: &BTreeMap<WindowHandle, WindowSizeConstraints>,
+    existing: &DwindleTree,
+    new: &DwindleTree,
 ) -> (Rect, Rect) {
     let gap = config.gap;
     match direction {
@@ -1482,8 +1698,24 @@ fn split_for_direction(
                 return (rect, rect);
             }
 
-            let first_width = scale_length(available_width, config.master_ratio_percent);
-            let second_width = available_width.saturating_sub(first_width);
+            let (left_constraint, right_constraint) = match direction {
+                SplitDirection::Left => (
+                    tree_axis_constraint(new, constraints, config, Axis::Horizontal),
+                    tree_axis_constraint(existing, constraints, config, Axis::Horizontal),
+                ),
+                SplitDirection::Right => (
+                    tree_axis_constraint(existing, constraints, config, Axis::Horizontal),
+                    tree_axis_constraint(new, constraints, config, Axis::Horizontal),
+                ),
+                SplitDirection::Down | SplitDirection::Up => unreachable!(),
+            };
+            let (first_width, second_width) = allocate_pair_with_constraints(
+                rect.width(),
+                gap,
+                config.master_ratio_percent,
+                left_constraint,
+                right_constraint,
+            );
             let left = Rect::from_size(rect.left, rect.top, first_width, rect.height());
             let right = Rect::from_size(
                 left.right.saturating_add(gap),
@@ -1504,8 +1736,24 @@ fn split_for_direction(
                 return (rect, rect);
             }
 
-            let first_height = scale_length(available_height, config.master_ratio_percent);
-            let second_height = available_height.saturating_sub(first_height);
+            let (top_constraint, bottom_constraint) = match direction {
+                SplitDirection::Up => (
+                    tree_axis_constraint(new, constraints, config, Axis::Vertical),
+                    tree_axis_constraint(existing, constraints, config, Axis::Vertical),
+                ),
+                SplitDirection::Down => (
+                    tree_axis_constraint(existing, constraints, config, Axis::Vertical),
+                    tree_axis_constraint(new, constraints, config, Axis::Vertical),
+                ),
+                SplitDirection::Left | SplitDirection::Right => unreachable!(),
+            };
+            let (first_height, second_height) = allocate_pair_with_constraints(
+                rect.height(),
+                gap,
+                config.master_ratio_percent,
+                top_constraint,
+                bottom_constraint,
+            );
             let top = Rect::from_size(rect.left, rect.top, rect.width(), first_height);
             let bottom = Rect::from_size(
                 rect.left,
@@ -1527,36 +1775,385 @@ fn reserve_window_rect(rect: Rect, config: LayoutConfig) -> Rect {
     rect.inset(config.border)
 }
 
-fn split_rows_with_gap(area: Rect, rows: usize, gap: i32) -> impl Iterator<Item = Rect> {
-    let gap = gap.max(0);
-    let total_gap = gap.saturating_mul(rows.saturating_sub(1).min(i32::MAX as usize) as i32);
-    let available_height = area.height().saturating_sub(total_gap);
-    let base_height = available_height / rows as i32;
-    let remainder = available_height % rows as i32;
+fn reserve_constrained_window_rect(
+    rect: Rect,
+    config: LayoutConfig,
+    constraints: WindowSizeConstraints,
+) -> Rect {
+    let constraints = constraints.normalized();
+    let border = config.border.saturating_mul(2);
+    let min_width = constraints.min.width.saturating_add(border);
+    let min_height = constraints.min.height.saturating_add(border);
+    let max_width = constraints
+        .max
+        .map(|max| max.width.saturating_add(border).max(min_width));
+    let max_height = constraints
+        .max
+        .map(|max| max.height.saturating_add(border).max(min_height));
 
-    (0..rows).scan(area.top, move |top, index| {
-        let extra = if (index as i32) < remainder { 1 } else { 0 };
-        let height = base_height.saturating_add(extra);
+    let width = clamp_length(rect.width(), min_width, max_width);
+    let height = clamp_length(rect.height(), min_height, max_height);
+
+    reserve_window_rect(Rect::from_size(rect.left, rect.top, width, height), config)
+}
+
+fn clamp_length(length: i32, min: i32, max: Option<i32>) -> i32 {
+    let length = length.max(min);
+    max.map(|max| length.min(max)).unwrap_or(length)
+}
+
+fn effective_axis_constraint(
+    constraints: WindowSizeConstraints,
+    config: LayoutConfig,
+    axis: Axis,
+) -> AxisConstraint {
+    let constraints = constraints.normalized();
+    let border = config.border.saturating_mul(2);
+    match axis {
+        Axis::Horizontal => AxisConstraint {
+            min: constraints.min.width.saturating_add(border),
+            max: constraints.max.map(|max| max.width.saturating_add(border)),
+        },
+        Axis::Vertical => AxisConstraint {
+            min: constraints.min.height.saturating_add(border),
+            max: constraints.max.map(|max| max.height.saturating_add(border)),
+        },
+    }
+    .normalized()
+}
+
+fn stack_cross_axis_constraint(
+    windows: &[WindowLayoutInfo],
+    config: LayoutConfig,
+    axis: Axis,
+) -> AxisConstraint {
+    let mut min = 0;
+    let mut max = Some(i32::MAX);
+
+    for window in windows {
+        let constraint = effective_axis_constraint(window.size_constraints, config, axis);
+        min = min.max(constraint.min);
+        max = match (max, constraint.max) {
+            (Some(current), Some(candidate)) => Some(current.min(candidate)),
+            _ => None,
+        };
+    }
+
+    AxisConstraint { min, max }.normalized()
+}
+
+fn tree_axis_constraint(
+    tree: &DwindleTree,
+    constraints: &BTreeMap<WindowHandle, WindowSizeConstraints>,
+    config: LayoutConfig,
+    axis: Axis,
+) -> AxisConstraint {
+    match tree {
+        DwindleTree::Leaf(window) => effective_axis_constraint(
+            constraints.get(window).copied().unwrap_or_default(),
+            config,
+            axis,
+        ),
+        DwindleTree::Split {
+            direction,
+            existing,
+            new,
+        } => {
+            let existing = tree_axis_constraint(existing, constraints, config, axis);
+            let new = tree_axis_constraint(new, constraints, config, axis);
+            match (*direction, axis) {
+                (SplitDirection::Left | SplitDirection::Right, Axis::Horizontal)
+                | (SplitDirection::Up | SplitDirection::Down, Axis::Vertical) => {
+                    combine_series_constraints(existing, new, config.gap)
+                }
+                _ => combine_parallel_constraints(existing, new),
+            }
+        }
+    }
+}
+
+fn combine_series_constraints(
+    first: AxisConstraint,
+    second: AxisConstraint,
+    gap: i32,
+) -> AxisConstraint {
+    let gap = gap.max(0);
+    AxisConstraint {
+        min: first.min.saturating_add(gap).saturating_add(second.min),
+        max: first
+            .max
+            .zip(second.max)
+            .map(|(first, second)| first.saturating_add(gap).saturating_add(second)),
+    }
+    .normalized()
+}
+
+fn combine_parallel_constraints(first: AxisConstraint, second: AxisConstraint) -> AxisConstraint {
+    AxisConstraint {
+        min: first.min.max(second.min),
+        max: first
+            .max
+            .zip(second.max)
+            .map(|(first, second)| first.min(second)),
+    }
+    .normalized()
+}
+
+fn allocate_pair_with_constraints(
+    length: i32,
+    gap: i32,
+    percent: u8,
+    first: AxisConstraint,
+    second: AxisConstraint,
+) -> (i32, i32) {
+    let first = first.normalized();
+    let second = second.normalized();
+    let available = length.saturating_sub(gap.max(0)).max(0);
+
+    if first.min.saturating_add(second.min) >= available {
+        return (first.min, second.min);
+    }
+
+    let mut first_len = scale_length(available, percent);
+    let mut second_len = available.saturating_sub(first_len);
+
+    satisfy_pair_minimums(&mut first_len, &mut second_len, first.min, second.min);
+    apply_pair_maximums(&mut first_len, &mut second_len, first.max, second.max);
+    satisfy_pair_minimums(&mut first_len, &mut second_len, first.min, second.min);
+
+    (first_len.max(0), second_len.max(0))
+}
+
+fn satisfy_pair_minimums(
+    first_len: &mut i32,
+    second_len: &mut i32,
+    first_min: i32,
+    second_min: i32,
+) {
+    if *first_len < first_min {
+        let needed = first_min.saturating_sub(*first_len);
+        let available = second_len.saturating_sub(second_min).max(0);
+        let take = needed.min(available);
+        *first_len = first_len.saturating_add(take);
+        *second_len = second_len.saturating_sub(take);
+        if *first_len < first_min {
+            *first_len = first_min;
+        }
+    }
+
+    if *second_len < second_min {
+        let needed = second_min.saturating_sub(*second_len);
+        let available = first_len.saturating_sub(first_min).max(0);
+        let take = needed.min(available);
+        *second_len = second_len.saturating_add(take);
+        *first_len = first_len.saturating_sub(take);
+        if *second_len < second_min {
+            *second_len = second_min;
+        }
+    }
+}
+
+fn apply_pair_maximums(
+    first_len: &mut i32,
+    second_len: &mut i32,
+    first_max: Option<i32>,
+    second_max: Option<i32>,
+) {
+    if let Some(max) = first_max
+        && *first_len > max
+    {
+        let spare = first_len.saturating_sub(max);
+        *first_len = max;
+        let capacity = second_max
+            .map(|max| max.saturating_sub(*second_len).max(0))
+            .unwrap_or(spare);
+        *second_len = second_len.saturating_add(spare.min(capacity));
+    }
+
+    if let Some(max) = second_max
+        && *second_len > max
+    {
+        let spare = second_len.saturating_sub(max);
+        *second_len = max;
+        let capacity = first_max
+            .map(|max| max.saturating_sub(*first_len).max(0))
+            .unwrap_or(spare);
+        *first_len = first_len.saturating_add(spare.min(capacity));
+    }
+}
+
+fn split_rows_for_layout_windows<'a>(
+    area: Rect,
+    windows: &'a [WindowLayoutInfo],
+    config: LayoutConfig,
+) -> impl Iterator<Item = Rect> + 'a {
+    let heights = allocate_segments_with_constraints(
+        area.height(),
+        windows.len(),
+        config.gap,
+        windows
+            .iter()
+            .map(move |window| {
+                effective_axis_constraint(window.size_constraints, config, Axis::Vertical)
+            })
+            .collect(),
+    );
+
+    heights.into_iter().scan(area.top, move |top, height| {
         let rect = Rect::from_size(area.left, *top, area.width(), height);
-        *top = top.saturating_add(height).saturating_add(gap);
+        *top = top.saturating_add(height).saturating_add(config.gap);
         Some(rect)
     })
 }
 
-fn split_columns_with_gap(area: Rect, columns: usize, gap: i32) -> impl Iterator<Item = Rect> {
-    let gap = gap.max(0);
-    let total_gap = gap.saturating_mul(columns.saturating_sub(1).min(i32::MAX as usize) as i32);
-    let available_width = area.width().saturating_sub(total_gap);
-    let base_width = available_width / columns as i32;
-    let remainder = available_width % columns as i32;
+fn split_columns_for_layout_windows<'a>(
+    area: Rect,
+    windows: &'a [WindowLayoutInfo],
+    config: LayoutConfig,
+) -> impl Iterator<Item = Rect> + 'a {
+    let widths = allocate_segments_with_constraints(
+        area.width(),
+        windows.len(),
+        config.gap,
+        windows
+            .iter()
+            .map(move |window| {
+                effective_axis_constraint(window.size_constraints, config, Axis::Horizontal)
+            })
+            .collect(),
+    );
 
-    (0..columns).scan(area.left, move |left, index| {
-        let extra = if (index as i32) < remainder { 1 } else { 0 };
-        let width = base_width.saturating_add(extra);
+    widths.into_iter().scan(area.left, move |left, width| {
         let rect = Rect::from_size(*left, area.top, width, area.height());
-        *left = left.saturating_add(width).saturating_add(gap);
+        *left = left.saturating_add(width).saturating_add(config.gap);
         Some(rect)
     })
+}
+
+fn allocate_segments_with_constraints(
+    length: i32,
+    count: usize,
+    gap: i32,
+    constraints: Vec<AxisConstraint>,
+) -> Vec<i32> {
+    if count == 0 {
+        return Vec::new();
+    }
+
+    let gap = gap.max(0);
+    let total_gap = gap.saturating_mul(count.saturating_sub(1).min(i32::MAX as usize) as i32);
+    let available = length.saturating_sub(total_gap);
+    let base = available / count as i32;
+    let remainder = available % count as i32;
+    let constraints: Vec<_> = constraints
+        .into_iter()
+        .map(AxisConstraint::normalized)
+        .collect();
+    let mut lengths: Vec<_> = (0..count)
+        .map(|index| {
+            let extra = if (index as i32) < remainder { 1 } else { 0 };
+            base.saturating_add(extra)
+        })
+        .collect();
+
+    satisfy_segment_minimums(&mut lengths, &constraints);
+    apply_segment_maximums(&mut lengths, &constraints);
+    satisfy_segment_minimums(&mut lengths, &constraints);
+
+    lengths
+}
+
+fn satisfy_segment_minimums(lengths: &mut [i32], constraints: &[AxisConstraint]) {
+    for index in 0..lengths.len() {
+        let min = constraints
+            .get(index)
+            .copied()
+            .unwrap_or(AxisConstraint::NONE)
+            .min;
+        if lengths[index] >= min {
+            continue;
+        }
+
+        let needed = min.saturating_sub(lengths[index]);
+        let taken = take_segment_slack(lengths, constraints, index, needed);
+        lengths[index] = lengths[index].saturating_add(taken);
+        if lengths[index] < min {
+            lengths[index] = min;
+        }
+    }
+}
+
+fn apply_segment_maximums(lengths: &mut [i32], constraints: &[AxisConstraint]) {
+    for index in 0..lengths.len() {
+        let Some(max) = constraints
+            .get(index)
+            .copied()
+            .unwrap_or(AxisConstraint::NONE)
+            .max
+        else {
+            continue;
+        };
+
+        if lengths[index] <= max {
+            continue;
+        }
+
+        let spare = lengths[index].saturating_sub(max);
+        lengths[index] = max;
+        distribute_segment_spare(lengths, constraints, index, spare);
+    }
+}
+
+fn take_segment_slack(
+    lengths: &mut [i32],
+    constraints: &[AxisConstraint],
+    excluded: usize,
+    mut needed: i32,
+) -> i32 {
+    let mut taken: i32 = 0;
+    for (donor, donor_len) in lengths.iter_mut().enumerate() {
+        if donor == excluded || needed <= 0 {
+            continue;
+        }
+
+        let min = constraints
+            .get(donor)
+            .copied()
+            .unwrap_or(AxisConstraint::NONE)
+            .min;
+        let available = donor_len.saturating_sub(min).max(0);
+        let amount = available.min(needed);
+        *donor_len = donor_len.saturating_sub(amount);
+        needed = needed.saturating_sub(amount);
+        taken = taken.saturating_add(amount);
+    }
+
+    taken
+}
+
+fn distribute_segment_spare(
+    lengths: &mut [i32],
+    constraints: &[AxisConstraint],
+    excluded: usize,
+    mut spare: i32,
+) {
+    for (target, target_len) in lengths.iter_mut().enumerate() {
+        if target == excluded || spare <= 0 {
+            continue;
+        }
+
+        let max = constraints
+            .get(target)
+            .copied()
+            .unwrap_or(AxisConstraint::NONE)
+            .max;
+        let capacity = max
+            .map(|max| max.saturating_sub(*target_len).max(0))
+            .unwrap_or(spare);
+        let amount = capacity.min(spare);
+        *target_len = target_len.saturating_add(amount);
+        spare = spare.saturating_sub(amount);
+    }
 }
 
 fn scale_length(length: i32, percent: u8) -> i32 {
@@ -1600,6 +2197,7 @@ mod tests {
                 style: 0,
                 extended_style: 0,
             },
+            size_constraints: WindowSizeConstraints::NONE,
             rect: Rect {
                 left: 10,
                 top: 20,
@@ -1683,6 +2281,38 @@ mod tests {
                 rect: work_area,
             }]
         );
+    }
+
+    #[test]
+    fn tile_assignment_fit_rejects_rects_outside_work_area() {
+        let work_area = Rect::from_size(0, 0, 800, 600);
+
+        assert!(!tile_assignments_fit_work_area(
+            work_area,
+            &[TileAssignment {
+                window: WindowHandle(1),
+                rect: Rect::from_size(0, 0, 900, 600),
+            }],
+        ));
+    }
+
+    #[test]
+    fn tile_assignment_fit_rejects_overlapping_rects() {
+        let work_area = Rect::from_size(0, 0, 800, 600);
+
+        assert!(!tile_assignments_fit_work_area(
+            work_area,
+            &[
+                TileAssignment {
+                    window: WindowHandle(1),
+                    rect: Rect::from_size(0, 0, 500, 600),
+                },
+                TileAssignment {
+                    window: WindowHandle(2),
+                    rect: Rect::from_size(400, 0, 400, 600),
+                },
+            ],
+        ));
     }
 
     #[test]
@@ -1789,6 +2419,197 @@ mod tests {
                 TileAssignment {
                     window: WindowHandle(3),
                     rect: Rect::from_size(68, 0, 33, 100),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn vertical_stack_reserves_minimum_heights_without_overlap() {
+        let work_area = Rect::from_size(0, 0, 100, 120);
+        let windows = [
+            WindowLayoutInfo {
+                handle: WindowHandle(1),
+                size_constraints: WindowSizeConstraints::minimum(0, 80),
+            },
+            WindowLayoutInfo::unconstrained(WindowHandle(2)),
+        ];
+
+        let assignments = tile_layout_windows_with_config(
+            work_area,
+            &windows,
+            LayoutConfig {
+                kind: LayoutKind::VerticalStack,
+                ..LayoutConfig::default()
+            },
+        );
+
+        assert_eq!(
+            assignments,
+            vec![
+                TileAssignment {
+                    window: WindowHandle(1),
+                    rect: Rect::from_size(0, 0, 100, 80),
+                },
+                TileAssignment {
+                    window: WindowHandle(2),
+                    rect: Rect::from_size(0, 80, 100, 40),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn master_stack_reserves_fixed_master_width_for_stack() {
+        let work_area = Rect::from_size(0, 0, 1000, 800);
+        let windows = [
+            WindowLayoutInfo {
+                handle: WindowHandle(1),
+                size_constraints: WindowSizeConstraints::fixed(300, 800),
+            },
+            WindowLayoutInfo::unconstrained(WindowHandle(2)),
+        ];
+
+        let assignments = tile_layout_windows_with_config(
+            work_area,
+            &windows,
+            LayoutConfig {
+                kind: LayoutKind::MasterStack,
+                ..LayoutConfig::default()
+            },
+        );
+
+        assert_eq!(
+            assignments,
+            vec![
+                TileAssignment {
+                    window: WindowHandle(1),
+                    rect: Rect::from_size(0, 0, 300, 800),
+                },
+                TileAssignment {
+                    window: WindowHandle(2),
+                    rect: Rect::from_size(300, 0, 700, 800),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn dwindle_reserves_minimum_split_width_without_overlap() {
+        let work_area = Rect::from_size(0, 0, 1000, 800);
+        let windows = [
+            WindowLayoutInfo::unconstrained(WindowHandle(1)),
+            WindowLayoutInfo {
+                handle: WindowHandle(2),
+                size_constraints: WindowSizeConstraints::minimum(700, 0),
+            },
+        ];
+
+        let assignments = tile_layout_windows_with_config(
+            work_area,
+            &windows,
+            LayoutConfig {
+                kind: LayoutKind::Dwindle,
+                ..LayoutConfig::default()
+            },
+        );
+
+        assert_eq!(
+            assignments,
+            vec![
+                TileAssignment {
+                    window: WindowHandle(1),
+                    rect: Rect::from_size(0, 0, 300, 800),
+                },
+                TileAssignment {
+                    window: WindowHandle(2),
+                    rect: Rect::from_size(300, 0, 700, 800),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn dwindle_reserves_minimum_width_for_left_side_new_split() {
+        let work_area = Rect::from_size(0, 0, 1000, 800);
+        let windows = [
+            WindowLayoutInfo::unconstrained(WindowHandle(1)),
+            WindowLayoutInfo {
+                handle: WindowHandle(2),
+                size_constraints: WindowSizeConstraints::minimum(700, 0),
+            },
+        ];
+        let mut splits = vec![DwindleSplit {
+            target: WindowHandle(1),
+            new_window: WindowHandle(2),
+            direction: SplitDirection::Left,
+        }];
+
+        let assignments = tile_layout_windows_with_state(
+            work_area,
+            &windows,
+            LayoutConfig {
+                kind: LayoutKind::Dwindle,
+                preserve_split: true,
+                ..LayoutConfig::default()
+            },
+            None,
+            Some(&mut splits),
+        );
+
+        assert_eq!(
+            assignments,
+            vec![
+                TileAssignment {
+                    window: WindowHandle(1),
+                    rect: Rect::from_size(700, 0, 300, 800),
+                },
+                TileAssignment {
+                    window: WindowHandle(2),
+                    rect: Rect::from_size(0, 0, 700, 800),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn dwindle_reserves_minimum_height_for_upper_side_new_split() {
+        let work_area = Rect::from_size(0, 0, 1000, 800);
+        let windows = [
+            WindowLayoutInfo::unconstrained(WindowHandle(1)),
+            WindowLayoutInfo {
+                handle: WindowHandle(2),
+                size_constraints: WindowSizeConstraints::minimum(0, 600),
+            },
+        ];
+        let mut splits = vec![DwindleSplit {
+            target: WindowHandle(1),
+            new_window: WindowHandle(2),
+            direction: SplitDirection::Up,
+        }];
+
+        let assignments = tile_layout_windows_with_state(
+            work_area,
+            &windows,
+            LayoutConfig {
+                kind: LayoutKind::Dwindle,
+                preserve_split: true,
+                ..LayoutConfig::default()
+            },
+            None,
+            Some(&mut splits),
+        );
+
+        assert_eq!(
+            assignments,
+            vec![
+                TileAssignment {
+                    window: WindowHandle(1),
+                    rect: Rect::from_size(0, 600, 1000, 200),
+                },
+                TileAssignment {
+                    window: WindowHandle(2),
+                    rect: Rect::from_size(0, 0, 1000, 600),
                 },
             ]
         );

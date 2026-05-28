@@ -7,13 +7,16 @@ use anyhow::{Context, Result, anyhow};
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 use winland_config::{
-    Config, HotkeyBindingConfig, HotkeyKey, HotkeyMode, HotkeyModifier, TextMatcherConfig,
+    Config, HotkeyBindingConfig, HotkeyKey, HotkeyMode, HotkeyModifier, OverflowFocusPolicy,
+    TextMatcherConfig,
 };
 use winland_core::{
     DwindleSplit, LayoutConfig, LayoutKind, MonitorId, MonitorInfo, Rect, TileAssignment,
-    WindowHandle, WindowInfo, WindowParticipation, WindowRule, WindowRuleDecision, WorkspaceId,
-    WorkspaceManager, WorkspaceVisibilityChange, evaluate_window_rules, split_direction_for_point,
-    tile_windows_with_config, tile_windows_with_state,
+    WindowHandle, WindowInfo, WindowLayoutInfo, WindowParticipation, WindowRule,
+    WindowRuleDecision, WindowSizeConstraints, WorkspaceId, WorkspaceManager,
+    WorkspaceVisibilityChange, evaluate_window_rules, split_direction_for_point,
+    tile_assignments_fit_work_area, tile_layout_windows_with_config,
+    tile_layout_windows_with_state,
 };
 use winland_ipc::{
     DaemonStateSnapshot, IpcCommand, IpcRequest, IpcResponse, decode_request, encode_response,
@@ -26,6 +29,8 @@ use winland_win32::{
 
 const RECONCILE_DEBOUNCE: Duration = Duration::from_millis(50);
 const MAX_BATCH_SIZE: usize = 512;
+const TILE_FEEDBACK_PASSES: usize = 3;
+const TILE_FEEDBACK_TOLERANCE_PX: i32 = 0;
 
 fn main() -> Result<()> {
     let loaded_config = winland_config::load_or_default(None).context("load Winland config")?;
@@ -112,6 +117,7 @@ struct RuntimeConfig {
     dynamic_retile: bool,
     drag_to_float: bool,
     retile_on_drag_end: bool,
+    overflow_focus_policy: OverflowFocusPolicy,
 }
 
 impl RuntimeConfig {
@@ -126,6 +132,7 @@ impl RuntimeConfig {
             dynamic_retile: config.behavior.dynamic_retile,
             drag_to_float: config.behavior.drag_to_float,
             retile_on_drag_end: config.behavior.retile_on_drag_end,
+            overflow_focus_policy: config.behavior.overflow_focus_policy,
         })
     }
 
@@ -329,6 +336,9 @@ struct DaemonState {
     participation: BTreeMap<WindowHandle, WindowParticipation>,
     dwindle_splits: BTreeMap<(WorkspaceId, MonitorId), Vec<DwindleSplit>>,
     previous_rects: BTreeMap<WindowHandle, Rect>,
+    learned_size_constraints: BTreeMap<WindowHandle, WindowSizeConstraints>,
+    window_monitor_overrides: BTreeMap<WindowHandle, MonitorId>,
+    overflow_floating: BTreeSet<WindowHandle>,
     workspaces: WorkspaceManager,
     config: RuntimeConfig,
     hotkey_commands: HotkeyCommandMap,
@@ -352,6 +362,9 @@ impl DaemonState {
             participation: BTreeMap::new(),
             dwindle_splits: BTreeMap::new(),
             previous_rects: BTreeMap::new(),
+            learned_size_constraints: BTreeMap::new(),
+            window_monitor_overrides: BTreeMap::new(),
+            overflow_floating: BTreeSet::new(),
             workspaces: WorkspaceManager::new(config.workspace_count),
             config,
             hotkey_commands,
@@ -371,7 +384,7 @@ impl DaemonState {
             winland_win32::enumerate_monitors().context("enumerate monitors for startup retile")?;
         self.sync_workspace_state(&monitors);
         let assignments = self.tile_assignments(&monitors);
-        apply_tile_assignments(&assignments, "startup retile");
+        self.apply_tile_assignments_with_feedback(&assignments, &monitors, "startup retile");
         info!(
             move_count = assignments.len(),
             "completed startup retile request"
@@ -397,7 +410,7 @@ impl DaemonState {
         self.preserve_keyboard_state(&mut refreshed, &monitors);
         *self = refreshed;
         let event_plan = self.plan_after_window_events(batch, &diff, &monitors);
-        apply_tile_assignments(&event_plan.moves, "dynamic retile");
+        self.apply_tile_assignments_with_feedback(&event_plan.moves, &monitors, "dynamic retile");
 
         info!(
             event_count = batch.len(),
@@ -411,6 +424,7 @@ impl DaemonState {
             minimized_events = count_events(batch, WindowEventKind::Minimized),
             restored_events = count_events(batch, WindowEventKind::Restored),
             foreground_events = count_events(batch, WindowEventKind::ForegroundChanged),
+            metadata_events = count_events(batch, WindowEventKind::MetadataChanged),
             total_windows = self.windows.len(),
             manageable_windows = self.manageable_window_count(),
             floating_windows = self.floating_window_count(),
@@ -548,18 +562,7 @@ impl DaemonState {
             }
         }
 
-        for assignment in &plan.moves {
-            if let Err(error) =
-                winland_win32::move_resize_window(assignment.window, assignment.rect)
-            {
-                warn!(
-                    window = %assignment.window,
-                    rect = %assignment.rect,
-                    %error,
-                    "failed to move window during hotkey command"
-                );
-            }
-        }
+        self.apply_tile_assignments_with_feedback(&plan.moves, &monitors, "hotkey command");
 
         if plan.quit {
             winland_win32::request_message_loop_stop()
@@ -744,6 +747,7 @@ impl DaemonState {
             for event in batch {
                 match event.kind {
                     WindowEventKind::MoveSizeStart => {
+                        self.forget_learned_size_constraint(event.window);
                         if self.start_temporary_float(event.window) {
                             should_retile = should_retile || self.config.dynamic_retile;
                         }
@@ -763,6 +767,12 @@ impl DaemonState {
                     }
                     _ => {}
                 }
+            }
+        }
+
+        for event in batch {
+            if event.kind == WindowEventKind::MetadataChanged {
+                self.forget_learned_size_constraint(event.window);
             }
         }
 
@@ -790,6 +800,7 @@ impl DaemonState {
                     | WindowEventKind::Hidden
                     | WindowEventKind::Minimized
                     | WindowEventKind::Restored
+                    | WindowEventKind::MetadataChanged
             )
         }) || diff.moved_between_monitors > 0
     }
@@ -823,12 +834,17 @@ impl DaemonState {
         let Some(window_info) = self.windows.get(&window) else {
             return false;
         };
-        let Some(target_monitor) = monitor_for_rect(window_info.rect, monitors) else {
+        let cursor_position = winland_win32::cursor_position().ok();
+        let Some(target_monitor) = cursor_position
+            .and_then(|point| monitor_for_point(point, monitors))
+            .or_else(|| monitor_for_rect(window_info.rect, monitors))
+        else {
             return false;
         };
         let Some(monitor) = monitors.iter().find(|monitor| monitor.id == target_monitor) else {
             return false;
         };
+        self.window_monitor_overrides.insert(window, target_monitor);
         let dropped_rect = window_info.rect;
 
         let target_handles: Vec<_> = self
@@ -840,9 +856,12 @@ impl DaemonState {
             .filter(|handle| {
                 self.windows.get(handle).is_some_and(|candidate| {
                     self.is_tilable_window(*handle)
-                        && monitor
-                            .rect
-                            .contains(self.window_layout_rect(*handle, candidate).center())
+                        && self.monitor_owns_window_rect(
+                            *handle,
+                            monitor,
+                            self.window_layout_rect(*handle, candidate),
+                            monitors,
+                        )
                 })
             })
             .collect();
@@ -854,7 +873,7 @@ impl DaemonState {
             && self.retarget_dwindle_drop(
                 window,
                 dropped_rect,
-                winland_win32::cursor_position().ok(),
+                cursor_position,
                 &target_handles,
                 monitor,
                 layout,
@@ -885,9 +904,10 @@ impl DaemonState {
             .get(&split_key)
             .cloned()
             .unwrap_or_default();
-        let assignments = tile_windows_with_state(
+        let layout_windows = self.layout_windows_for_handles(target_handles);
+        let assignments = tile_layout_windows_with_state(
             monitor.work_area,
-            target_handles,
+            &layout_windows,
             layout,
             None,
             Some(&mut preview_splits),
@@ -933,9 +953,11 @@ impl DaemonState {
                 let layout = self
                     .config
                     .layout_for_monitor(monitor, self.workspaces.active_workspace());
-                let assignment = tile_windows_with_config(monitor.work_area, &handles, layout)
-                    .into_iter()
-                    .find(|assignment| assignment.window == window)?;
+                let layout_windows = self.layout_windows_for_handles(&handles);
+                let assignment =
+                    tile_layout_windows_with_config(monitor.work_area, &layout_windows, layout)
+                        .into_iter()
+                        .find(|assignment| assignment.window == window)?;
                 let center = assignment.rect.center();
                 let dx = i64::from(center.x - dropped_center.x);
                 let dy = i64::from(center.y - dropped_center.y);
@@ -1047,34 +1069,234 @@ impl DaemonState {
         let cursor_position = winland_win32::cursor_position().ok();
         let active_workspace = self.workspaces.active_workspace();
         let mut assignments = Vec::new();
+        let mut next_overflow_floating = BTreeSet::new();
 
         for monitor in monitors {
-            let handles = self.tiled_handles_for_monitor(monitor);
+            let handles = self.tiled_handles_for_monitor(monitor, monitors);
             let layout = self.config.layout_for_monitor(monitor, active_workspace);
+            let overflow_plan =
+                self.resolve_overflow_for_monitor(monitor, &handles, layout, cursor_position);
+            next_overflow_floating.extend(overflow_plan.overflow_windows.iter().copied());
+            let layout_windows = self.layout_windows_for_handles(&overflow_plan.tiled_windows);
             let monitor_assignments = if layout.kind == LayoutKind::Dwindle {
                 let splits = self
                     .dwindle_splits
                     .entry((active_workspace, monitor.id))
                     .or_default();
-                tile_windows_with_state(
+                tile_layout_windows_with_state(
                     monitor.work_area,
-                    &handles,
+                    &layout_windows,
                     layout,
                     cursor_position,
                     Some(splits),
                 )
             } else {
                 self.dwindle_splits.remove(&(active_workspace, monitor.id));
-                tile_windows_with_config(monitor.work_area, &handles, layout)
+                tile_layout_windows_with_config(monitor.work_area, &layout_windows, layout)
             };
 
             assignments.extend(monitor_assignments);
         }
 
+        if self.overflow_floating != next_overflow_floating {
+            debug!(
+                old_count = self.overflow_floating.len(),
+                new_count = next_overflow_floating.len(),
+                "updated automatic overflow floating windows"
+            );
+        }
+        self.overflow_floating = next_overflow_floating;
+
         assignments
     }
 
-    fn tiled_handles_for_monitor(&self, monitor: &MonitorInfo) -> Vec<WindowHandle> {
+    fn resolve_overflow_for_monitor(
+        &self,
+        monitor: &MonitorInfo,
+        handles: &[WindowHandle],
+        layout: LayoutConfig,
+        cursor_position: Option<winland_core::Point>,
+    ) -> MonitorOverflowPlan {
+        let mut tiled_windows = handles.to_vec();
+        let mut overflow_windows = Vec::new();
+
+        loop {
+            let assignments =
+                self.preview_tile_assignments(monitor, &tiled_windows, layout, cursor_position);
+            if tile_assignments_fit_work_area(monitor.work_area, &assignments) {
+                return MonitorOverflowPlan {
+                    tiled_windows,
+                    overflow_windows,
+                };
+            }
+
+            let Some(overflow) = self.next_overflow_window(&tiled_windows) else {
+                return MonitorOverflowPlan {
+                    tiled_windows: Vec::new(),
+                    overflow_windows,
+                };
+            };
+
+            tiled_windows.retain(|window| *window != overflow);
+            overflow_windows.push(overflow);
+        }
+    }
+
+    fn preview_tile_assignments(
+        &self,
+        monitor: &MonitorInfo,
+        handles: &[WindowHandle],
+        layout: LayoutConfig,
+        cursor_position: Option<winland_core::Point>,
+    ) -> Vec<TileAssignment> {
+        let layout_windows = self.layout_windows_for_handles(handles);
+        if layout.kind == LayoutKind::Dwindle {
+            let mut splits = self
+                .dwindle_splits
+                .get(&(self.workspaces.active_workspace(), monitor.id))
+                .cloned()
+                .unwrap_or_default();
+            tile_layout_windows_with_state(
+                monitor.work_area,
+                &layout_windows,
+                layout,
+                cursor_position,
+                Some(&mut splits),
+            )
+        } else {
+            tile_layout_windows_with_config(monitor.work_area, &layout_windows, layout)
+        }
+    }
+
+    fn next_overflow_window(&self, tiled_windows: &[WindowHandle]) -> Option<WindowHandle> {
+        let focused = self
+            .foreground
+            .filter(|window| tiled_windows.contains(window));
+
+        if self.config.overflow_focus_policy == OverflowFocusPolicy::FloatFocused
+            && let Some(focused) = focused
+        {
+            return Some(focused);
+        }
+
+        tiled_windows
+            .iter()
+            .rev()
+            .copied()
+            .find(|window| Some(*window) != focused)
+            .or_else(|| tiled_windows.last().copied())
+    }
+
+    fn apply_tile_assignments_with_feedback(
+        &mut self,
+        assignments: &[TileAssignment],
+        monitors: &[MonitorInfo],
+        operation: &'static str,
+    ) {
+        let mut assignments = assignments.to_vec();
+
+        for pass in 0..TILE_FEEDBACK_PASSES {
+            if assignments.is_empty() {
+                return;
+            }
+
+            apply_tile_assignments_once(&assignments, operation);
+
+            if !self.learn_constraints_from_actual_rects(&assignments, operation) {
+                return;
+            }
+
+            if pass + 1 < TILE_FEEDBACK_PASSES {
+                assignments = self.tile_assignments(monitors);
+            }
+        }
+    }
+
+    fn learn_constraints_from_actual_rects(
+        &mut self,
+        assignments: &[TileAssignment],
+        operation: &'static str,
+    ) -> bool {
+        let mut changed = false;
+
+        for assignment in assignments {
+            let Ok(actual) = winland_win32::window_rect_for_handle(assignment.window) else {
+                continue;
+            };
+
+            let extra_width = actual
+                .width()
+                .saturating_sub(assignment.rect.width())
+                .max(0);
+            let extra_height = actual
+                .height()
+                .saturating_sub(assignment.rect.height())
+                .max(0);
+            if extra_width <= TILE_FEEDBACK_TOLERANCE_PX
+                && extra_height <= TILE_FEEDBACK_TOLERANCE_PX
+            {
+                continue;
+            }
+
+            let current = self
+                .learned_size_constraints
+                .get(&assignment.window)
+                .copied()
+                .unwrap_or_default();
+            let learned = WindowSizeConstraints::minimum(
+                current.min.width.max(actual.width()),
+                current.min.height.max(actual.height()),
+            );
+
+            if learned != current {
+                self.learned_size_constraints
+                    .insert(assignment.window, learned);
+                changed = true;
+                debug!(
+                    window = %assignment.window,
+                    requested = %assignment.rect,
+                    actual = %actual,
+                    operation,
+                    "learned window minimum size from accepted geometry"
+                );
+            }
+        }
+
+        changed
+    }
+
+    fn forget_learned_size_constraint(&mut self, window: WindowHandle) {
+        if self.learned_size_constraints.remove(&window).is_some() {
+            debug!(
+                window = %window,
+                "cleared learned window minimum size after window state changed"
+            );
+        }
+    }
+
+    fn layout_windows_for_handles(&self, handles: &[WindowHandle]) -> Vec<WindowLayoutInfo> {
+        handles
+            .iter()
+            .filter_map(|handle| {
+                self.windows.get(handle).map(|window| WindowLayoutInfo {
+                    handle: *handle,
+                    size_constraints: merge_size_constraints(
+                        window.size_constraints,
+                        self.learned_size_constraints
+                            .get(handle)
+                            .copied()
+                            .unwrap_or_default(),
+                    ),
+                })
+            })
+            .collect()
+    }
+
+    fn tiled_handles_for_monitor(
+        &self,
+        monitor: &MonitorInfo,
+        monitors: &[MonitorInfo],
+    ) -> Vec<WindowHandle> {
         self.tile_order
             .iter()
             .copied()
@@ -1082,12 +1304,33 @@ impl DaemonState {
             .filter(|handle| {
                 self.windows.get(handle).is_some_and(|window| {
                     self.is_tilable_window(*handle)
-                        && monitor
-                            .rect
-                            .contains(self.window_layout_rect(*handle, window).center())
+                        && self.monitor_owns_window_rect(
+                            *handle,
+                            monitor,
+                            self.window_layout_rect(*handle, window),
+                            monitors,
+                        )
                 })
             })
             .collect()
+    }
+
+    fn monitor_owns_window_rect(
+        &self,
+        window: WindowHandle,
+        monitor: &MonitorInfo,
+        rect: Rect,
+        monitors: &[MonitorInfo],
+    ) -> bool {
+        if let Some(override_monitor) = self.window_monitor_overrides.get(&window).copied()
+            && monitors
+                .iter()
+                .any(|candidate| candidate.id == override_monitor)
+        {
+            return override_monitor == monitor.id;
+        }
+
+        monitor_owns_rect(monitor, rect, monitors)
     }
 
     fn sync_workspace_state(&mut self, monitors: &[MonitorInfo]) {
@@ -1180,6 +1423,27 @@ impl DaemonState {
             .iter()
             .filter(|(handle, _)| known_workspace_windows.contains(handle))
             .map(|(handle, rect)| (*handle, *rect))
+            .collect();
+        refreshed.learned_size_constraints = self
+            .learned_size_constraints
+            .iter()
+            .filter(|(handle, _)| known_workspace_windows.contains(handle))
+            .map(|(handle, constraints)| (*handle, *constraints))
+            .collect();
+        refreshed.window_monitor_overrides = self
+            .window_monitor_overrides
+            .iter()
+            .filter(|(handle, monitor)| {
+                known_workspace_windows.contains(handle)
+                    && monitors.iter().any(|candidate| candidate.id == **monitor)
+            })
+            .map(|(handle, monitor)| (*handle, *monitor))
+            .collect();
+        refreshed.overflow_floating = self
+            .overflow_floating
+            .iter()
+            .copied()
+            .filter(|handle| known_workspace_windows.contains(handle))
             .collect();
     }
 
@@ -1373,6 +1637,12 @@ struct CommandPlan {
 struct WorkspaceCommandPlan {
     hide: Vec<WindowHandle>,
     show: Vec<WorkspaceVisibilityChange>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct MonitorOverflowPlan {
+    tiled_windows: Vec<WindowHandle>,
+    overflow_windows: Vec<WindowHandle>,
 }
 
 fn count_events(batch: &[WindowEvent], kind: WindowEventKind) -> usize {
@@ -1689,7 +1959,25 @@ fn virtual_key_label(key: VirtualKey) -> String {
     }
 }
 
-fn apply_tile_assignments(assignments: &[TileAssignment], operation: &'static str) {
+fn merge_size_constraints(
+    base: WindowSizeConstraints,
+    learned: WindowSizeConstraints,
+) -> WindowSizeConstraints {
+    let base = base.normalized();
+    let learned = learned.normalized();
+    let min_width = base.min.width.max(learned.min.width);
+    let min_height = base.min.height.max(learned.min.height);
+
+    WindowSizeConstraints {
+        min: winland_core::Size::new(min_width, min_height),
+        max: base.max.map(|max| {
+            winland_core::Size::new(max.width.max(min_width), max.height.max(min_height))
+        }),
+    }
+    .normalized()
+}
+
+fn apply_tile_assignments_once(assignments: &[TileAssignment], operation: &'static str) {
     for assignment in assignments {
         if let Err(error) = winland_win32::move_resize_window(assignment.window, assignment.rect) {
             warn!(
@@ -1707,12 +1995,73 @@ fn is_fullscreen_window(window: &WindowInfo, monitors: &[MonitorInfo]) -> bool {
     monitors.iter().any(|monitor| window.rect == monitor.rect)
 }
 
-fn monitor_for_rect(rect: Rect, monitors: &[MonitorInfo]) -> Option<winland_core::MonitorId> {
-    let center = rect.center();
+fn monitor_owns_rect(monitor: &MonitorInfo, rect: Rect, monitors: &[MonitorInfo]) -> bool {
+    monitor_for_rect(rect, monitors) == Some(monitor.id)
+}
+
+fn monitor_for_point(
+    point: winland_core::Point,
+    monitors: &[MonitorInfo],
+) -> Option<winland_core::MonitorId> {
     monitors
         .iter()
-        .find(|monitor| monitor.rect.contains(center))
+        .find(|monitor| monitor.rect.contains(point))
         .map(|monitor| monitor.id)
+        .or_else(|| {
+            monitors
+                .iter()
+                .min_by_key(|monitor| (squared_distance_to_rect(point, monitor.rect), monitor.id))
+                .map(|monitor| monitor.id)
+        })
+}
+
+fn monitor_for_rect(rect: Rect, monitors: &[MonitorInfo]) -> Option<winland_core::MonitorId> {
+    monitors
+        .iter()
+        .filter_map(|monitor| {
+            let overlap = rect_overlap_area(rect, monitor.rect);
+            (overlap > 0).then_some((overlap, monitor.id))
+        })
+        .max_by_key(|(overlap, id)| (*overlap, std::cmp::Reverse(*id)))
+        .map(|(_, id)| id)
+        .or_else(|| {
+            let center = rect.center();
+            monitors
+                .iter()
+                .min_by_key(|monitor| (squared_distance_to_rect(center, monitor.rect), monitor.id))
+                .map(|monitor| monitor.id)
+        })
+}
+
+fn rect_overlap_area(a: Rect, b: Rect) -> i64 {
+    let left = a.left.max(b.left);
+    let top = a.top.max(b.top);
+    let right = a.right.min(b.right);
+    let bottom = a.bottom.min(b.bottom);
+    let width = i64::from(right.saturating_sub(left).max(0));
+    let height = i64::from(bottom.saturating_sub(top).max(0));
+    width * height
+}
+
+fn squared_distance_to_rect(point: winland_core::Point, rect: Rect) -> i64 {
+    let dx = if point.x < rect.left {
+        rect.left.saturating_sub(point.x)
+    } else if point.x >= rect.right {
+        point.x.saturating_sub(rect.right.saturating_sub(1))
+    } else {
+        0
+    };
+    let dy = if point.y < rect.top {
+        rect.top.saturating_sub(point.y)
+    } else if point.y >= rect.bottom {
+        point.y.saturating_sub(rect.bottom.saturating_sub(1))
+    } else {
+        0
+    };
+
+    let dx = i64::from(dx);
+    let dy = i64::from(dy);
+    dx * dx + dy * dy
 }
 
 fn nearest_assignment(
@@ -1879,6 +2228,243 @@ mod tests {
                     rect: Rect::from_size(1000, 0, 800, 560),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn retile_uses_window_size_constraints_from_snapshot() {
+        let monitor = primary_test_monitor();
+        let mut fixed = window(1, "Fixed", Rect::from_size(0, 0, 300, 760));
+        fixed.size_constraints = winland_core::WindowSizeConstraints::fixed(300, 760);
+        let mut state = daemon_state([
+            fixed,
+            window(2, "Flexible", Rect::from_size(200, 0, 100, 100)),
+        ]);
+
+        let plan = state.plan_command(DaemonCommand::Retile, &[monitor]);
+
+        assert_eq!(
+            plan.moves,
+            vec![
+                TileAssignment {
+                    window: WindowHandle(1),
+                    rect: Rect::from_size(0, 0, 300, 760),
+                },
+                TileAssignment {
+                    window: WindowHandle(2),
+                    rect: Rect::from_size(300, 0, 700, 760),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn overflow_floats_other_windows_to_keep_focused_window_tiled_by_default() {
+        let monitor = primary_test_monitor();
+        let work_area = monitor.work_area;
+        let mut focused = window(1, "Focused", Rect::from_size(0, 0, 100, 100));
+        focused.size_constraints = winland_core::WindowSizeConstraints::minimum(700, 0);
+        let mut other = window(2, "Other", Rect::from_size(200, 0, 100, 100));
+        other.size_constraints = winland_core::WindowSizeConstraints::minimum(700, 0);
+        let mut state = daemon_state([focused, other]);
+        state.foreground = Some(WindowHandle(1));
+
+        let plan = state.plan_command(DaemonCommand::Retile, &[monitor]);
+
+        assert_eq!(
+            plan.moves,
+            vec![TileAssignment {
+                window: WindowHandle(1),
+                rect: work_area,
+            }]
+        );
+        assert_eq!(state.overflow_floating, BTreeSet::from([WindowHandle(2)]));
+    }
+
+    #[test]
+    fn overflow_can_float_focused_window_first_when_configured() {
+        let monitor = primary_test_monitor();
+        let work_area = monitor.work_area;
+        let mut focused = window(1, "Focused", Rect::from_size(0, 0, 100, 100));
+        focused.size_constraints = winland_core::WindowSizeConstraints::minimum(700, 0);
+        let mut other = window(2, "Other", Rect::from_size(200, 0, 100, 100));
+        other.size_constraints = winland_core::WindowSizeConstraints::minimum(700, 0);
+        let mut state = daemon_state([focused, other]);
+        state.foreground = Some(WindowHandle(1));
+        state.config.overflow_focus_policy = OverflowFocusPolicy::FloatFocused;
+
+        let plan = state.plan_command(DaemonCommand::Retile, &[monitor]);
+
+        assert_eq!(
+            plan.moves,
+            vec![TileAssignment {
+                window: WindowHandle(2),
+                rect: work_area,
+            }]
+        );
+        assert_eq!(state.overflow_floating, BTreeSet::from([WindowHandle(1)]));
+    }
+
+    #[test]
+    fn overflow_can_float_multiple_windows_until_layout_fits() {
+        let monitor = primary_test_monitor();
+        let work_area = monitor.work_area;
+        let mut first = window(1, "Focused", Rect::from_size(0, 0, 100, 100));
+        first.size_constraints = winland_core::WindowSizeConstraints::minimum(0, 400);
+        let mut second = window(2, "Second", Rect::from_size(0, 200, 100, 100));
+        second.size_constraints = winland_core::WindowSizeConstraints::minimum(0, 400);
+        let mut third = window(3, "Third", Rect::from_size(0, 400, 100, 100));
+        third.size_constraints = winland_core::WindowSizeConstraints::minimum(0, 400);
+        let mut state = daemon_state([first, second, third]);
+        state.config.layout.kind = LayoutKind::VerticalStack;
+        state.foreground = Some(WindowHandle(1));
+
+        let plan = state.plan_command(DaemonCommand::Retile, &[monitor]);
+
+        assert_eq!(
+            plan.moves,
+            vec![TileAssignment {
+                window: WindowHandle(1),
+                rect: work_area,
+            }]
+        );
+        assert_eq!(
+            state.overflow_floating,
+            BTreeSet::from([WindowHandle(2), WindowHandle(3)])
+        );
+    }
+
+    #[test]
+    fn overflow_floats_focused_window_when_it_cannot_fit_by_itself() {
+        let monitor = primary_test_monitor();
+        let mut focused = window(1, "Focused", Rect::from_size(0, 0, 100, 100));
+        focused.size_constraints = winland_core::WindowSizeConstraints::minimum(
+            monitor.work_area.width() + 1,
+            monitor.work_area.height(),
+        );
+        let mut state = daemon_state([focused]);
+        state.foreground = Some(WindowHandle(1));
+
+        let plan = state.plan_command(DaemonCommand::Retile, &[monitor]);
+
+        assert!(plan.moves.is_empty());
+        assert_eq!(state.overflow_floating, BTreeSet::from([WindowHandle(1)]));
+    }
+
+    #[test]
+    fn overflow_windows_are_reconsidered_on_next_retile() {
+        let monitor = primary_test_monitor();
+        let mut first = window(1, "One", Rect::from_size(0, 0, 100, 100));
+        first.size_constraints = winland_core::WindowSizeConstraints::minimum(700, 0);
+        let mut second = window(2, "Two", Rect::from_size(200, 0, 100, 100));
+        second.size_constraints = winland_core::WindowSizeConstraints::minimum(700, 0);
+        let mut state = daemon_state([first, second]);
+        state.foreground = Some(WindowHandle(1));
+
+        let _ = state.plan_command(DaemonCommand::Retile, std::slice::from_ref(&monitor));
+        assert_eq!(state.overflow_floating, BTreeSet::from([WindowHandle(2)]));
+
+        state
+            .windows
+            .get_mut(&WindowHandle(2))
+            .unwrap()
+            .size_constraints = winland_core::WindowSizeConstraints::NONE;
+        let plan = state.plan_command(DaemonCommand::Retile, &[monitor]);
+
+        assert_eq!(state.overflow_floating, BTreeSet::new());
+        assert_eq!(plan.moves.len(), 2);
+    }
+
+    #[test]
+    fn retile_keeps_partially_offscreen_windows_on_nearest_monitor() {
+        let monitor = primary_test_monitor();
+        let mut state = daemon_state([
+            window(1, "Mostly Offscreen", Rect::from_size(-900, 0, 1000, 100)),
+            window(2, "Visible", Rect::from_size(200, 0, 100, 100)),
+        ]);
+
+        let plan = state.plan_command(DaemonCommand::Retile, &[monitor]);
+
+        assert_eq!(
+            plan.moves,
+            vec![
+                TileAssignment {
+                    window: WindowHandle(1),
+                    rect: Rect::from_size(0, 0, 500, 760),
+                },
+                TileAssignment {
+                    window: WindowHandle(2),
+                    rect: Rect::from_size(500, 0, 500, 760),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn monitor_selection_uses_overlap_before_center() {
+        let monitors = [primary_test_monitor(), secondary_test_monitor()];
+
+        assert_eq!(
+            monitor_for_rect(Rect::from_size(-900, 0, 1000, 100), &monitors),
+            Some(MonitorId(1))
+        );
+    }
+
+    #[test]
+    fn monitor_selection_falls_back_to_nearest_monitor_when_fully_offscreen() {
+        let monitors = [primary_test_monitor(), secondary_test_monitor()];
+
+        assert_eq!(
+            monitor_for_rect(Rect::from_size(2600, 0, 100, 100), &monitors),
+            Some(MonitorId(2))
+        );
+    }
+
+    #[test]
+    fn monitor_selection_can_use_cursor_position() {
+        let monitors = [primary_test_monitor(), secondary_test_monitor()];
+
+        assert_eq!(
+            monitor_for_point(winland_core::Point { x: 1200, y: 300 }, &monitors),
+            Some(MonitorId(2))
+        );
+    }
+
+    #[test]
+    fn monitor_override_from_drag_controls_next_retile_assignment() {
+        let monitors = [primary_test_monitor(), secondary_test_monitor()];
+        let mut state = daemon_state([window(1, "Dragged", Rect::from_size(0, 0, 100, 100))]);
+        state
+            .window_monitor_overrides
+            .insert(WindowHandle(1), MonitorId(2));
+
+        let plan = state.plan_command(DaemonCommand::Retile, &monitors);
+
+        assert_eq!(
+            plan.moves,
+            vec![TileAssignment {
+                window: WindowHandle(1),
+                rect: Rect::from_size(1000, 0, 800, 560),
+            }]
+        );
+    }
+
+    #[test]
+    fn learned_constraints_are_merged_into_layout_inputs() {
+        let mut state = daemon_state([window(1, "Task Manager", Rect::from_size(0, 0, 100, 100))]);
+        state.learned_size_constraints.insert(
+            WindowHandle(1),
+            winland_core::WindowSizeConstraints::minimum(420, 300),
+        );
+
+        let windows = state.layout_windows_for_handles(&[WindowHandle(1)]);
+
+        assert_eq!(
+            windows,
+            vec![WindowLayoutInfo {
+                handle: WindowHandle(1),
+                size_constraints: winland_core::WindowSizeConstraints::minimum(420, 300),
+            }]
         );
     }
 
@@ -2186,6 +2772,67 @@ mod tests {
     }
 
     #[test]
+    fn metadata_changes_request_dynamic_retile() {
+        let state = daemon_state([window(1, "Paint", Rect::from_size(0, 0, 100, 100))]);
+
+        assert!(state.should_retile_after_events(
+            &[event(WindowEventKind::MetadataChanged, 1)],
+            &SnapshotDiff::default(),
+        ));
+    }
+
+    #[test]
+    fn metadata_changes_clear_learned_size_constraint_before_retile() {
+        let monitor = primary_test_monitor();
+        let work_area = monitor.work_area;
+        let mut state = daemon_state([window(1, "Paint", Rect::from_size(0, 0, 100, 100))]);
+        state.learned_size_constraints.insert(
+            WindowHandle(1),
+            WindowSizeConstraints::minimum(work_area.width() + 200, work_area.height() + 200),
+        );
+
+        let plan = state.plan_after_window_events(
+            &[event(WindowEventKind::MetadataChanged, 1)],
+            &SnapshotDiff::default(),
+            &[monitor],
+        );
+
+        assert!(
+            !state
+                .learned_size_constraints
+                .contains_key(&WindowHandle(1))
+        );
+        assert_eq!(
+            plan.moves,
+            vec![TileAssignment {
+                window: WindowHandle(1),
+                rect: work_area,
+            }]
+        );
+    }
+
+    #[test]
+    fn drag_start_clears_learned_size_constraint() {
+        let monitor = primary_test_monitor();
+        let mut state = daemon_state([window(1, "Paint", Rect::from_size(0, 0, 100, 100))]);
+        state
+            .learned_size_constraints
+            .insert(WindowHandle(1), WindowSizeConstraints::minimum(900, 700));
+
+        let _ = state.plan_after_window_events(
+            &[event(WindowEventKind::MoveSizeStart, 1)],
+            &SnapshotDiff::default(),
+            &[monitor],
+        );
+
+        assert!(
+            !state
+                .learned_size_constraints
+                .contains_key(&WindowHandle(1))
+        );
+    }
+
+    #[test]
     fn switch_workspace_plans_hide_show_and_retile_for_target_workspace() {
         let mut state = daemon_state([
             window(1, "One", Rect::from_size(0, 0, 100, 100)),
@@ -2361,6 +3008,9 @@ mod tests {
             participation: BTreeMap::new(),
             dwindle_splits: BTreeMap::new(),
             previous_rects: BTreeMap::new(),
+            learned_size_constraints: BTreeMap::new(),
+            window_monitor_overrides: BTreeMap::new(),
+            overflow_floating: BTreeSet::new(),
             workspaces: WorkspaceManager::new(9),
             config: RuntimeConfig::default(),
             hotkey_commands: HotkeyCommandMap::default(),
@@ -2412,6 +3062,7 @@ mod tests {
                 style: 0,
                 extended_style: 0,
             },
+            size_constraints: winland_core::WindowSizeConstraints::NONE,
             rect,
         }
     }

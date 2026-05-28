@@ -274,6 +274,7 @@ pub struct BehaviorConfig {
     pub dynamic_retile: bool,
     pub drag_to_float: bool,
     pub retile_on_drag_end: bool,
+    pub overflow_focus_policy: OverflowFocusPolicy,
     pub focus_follows_mouse: bool,
     pub restore_previous_placement: bool,
     pub manage_minimized_windows: bool,
@@ -287,12 +288,21 @@ impl Default for BehaviorConfig {
             dynamic_retile: true,
             drag_to_float: true,
             retile_on_drag_end: true,
+            overflow_focus_policy: OverflowFocusPolicy::TileFocused,
             focus_follows_mouse: false,
             restore_previous_placement: true,
             manage_minimized_windows: false,
             avoid_fullscreen_windows: true,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum OverflowFocusPolicy {
+    #[default]
+    TileFocused,
+    FloatFocused,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1131,6 +1141,10 @@ mod tests {
         assert!(config.behavior.dynamic_retile);
         assert!(config.behavior.drag_to_float);
         assert!(config.behavior.retile_on_drag_end);
+        assert_eq!(
+            config.behavior.overflow_focus_policy,
+            OverflowFocusPolicy::TileFocused
+        );
         assert!(config.window_rules.is_empty());
     }
 
@@ -1169,6 +1183,7 @@ mod tests {
             dynamic_retile = false
             drag_to_float = true
             retile_on_drag_end = false
+            overflow_focus_policy = "float-focused"
 
             [[window_rules]]
             name = "float settings"
@@ -1198,6 +1213,10 @@ mod tests {
         assert!(!config.behavior.dynamic_retile);
         assert!(config.behavior.drag_to_float);
         assert!(!config.behavior.retile_on_drag_end);
+        assert_eq!(
+            config.behavior.overflow_focus_policy,
+            OverflowFocusPolicy::FloatFocused
+        );
         assert_eq!(config.window_rules().unwrap().len(), 1);
     }
 
@@ -1345,6 +1364,7 @@ mod tests {
                 style: 0,
                 extended_style: 0,
             },
+            size_constraints: winland_core::WindowSizeConstraints::NONE,
             rect: Rect::from_size(0, 0, 100, 100),
         }
     }

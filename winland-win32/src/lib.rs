@@ -39,22 +39,25 @@ mod platform {
         MOD_WIN, RegisterHotKey, UnregisterHotKey,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        CallNextHookEx, DispatchMessageW, EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY,
-        EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW, EVENT_SYSTEM_FOREGROUND,
-        EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND,
-        EVENT_SYSTEM_MOVESIZESTART, EnumWindows, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetClassNameW,
-        GetCursorPos, GetForegroundWindow, GetMessageW, GetWindow, GetWindowLongPtrW,
-        GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HC_ACTION,
-        HHOOK, IsIconic, IsWindowVisible, KBDLLHOOKSTRUCT, MONITORINFOF_PRIMARY, MSG, OBJID_WINDOW,
-        PostThreadMessageW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOOWNERZORDER,
-        SWP_NOZORDER, SetForegroundWindow, SetWindowPos, SetWindowsHookExW, ShowWindow,
-        TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WINEVENT_OUTOFCONTEXT, WM_HOTKEY,
-        WM_KEYDOWN, WM_QUIT, WM_SYSKEYDOWN, WS_CAPTION, WS_EX_TOOLWINDOW, WS_THICKFRAME,
+        CallNextHookEx, DispatchMessageW, EVENT_OBJECT_CLOAKED, EVENT_OBJECT_CREATE,
+        EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE,
+        EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_SHOW, EVENT_OBJECT_STATECHANGE,
+        EVENT_OBJECT_UNCLOAKED, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND,
+        EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZESTART,
+        EnumWindows, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetClassNameW, GetCursorPos,
+        GetForegroundWindow, GetMessageW, GetWindow, GetWindowLongPtrW, GetWindowRect,
+        GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HC_ACTION, HHOOK, IsIconic,
+        IsWindowVisible, KBDLLHOOKSTRUCT, MINMAXINFO, MONITORINFOF_PRIMARY, MSG, OBJID_WINDOW,
+        PostThreadMessageW, SMTO_ABORTIFHUNG, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
+        SWP_NOOWNERZORDER, SWP_NOZORDER, SendMessageTimeoutW, SetForegroundWindow, SetWindowPos,
+        SetWindowsHookExW, ShowWindow, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL,
+        WINEVENT_OUTOFCONTEXT, WM_GETMINMAXINFO, WM_HOTKEY, WM_KEYDOWN, WM_QUIT, WM_SYSKEYDOWN,
+        WS_CAPTION, WS_EX_TOOLWINDOW, WS_THICKFRAME,
     };
     use windows::core::{PCWSTR, PWSTR};
     use winland_core::{
-        MonitorId, MonitorInfo as CoreMonitorInfo, Point, Rect, WindowHandle, WindowInfo,
-        WindowStyles,
+        MonitorId, MonitorInfo as CoreMonitorInfo, Point, Rect, Size, WindowHandle, WindowInfo,
+        WindowSizeConstraints, WindowStyles,
     };
 
     use crate::{
@@ -67,6 +70,8 @@ mod platform {
     static EVENT_SENDER: OnceLock<Mutex<Option<Sender<WindowEvent>>>> = OnceLock::new();
     static HOTKEY_SENDER: OnceLock<Mutex<Option<HotkeySenderState>>> = OnceLock::new();
     static HOTKEY_OVERRIDE: OnceLock<Mutex<Option<HotkeyOverrideState>>> = OnceLock::new();
+    const MINMAXINFO_TIMEOUT_MS: u32 = 50;
+    const GEOMETRY_CORRECTION_PASSES: usize = 3;
 
     pub fn enumerate_windows() -> Result<Vec<WindowInfo>> {
         let mut windows = Vec::new();
@@ -112,7 +117,46 @@ mod platform {
 
     pub fn move_resize_window(handle: WindowHandle, rect: Rect) -> Result<()> {
         let hwnd = hwnd_from_handle(handle);
+        let target = outer_rect_for_desired_visible_rect(hwnd, rect).unwrap_or(rect);
+        let mut target = target;
 
+        for pass in 0..GEOMETRY_CORRECTION_PASSES {
+            set_window_outer_rect(hwnd, target)?;
+
+            let Some(actual) = visible_window_rect(hwnd) else {
+                return Ok(());
+            };
+
+            if actual == rect {
+                return Ok(());
+            }
+
+            if (actual.width() != rect.width() || actual.height() != rect.height())
+                && pass + 1 == GEOMETRY_CORRECTION_PASSES
+            {
+                return Ok(());
+            }
+
+            target = Rect {
+                left: target
+                    .left
+                    .saturating_add(rect.left.saturating_sub(actual.left)),
+                top: target
+                    .top
+                    .saturating_add(rect.top.saturating_sub(actual.top)),
+                right: target
+                    .right
+                    .saturating_add(rect.right.saturating_sub(actual.right)),
+                bottom: target
+                    .bottom
+                    .saturating_add(rect.bottom.saturating_sub(actual.bottom)),
+            };
+        }
+
+        Ok(())
+    }
+
+    fn set_window_outer_rect(hwnd: HWND, rect: Rect) -> Result<()> {
         // SAFETY: hwnd comes from earlier documented window enumeration, and the
         // rectangle is ordinary screen coordinates. SWP flags avoid activation and
         // z-order changes so this is a geometry-only request.
@@ -129,10 +173,12 @@ mod platform {
             .map_err(|source| Win32Error::Windows {
                 context: "SetWindowPos",
                 source,
-            })?;
+            })
         }
+    }
 
-        Ok(())
+    pub fn window_rect_for_handle(handle: WindowHandle) -> Result<Rect> {
+        layout_window_rect(hwnd_from_handle(handle))
     }
 
     pub fn foreground_window() -> Result<Option<WindowHandle>> {
@@ -956,6 +1002,9 @@ mod platform {
             (EVENT_SYSTEM_MOVESIZESTART, EVENT_SYSTEM_MOVESIZEEND),
             (EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND),
             (EVENT_OBJECT_CREATE, EVENT_OBJECT_LOCATIONCHANGE),
+            (EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_NAMECHANGE),
+            (EVENT_OBJECT_STATECHANGE, EVENT_OBJECT_STATECHANGE),
+            (EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED),
         ] {
             match install_window_event_hook(event_min, event_max) {
                 Ok(hook) => hooks.push(hook),
@@ -1013,6 +1062,10 @@ mod platform {
             EVENT_OBJECT_SHOW => WindowEventKind::Shown,
             EVENT_OBJECT_HIDE => WindowEventKind::Hidden,
             EVENT_OBJECT_LOCATIONCHANGE => WindowEventKind::Moved,
+            EVENT_OBJECT_NAMECHANGE
+            | EVENT_OBJECT_STATECHANGE
+            | EVENT_OBJECT_CLOAKED
+            | EVENT_OBJECT_UNCLOAKED => WindowEventKind::MetadataChanged,
             EVENT_SYSTEM_MOVESIZESTART => WindowEventKind::MoveSizeStart,
             EVENT_SYSTEM_MOVESIZEEND => WindowEventKind::MoveSizeEnd,
             EVENT_SYSTEM_MINIMIZESTART => WindowEventKind::Minimized,
@@ -1046,6 +1099,8 @@ mod platform {
         // SAFETY: hwnd is provided by EnumWindows and remains valid for this
         // metadata query. The owner handle is only inspected for nullness.
         let has_owner = unsafe { GetWindow(hwnd, GW_OWNER).is_ok_and(|owner| !owner.0.is_null()) };
+        let styles = window_styles(hwnd);
+        let rect = layout_window_rect(hwnd)?;
 
         Ok(WindowInfo {
             handle: WindowHandle(hwnd.0 as usize as u64),
@@ -1058,8 +1113,9 @@ mod platform {
             is_dwm_cloaked: dwm_cloaked(hwnd),
             has_owner,
             is_tool_window: is_tool_window(hwnd),
-            styles: window_styles(hwnd),
-            rect: window_rect(hwnd)?,
+            styles,
+            size_constraints: window_size_constraints(hwnd),
+            rect,
         })
     }
 
@@ -1164,6 +1220,54 @@ mod platform {
         }
     }
 
+    fn window_size_constraints(hwnd: HWND) -> WindowSizeConstraints {
+        let Some(minmax) = window_minmax_info(hwnd) else {
+            return WindowSizeConstraints::NONE;
+        };
+
+        let min = Size::new(minmax.ptMinTrackSize.x, minmax.ptMinTrackSize.y);
+        if !plausible_min_track_size(min) {
+            return WindowSizeConstraints::NONE;
+        }
+
+        WindowSizeConstraints::minimum(min.width, min.height)
+    }
+
+    pub(super) fn plausible_min_track_size(size: Size) -> bool {
+        (size.width > 0 || size.height > 0) && size.width < 10_000 && size.height < 10_000
+    }
+
+    fn window_minmax_info(hwnd: HWND) -> Option<MINMAXINFO> {
+        let mut info = MINMAXINFO::default();
+        let mut result = 0usize;
+
+        // SAFETY: info points to writable MINMAXINFO storage for the duration of
+        // this synchronous message. SendMessageTimeoutW avoids blocking the
+        // daemon indefinitely if the target window is hung.
+        let timeout_result = unsafe {
+            SendMessageTimeoutW(
+                hwnd,
+                WM_GETMINMAXINFO,
+                WPARAM(0),
+                LPARAM(&mut info as *mut MINMAXINFO as isize),
+                SMTO_ABORTIFHUNG,
+                MINMAXINFO_TIMEOUT_MS,
+                Some(&mut result),
+            )
+        };
+
+        if timeout_result.0 == 0 {
+            debug!(?hwnd, "WM_GETMINMAXINFO timed out or failed");
+            None
+        } else {
+            Some(info)
+        }
+    }
+
+    fn layout_window_rect(hwnd: HWND) -> Result<Rect> {
+        visible_window_rect(hwnd).map_or_else(|| window_rect(hwnd), Ok)
+    }
+
     fn window_rect(hwnd: HWND) -> Result<Rect> {
         let mut rect = RECT::default();
         // SAFETY: rect points to valid writable storage for the duration of the
@@ -1189,6 +1293,22 @@ mod platform {
         };
 
         result.ok().map(|()| rect_from_win32(rect))
+    }
+
+    fn outer_rect_for_desired_visible_rect(hwnd: HWND, desired_visible: Rect) -> Option<Rect> {
+        let outer = window_rect(hwnd).ok()?;
+        let visible = visible_window_rect(hwnd)?;
+        let left_margin = visible.left.saturating_sub(outer.left);
+        let top_margin = visible.top.saturating_sub(outer.top);
+        let right_margin = outer.right.saturating_sub(visible.right);
+        let bottom_margin = outer.bottom.saturating_sub(visible.bottom);
+
+        Some(Rect {
+            left: desired_visible.left.saturating_sub(left_margin),
+            top: desired_visible.top.saturating_sub(top_margin),
+            right: desired_visible.right.saturating_add(right_margin),
+            bottom: desired_visible.bottom.saturating_add(bottom_margin),
+        })
     }
 
     fn rect_from_win32(rect: RECT) -> Rect {
@@ -1276,6 +1396,10 @@ mod platform {
     }
 
     pub fn move_resize_window(_handle: WindowHandle, _rect: Rect) -> Result<()> {
+        Err(Win32Error::UnsupportedPlatform)
+    }
+
+    pub fn window_rect_for_handle(_handle: WindowHandle) -> Result<Rect> {
         Err(Win32Error::UnsupportedPlatform)
     }
 
@@ -1370,6 +1494,7 @@ pub use platform::send_ipc_request;
 pub use platform::show_window_without_activate;
 pub use platform::spawn_ipc_server;
 pub use platform::subscribe_window_events;
+pub use platform::window_rect_for_handle;
 pub use shell::ShellReplacementChange;
 pub use shell::ShellReplacementStatus;
 pub use shell::USER_WINLOGON_KEY;
@@ -1705,6 +1830,7 @@ pub enum WindowEventKind {
     Minimized,
     Restored,
     ForegroundChanged,
+    MetadataChanged,
 }
 
 pub type Result<T> = std::result::Result<T, Win32Error>;
@@ -1893,6 +2019,20 @@ mod tests {
 
         assert!(rect_covers_any_monitor(monitors[0].rect, &monitors));
         assert!(!rect_covers_any_monitor(monitors[0].work_area, &monitors));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn minmax_constraints_only_trust_plausible_minimums() {
+        assert!(platform::plausible_min_track_size(winland_core::Size::new(
+            320, 240
+        )));
+        assert!(!platform::plausible_min_track_size(
+            winland_core::Size::new(0, 0)
+        ));
+        assert!(!platform::plausible_min_track_size(
+            winland_core::Size::new(30_000, 240)
+        ));
     }
 
     #[test]

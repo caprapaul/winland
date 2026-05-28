@@ -12,7 +12,8 @@ mod platform {
     use tracing::{debug, warn};
     use windows::Win32::Foundation::{
         BOOL, CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
-        GENERIC_READ, GENERIC_WRITE, HANDLE, HMODULE, HWND, LPARAM, LRESULT, RECT, TRUE, WPARAM,
+        GENERIC_READ, GENERIC_WRITE, HANDLE, HMODULE, HWND, LPARAM, LRESULT, POINT, RECT, TRUE,
+        WPARAM,
     };
     use windows::Win32::Graphics::Dwm::{
         DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute,
@@ -42,9 +43,9 @@ mod platform {
         EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW, EVENT_SYSTEM_FOREGROUND,
         EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND,
         EVENT_SYSTEM_MOVESIZESTART, EnumWindows, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetClassNameW,
-        GetForegroundWindow, GetMessageW, GetWindow, GetWindowLongPtrW, GetWindowRect,
-        GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HC_ACTION, HHOOK, IsIconic,
-        IsWindowVisible, KBDLLHOOKSTRUCT, MONITORINFOF_PRIMARY, MSG, OBJID_WINDOW,
+        GetCursorPos, GetForegroundWindow, GetMessageW, GetWindow, GetWindowLongPtrW,
+        GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HC_ACTION,
+        HHOOK, IsIconic, IsWindowVisible, KBDLLHOOKSTRUCT, MONITORINFOF_PRIMARY, MSG, OBJID_WINDOW,
         PostThreadMessageW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOOWNERZORDER,
         SWP_NOZORDER, SetForegroundWindow, SetWindowPos, SetWindowsHookExW, ShowWindow,
         TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WINEVENT_OUTOFCONTEXT, WM_HOTKEY,
@@ -52,7 +53,8 @@ mod platform {
     };
     use windows::core::{PCWSTR, PWSTR};
     use winland_core::{
-        MonitorId, MonitorInfo as CoreMonitorInfo, Rect, WindowHandle, WindowInfo, WindowStyles,
+        MonitorId, MonitorInfo as CoreMonitorInfo, Point, Rect, WindowHandle, WindowInfo,
+        WindowStyles,
     };
 
     use crate::{
@@ -142,6 +144,24 @@ mod platform {
         } else {
             Ok(Some(handle_from_hwnd(hwnd)))
         }
+    }
+
+    pub fn cursor_position() -> Result<Point> {
+        let mut point = POINT::default();
+
+        // SAFETY: GetCursorPos writes to the initialized POINT provided by this
+        // stack frame and does not retain the pointer after returning.
+        unsafe {
+            GetCursorPos(&mut point).map_err(|source| Win32Error::Windows {
+                context: "GetCursorPos",
+                source,
+            })?;
+        }
+
+        Ok(Point {
+            x: point.x,
+            y: point.y,
+        })
     }
 
     pub fn focus_window(handle: WindowHandle) -> Result<()> {
@@ -1243,7 +1263,7 @@ mod platform {
     use std::sync::mpsc::Sender;
 
     use crate::{HotkeyBinding, HotkeyEvent, IpcTransportRequest, Result, Win32Error};
-    use winland_core::{MonitorInfo, Rect, WindowHandle, WindowInfo};
+    use winland_core::{MonitorInfo, Point, Rect, WindowHandle, WindowInfo};
 
     use crate::WindowEvent;
 
@@ -1260,6 +1280,10 @@ mod platform {
     }
 
     pub fn foreground_window() -> Result<Option<WindowHandle>> {
+        Err(Win32Error::UnsupportedPlatform)
+    }
+
+    pub fn cursor_position() -> Result<Point> {
         Err(Win32Error::UnsupportedPlatform)
     }
 
@@ -1331,6 +1355,7 @@ pub use platform::HotkeyOverrideRegistration;
 pub use platform::HotkeyRegistration;
 pub use platform::IpcServer;
 pub use platform::WindowEventSubscription;
+pub use platform::cursor_position;
 pub use platform::enumerate_monitors;
 pub use platform::enumerate_windows;
 pub use platform::focus_window;

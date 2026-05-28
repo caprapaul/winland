@@ -100,23 +100,30 @@ bindings = [
 # ]
 
 [layout]
-# Phase 7 supports the existing master-stack layout.
-default = "master-stack"
+# Supported layouts: master-stack, dwindle, vertical-stack, horizontal-stack.
+default = "dwindle"
 
 # Geometry options are applied to tiling calculations.
 gap = 0
 border = 0
 master_ratio_percent = 50
 
+# Dwindle-only options. Smart split uses the cursor position inside the
+# split target and also preserves existing split directions.
+smart_split = false
+preserve_split = false
+
 [layout.per_monitor]
-# Example monitor-specific override. Monitor keys are stable user labels for
-# config and validation today; monitor-name resolution can become richer later.
-# primary = { layout = "master-stack", gap = 8, border = 1, master_ratio_percent = 60 }
+# Use `winland monitors` to list monitor IDs. The special key `primary` is
+# also supported.
+# primary = { layout = "dwindle", gap = 8, border = 1, smart_split = true }
+# "0x10001" = { layout = "vertical-stack", gap = 6 }
+primary = { layout = "dwindle", gap = 8, border = 1, smart_split = true }
 
 [layout.per_workspace]
 # Example workspace-specific overrides.
 # "1" = { layout = "master-stack", gap = 6, master_ratio_percent = 55 }
-# "2" = { layout = "master-stack", gap = 12, border = 1 }
+# "2" = { layout = "horizontal-stack", gap = 12, border = 1 }
 
 [workspaces]
 count = 9

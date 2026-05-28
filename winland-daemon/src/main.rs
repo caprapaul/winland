@@ -10,9 +10,10 @@ use winland_config::{
     Config, HotkeyBindingConfig, HotkeyKey, HotkeyMode, HotkeyModifier, TextMatcherConfig,
 };
 use winland_core::{
-    LayoutConfig, MonitorInfo, Rect, TileAssignment, WindowHandle, WindowInfo, WindowParticipation,
-    WindowRule, WindowRuleDecision, WorkspaceId, WorkspaceManager, WorkspaceVisibilityChange,
-    evaluate_window_rules, tile_windows_with_config,
+    DwindleSplit, LayoutConfig, LayoutKind, MonitorId, MonitorInfo, Rect, TileAssignment,
+    WindowHandle, WindowInfo, WindowParticipation, WindowRule, WindowRuleDecision, WorkspaceId,
+    WorkspaceManager, WorkspaceVisibilityChange, evaluate_window_rules, split_direction_for_point,
+    tile_windows_with_config, tile_windows_with_state,
 };
 use winland_ipc::{
     DaemonStateSnapshot, IpcCommand, IpcRequest, IpcResponse, decode_request, encode_response,
@@ -103,6 +104,8 @@ fn log_loaded_config(loaded: &winland_config::LoadedConfig) {
 #[derive(Debug, Clone)]
 struct RuntimeConfig {
     layout: LayoutConfig,
+    layout_per_monitor: BTreeMap<String, LayoutConfig>,
+    layout_per_workspace: BTreeMap<WorkspaceId, LayoutConfig>,
     workspace_count: u16,
     window_rules: Vec<WindowRule>,
     startup_retile: bool,
@@ -115,6 +118,8 @@ impl RuntimeConfig {
     fn from_config(config: &Config) -> Result<Self> {
         Ok(Self {
             layout: config.layout_config(),
+            layout_per_monitor: layout_per_monitor_from_config(config),
+            layout_per_workspace: layout_per_workspace_from_config(config),
             workspace_count: config.workspace_count(),
             window_rules: config.window_rules().context("convert window rules")?,
             startup_retile: config.behavior.startup_retile,
@@ -123,12 +128,101 @@ impl RuntimeConfig {
             retile_on_drag_end: config.behavior.retile_on_drag_end,
         })
     }
+
+    fn layout_for_monitor(&self, monitor: &MonitorInfo, workspace: WorkspaceId) -> LayoutConfig {
+        layout_config_for_monitor(
+            self.layout,
+            &self.layout_per_monitor,
+            &self.layout_per_workspace,
+            monitor,
+            workspace,
+        )
+    }
 }
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self::from_config(&Config::default()).expect("built-in config defaults are valid")
     }
+}
+
+fn layout_per_monitor_from_config(config: &Config) -> BTreeMap<String, LayoutConfig> {
+    config
+        .layout
+        .per_monitor
+        .iter()
+        .map(|(monitor, override_config)| {
+            (
+                monitor.clone(),
+                merge_layout_override(config.layout_config(), override_config),
+            )
+        })
+        .collect()
+}
+
+fn layout_per_workspace_from_config(config: &Config) -> BTreeMap<WorkspaceId, LayoutConfig> {
+    config
+        .layout
+        .per_workspace
+        .iter()
+        .filter_map(|(workspace, override_config)| {
+            let workspace = workspace.parse::<u16>().ok().map(WorkspaceId)?;
+            Some((
+                workspace,
+                merge_layout_override(config.layout_config(), override_config),
+            ))
+        })
+        .collect()
+}
+
+fn merge_layout_override(
+    base: LayoutConfig,
+    override_config: &winland_config::LayoutOverride,
+) -> LayoutConfig {
+    LayoutConfig {
+        kind: override_config
+            .layout
+            .as_deref()
+            .and_then(LayoutKind::from_name)
+            .unwrap_or(base.kind),
+        gap: override_config.gap.map(i32::from).unwrap_or(base.gap),
+        border: override_config.border.map(i32::from).unwrap_or(base.border),
+        master_ratio_percent: override_config
+            .master_ratio_percent
+            .unwrap_or(base.master_ratio_percent),
+        smart_split: override_config.smart_split.unwrap_or(base.smart_split),
+        preserve_split: override_config
+            .preserve_split
+            .unwrap_or(base.preserve_split),
+    }
+    .normalized()
+}
+
+fn layout_config_for_monitor(
+    default_layout: LayoutConfig,
+    per_monitor: &BTreeMap<String, LayoutConfig>,
+    per_workspace: &BTreeMap<WorkspaceId, LayoutConfig>,
+    monitor: &MonitorInfo,
+    workspace: WorkspaceId,
+) -> LayoutConfig {
+    let mut layout = per_workspace
+        .get(&workspace)
+        .copied()
+        .unwrap_or(default_layout);
+
+    if let Some(primary_layout) = monitor
+        .is_primary
+        .then(|| per_monitor.get("primary").copied())
+        .flatten()
+    {
+        layout = primary_layout;
+    }
+
+    per_monitor
+        .get(&monitor.id.to_string())
+        .copied()
+        .unwrap_or(layout)
+        .normalized()
 }
 
 fn spawn_window_bridge(
@@ -233,6 +327,7 @@ struct DaemonState {
     foreground: Option<WindowHandle>,
     tile_order: Vec<WindowHandle>,
     participation: BTreeMap<WindowHandle, WindowParticipation>,
+    dwindle_splits: BTreeMap<(WorkspaceId, MonitorId), Vec<DwindleSplit>>,
     previous_rects: BTreeMap<WindowHandle, Rect>,
     workspaces: WorkspaceManager,
     config: RuntimeConfig,
@@ -255,6 +350,7 @@ impl DaemonState {
             foreground,
             tile_order: Vec::new(),
             participation: BTreeMap::new(),
+            dwindle_splits: BTreeMap::new(),
             previous_rects: BTreeMap::new(),
             workspaces: WorkspaceManager::new(config.workspace_count),
             config,
@@ -406,6 +502,7 @@ impl DaemonState {
             let monitors = winland_win32::enumerate_monitors()
                 .context("enumerate monitors while reloading daemon state")?;
             self.preserve_keyboard_state(&mut refreshed, &monitors);
+            refreshed.dwindle_splits.clear();
             *self = refreshed;
             self.log_snapshot("reloaded daemon state");
             return Ok(());
@@ -732,6 +829,7 @@ impl DaemonState {
         let Some(monitor) = monitors.iter().find(|monitor| monitor.id == target_monitor) else {
             return false;
         };
+        let dropped_rect = window_info.rect;
 
         let target_handles: Vec<_> = self
             .tile_order
@@ -748,10 +846,75 @@ impl DaemonState {
                 })
             })
             .collect();
-        let local_index =
-            self.drop_insert_index(window, window_info.rect, &target_handles, monitor);
+        let layout = self
+            .config
+            .layout_for_monitor(monitor, self.workspaces.active_workspace());
+
+        if layout.kind == LayoutKind::Dwindle
+            && self.retarget_dwindle_drop(
+                window,
+                dropped_rect,
+                winland_win32::cursor_position().ok(),
+                &target_handles,
+                monitor,
+                layout,
+            )
+        {
+            return true;
+        }
+
+        let local_index = self.drop_insert_index(window, dropped_rect, &target_handles, monitor);
 
         self.reinsert_window_at_local_index(window, &target_handles, local_index)
+    }
+
+    fn retarget_dwindle_drop(
+        &mut self,
+        window: WindowHandle,
+        dropped_rect: Rect,
+        cursor_position: Option<winland_core::Point>,
+        target_handles: &[WindowHandle],
+        monitor: &MonitorInfo,
+        layout: LayoutConfig,
+    ) -> bool {
+        let drop_point = cursor_position.unwrap_or_else(|| dropped_rect.center());
+        let workspace = self.workspaces.active_workspace();
+        let split_key = (workspace, monitor.id);
+        let mut preview_splits = self
+            .dwindle_splits
+            .get(&split_key)
+            .cloned()
+            .unwrap_or_default();
+        let assignments = tile_windows_with_state(
+            monitor.work_area,
+            target_handles,
+            layout,
+            None,
+            Some(&mut preview_splits),
+        );
+        let Some(target_assignment) = assignments
+            .iter()
+            .find(|assignment| assignment.rect.contains(drop_point))
+            .or_else(|| nearest_assignment(drop_point, &assignments))
+        else {
+            return false;
+        };
+
+        let direction = split_direction_for_point(target_assignment.rect, drop_point);
+        let splits_changed = {
+            let splits = self.dwindle_splits.entry(split_key).or_default();
+            let old_splits = splits.clone();
+            *splits = preview_splits;
+            splits.push(DwindleSplit {
+                target: target_assignment.window,
+                new_window: window,
+                direction,
+            });
+            *splits != old_splits
+        };
+
+        let order_changed = self.reinsert_window_after_target(window, target_assignment.window);
+        order_changed || splits_changed
     }
 
     fn drop_insert_index(
@@ -767,10 +930,12 @@ impl DaemonState {
             .filter_map(|index| {
                 let mut handles = target_handles.to_vec();
                 handles.insert(index, window);
-                let assignment =
-                    tile_windows_with_config(monitor.work_area, &handles, self.config.layout)
-                        .into_iter()
-                        .find(|assignment| assignment.window == window)?;
+                let layout = self
+                    .config
+                    .layout_for_monitor(monitor, self.workspaces.active_workspace());
+                let assignment = tile_windows_with_config(monitor.work_area, &handles, layout)
+                    .into_iter()
+                    .find(|assignment| assignment.window == window)?;
                 let center = assignment.rect.center();
                 let dx = i64::from(center.x - dropped_center.x);
                 let dy = i64::from(center.y - dropped_center.y);
@@ -805,6 +970,19 @@ impl DaemonState {
             self.tile_order.len()
         };
 
+        self.tile_order.insert(insert_at, window);
+        self.tile_order != old_order
+    }
+
+    fn reinsert_window_after_target(&mut self, window: WindowHandle, target: WindowHandle) -> bool {
+        let old_order = self.tile_order.clone();
+        self.tile_order.retain(|handle| *handle != window);
+        let insert_at = self
+            .tile_order
+            .iter()
+            .position(|handle| *handle == target)
+            .map(|index| index + 1)
+            .unwrap_or(self.tile_order.len());
         self.tile_order.insert(insert_at, window);
         self.tile_order != old_order
     }
@@ -865,26 +1043,49 @@ impl DaemonState {
         Vec::new()
     }
 
-    fn tile_assignments(&self, monitors: &[MonitorInfo]) -> Vec<TileAssignment> {
-        monitors
-            .iter()
-            .flat_map(|monitor| {
-                let handles: Vec<_> = self
-                    .tile_order
-                    .iter()
-                    .copied()
-                    .filter(|handle| self.window_participation(*handle).is_tiled())
-                    .filter(|handle| {
-                        self.windows.get(handle).is_some_and(|window| {
-                            self.is_tilable_window(*handle)
-                                && monitor
-                                    .rect
-                                    .contains(self.window_layout_rect(*handle, window).center())
-                        })
-                    })
-                    .collect();
+    fn tile_assignments(&mut self, monitors: &[MonitorInfo]) -> Vec<TileAssignment> {
+        let cursor_position = winland_win32::cursor_position().ok();
+        let active_workspace = self.workspaces.active_workspace();
+        let mut assignments = Vec::new();
 
-                tile_windows_with_config(monitor.work_area, &handles, self.config.layout)
+        for monitor in monitors {
+            let handles = self.tiled_handles_for_monitor(monitor);
+            let layout = self.config.layout_for_monitor(monitor, active_workspace);
+            let monitor_assignments = if layout.kind == LayoutKind::Dwindle {
+                let splits = self
+                    .dwindle_splits
+                    .entry((active_workspace, monitor.id))
+                    .or_default();
+                tile_windows_with_state(
+                    monitor.work_area,
+                    &handles,
+                    layout,
+                    cursor_position,
+                    Some(splits),
+                )
+            } else {
+                self.dwindle_splits.remove(&(active_workspace, monitor.id));
+                tile_windows_with_config(monitor.work_area, &handles, layout)
+            };
+
+            assignments.extend(monitor_assignments);
+        }
+
+        assignments
+    }
+
+    fn tiled_handles_for_monitor(&self, monitor: &MonitorInfo) -> Vec<WindowHandle> {
+        self.tile_order
+            .iter()
+            .copied()
+            .filter(|handle| self.window_participation(*handle).is_tiled())
+            .filter(|handle| {
+                self.windows.get(handle).is_some_and(|window| {
+                    self.is_tilable_window(*handle)
+                        && monitor
+                            .rect
+                            .contains(self.window_layout_rect(*handle, window).center())
+                })
             })
             .collect()
     }
@@ -973,6 +1174,7 @@ impl DaemonState {
             .filter(|(handle, _)| known_workspace_windows.contains(handle))
             .map(|(handle, participation)| (*handle, *participation))
             .collect();
+        refreshed.dwindle_splits = self.dwindle_splits.clone();
         refreshed.previous_rects = self
             .previous_rects
             .iter()
@@ -1513,6 +1715,18 @@ fn monitor_for_rect(rect: Rect, monitors: &[MonitorInfo]) -> Option<winland_core
         .map(|monitor| monitor.id)
 }
 
+fn nearest_assignment(
+    point: winland_core::Point,
+    assignments: &[TileAssignment],
+) -> Option<&TileAssignment> {
+    assignments.iter().min_by_key(|assignment| {
+        let center = assignment.rect.center();
+        let dx = i64::from(center.x - point.x);
+        let dy = i64::from(center.y - point.y);
+        dx * dx + dy * dy
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1663,6 +1877,179 @@ mod tests {
                 TileAssignment {
                     window: WindowHandle(3),
                     rect: Rect::from_size(1000, 0, 800, 560),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn retile_uses_monitor_specific_layout_override() {
+        let monitors = [primary_test_monitor(), secondary_test_monitor()];
+        let mut state = daemon_state([
+            window(1, "Primary One", Rect::from_size(0, 0, 100, 100)),
+            window(2, "Primary Two", Rect::from_size(200, 0, 100, 100)),
+            window(3, "Secondary One", Rect::from_size(1100, 0, 100, 100)),
+            window(4, "Secondary Two", Rect::from_size(1300, 0, 100, 100)),
+        ]);
+        state.config.layout_per_monitor.insert(
+            MonitorId(2).to_string(),
+            LayoutConfig {
+                kind: LayoutKind::VerticalStack,
+                ..LayoutConfig::default()
+            },
+        );
+        state.sync_workspace_state(&monitors);
+
+        let plan = state.plan_command(DaemonCommand::Retile, &monitors);
+
+        assert_eq!(
+            plan.moves,
+            vec![
+                TileAssignment {
+                    window: WindowHandle(1),
+                    rect: Rect::from_size(0, 0, 500, 760),
+                },
+                TileAssignment {
+                    window: WindowHandle(2),
+                    rect: Rect::from_size(500, 0, 500, 760),
+                },
+                TileAssignment {
+                    window: WindowHandle(3),
+                    rect: Rect::from_size(1000, 0, 800, 280),
+                },
+                TileAssignment {
+                    window: WindowHandle(4),
+                    rect: Rect::from_size(1000, 280, 800, 280),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn dwindle_drop_splits_assignment_under_drop_point() {
+        let monitor = primary_test_monitor();
+        let mut state = daemon_state([
+            window(1, "Top Left", Rect::from_size(0, 0, 100, 100)),
+            window(2, "Bottom", Rect::from_size(0, 600, 1000, 160)),
+            window(3, "Top Right", Rect::from_size(500, 0, 100, 100)),
+        ]);
+        state.config.layout = LayoutConfig {
+            kind: LayoutKind::Dwindle,
+            smart_split: true,
+            ..LayoutConfig::default()
+        };
+        state.dwindle_splits.insert(
+            (WorkspaceId(1), monitor.id),
+            vec![
+                DwindleSplit {
+                    target: WindowHandle(1),
+                    new_window: WindowHandle(2),
+                    direction: winland_core::SplitDirection::Down,
+                },
+                DwindleSplit {
+                    target: WindowHandle(1),
+                    new_window: WindowHandle(3),
+                    direction: winland_core::SplitDirection::Right,
+                },
+            ],
+        );
+
+        assert!(state.retarget_dwindle_drop(
+            WindowHandle(2),
+            Rect::from_size(700, 700, 100, 100),
+            Some(winland_core::Point { x: 200, y: 0 }),
+            &[WindowHandle(1), WindowHandle(3)],
+            &monitor,
+            state.config.layout,
+        ));
+
+        assert_eq!(
+            state.dwindle_splits.get(&(WorkspaceId(1), monitor.id)),
+            Some(&vec![
+                DwindleSplit {
+                    target: WindowHandle(1),
+                    new_window: WindowHandle(3),
+                    direction: winland_core::SplitDirection::Right,
+                },
+                DwindleSplit {
+                    target: WindowHandle(1),
+                    new_window: WindowHandle(2),
+                    direction: winland_core::SplitDirection::Up,
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn dwindle_drop_commits_pruned_preview_before_new_split() {
+        let monitor = primary_test_monitor();
+        let mut state = daemon_state([
+            window(1, "B", Rect::from_size(0, 0, 500, 760)),
+            window(2, "A", Rect::from_size(500, 0, 500, 760)),
+            window(3, "C", Rect::from_size(500, 0, 500, 380)),
+        ]);
+        state.config.layout = LayoutConfig {
+            kind: LayoutKind::Dwindle,
+            smart_split: true,
+            ..LayoutConfig::default()
+        };
+        state.dwindle_splits.insert(
+            (WorkspaceId(1), monitor.id),
+            vec![
+                DwindleSplit {
+                    target: WindowHandle(1),
+                    new_window: WindowHandle(3),
+                    direction: winland_core::SplitDirection::Right,
+                },
+                DwindleSplit {
+                    target: WindowHandle(3),
+                    new_window: WindowHandle(2),
+                    direction: winland_core::SplitDirection::Down,
+                },
+            ],
+        );
+
+        assert!(state.retarget_dwindle_drop(
+            WindowHandle(3),
+            Rect::from_size(500, 0, 500, 380),
+            Some(winland_core::Point { x: 750, y: 10 }),
+            &[WindowHandle(1), WindowHandle(2)],
+            &monitor,
+            state.config.layout,
+        ));
+
+        assert_eq!(
+            state.dwindle_splits.get(&(WorkspaceId(1), monitor.id)),
+            Some(&vec![
+                DwindleSplit {
+                    target: WindowHandle(1),
+                    new_window: WindowHandle(2),
+                    direction: winland_core::SplitDirection::Right,
+                },
+                DwindleSplit {
+                    target: WindowHandle(2),
+                    new_window: WindowHandle(3),
+                    direction: winland_core::SplitDirection::Up,
+                },
+            ])
+        );
+
+        let plan = state.plan_command(DaemonCommand::Retile, &[monitor]);
+
+        assert_eq!(
+            plan.moves,
+            vec![
+                TileAssignment {
+                    window: WindowHandle(1),
+                    rect: Rect::from_size(0, 0, 500, 760),
+                },
+                TileAssignment {
+                    window: WindowHandle(2),
+                    rect: Rect::from_size(500, 380, 500, 380),
+                },
+                TileAssignment {
+                    window: WindowHandle(3),
+                    rect: Rect::from_size(500, 0, 500, 380),
                 },
             ]
         );
@@ -1972,6 +2359,7 @@ mod tests {
             foreground: None,
             tile_order: Vec::new(),
             participation: BTreeMap::new(),
+            dwindle_splits: BTreeMap::new(),
             previous_rects: BTreeMap::new(),
             workspaces: WorkspaceManager::new(9),
             config: RuntimeConfig::default(),

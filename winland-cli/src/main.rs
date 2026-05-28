@@ -4,7 +4,7 @@ use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use tracing::debug;
 use tracing_subscriber::EnvFilter;
-use winland_core::{Manageability, MonitorInfo, WindowInfo, tile_windows};
+use winland_core::{Manageability, MonitorInfo, WindowInfo, WorkspaceId, tile_windows_with_config};
 use winland_ipc::{
     DaemonStateSnapshot, IpcRequest, IpcResponseResult, decode_response, encode_request,
 };
@@ -23,6 +23,8 @@ enum Command {
     State(StateArgs),
     /// List discovered desktop windows and explain Winland's conservative filter.
     Windows(WindowsArgs),
+    /// List discovered monitors and their stable Winland IDs.
+    Monitors,
     /// Arrange manageable windows on the primary monitor once.
     TileOnce,
     /// Inspect or validate Winland configuration.
@@ -152,6 +154,7 @@ fn main() -> Result<()> {
     match cli.command {
         Command::State(args) => daemon_state(args),
         Command::Windows(args) => list_windows(args),
+        Command::Monitors => list_monitors(),
         Command::TileOnce => tile_once(),
         Command::Config(args) => handle_config(args),
         Command::Shell(args) => handle_shell(args),
@@ -180,6 +183,36 @@ fn list_windows(args: WindowsArgs) -> Result<()> {
     Ok(())
 }
 
+fn list_monitors() -> Result<()> {
+    let monitors = winland_win32::enumerate_monitors()?;
+    if monitors.is_empty() {
+        println!("No monitors found.");
+        return Ok(());
+    }
+
+    let rows: Vec<Vec<String>> = monitors
+        .iter()
+        .map(|monitor| {
+            vec![
+                monitor.id.to_string(),
+                yes_no(monitor.is_primary).to_owned(),
+                monitor.rect.to_string(),
+                monitor.work_area.to_string(),
+            ]
+        })
+        .collect();
+    let headers = ["ID", "Primary", "Rect", "Work Area"];
+    let widths = column_widths(&headers, &rows);
+
+    print_row(&headers, &widths);
+    print_separator(&widths);
+    for row in rows {
+        print_row(&row, &widths);
+    }
+
+    Ok(())
+}
+
 fn handle_config(args: ConfigArgs) -> Result<()> {
     match args.command {
         ConfigCommand::Validate(args) => validate_config(args),
@@ -192,6 +225,15 @@ fn validate_config(args: ConfigValidateArgs) -> Result<()> {
         Some(path) => println!("Config is valid: {}", path.display()),
         None => println!("Config is valid: no config file found, using built-in defaults."),
     }
+    let layout = loaded.config.layout_config();
+    println!(
+        "Layout: {} (gap {}, border {}, smart_split {}, preserve_split {})",
+        layout.kind.name(),
+        layout.gap,
+        layout.border,
+        yes_no(layout.smart_split),
+        yes_no(layout.preserve_split)
+    );
 
     Ok(())
 }
@@ -429,9 +471,15 @@ fn daemon_state(args: StateArgs) -> Result<()> {
 }
 
 fn tile_once() -> Result<()> {
+    let loaded_config = winland_config::load_or_default(None)?;
     let windows = winland_win32::enumerate_windows()?;
     let monitors = winland_win32::enumerate_monitors()?;
     let monitor = primary_monitor(&monitors)?;
+    let layout = loaded_config.config.layout_config_for_monitor(
+        monitor.id,
+        monitor.is_primary,
+        WorkspaceId(1),
+    );
 
     let selected: Vec<_> = windows
         .iter()
@@ -439,7 +487,7 @@ fn tile_once() -> Result<()> {
         .filter(|window| monitor.rect.contains(window.rect.center()))
         .collect();
     let handles: Vec<_> = selected.iter().map(|window| window.handle).collect();
-    let assignments = tile_windows(monitor.work_area, &handles);
+    let assignments = tile_windows_with_config(monitor.work_area, &handles, layout);
 
     if assignments.is_empty() {
         println!(
@@ -450,9 +498,10 @@ fn tile_once() -> Result<()> {
     }
 
     println!(
-        "Tiling {} window(s) on primary monitor {} (work area {}).",
+        "Tiling {} window(s) on primary monitor {} using {} (work area {}).",
         assignments.len(),
         monitor.id,
+        layout.kind.name(),
         monitor.work_area
     );
 

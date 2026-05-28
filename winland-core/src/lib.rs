@@ -140,11 +140,59 @@ impl LayoutDirection {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LayoutKind {
+    #[default]
+    MasterStack,
+    Dwindle,
+    VerticalStack,
+    HorizontalStack,
+}
+
+impl LayoutKind {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::MasterStack => "master-stack",
+            Self::Dwindle => "dwindle",
+            Self::VerticalStack => "vertical-stack",
+            Self::HorizontalStack => "horizontal-stack",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "master-stack" => Some(Self::MasterStack),
+            "dwindle" => Some(Self::Dwindle),
+            "vertical-stack" => Some(Self::VerticalStack),
+            "horizontal-stack" => Some(Self::HorizontalStack),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitDirection {
+    Left,
+    Down,
+    Up,
+    Right,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DwindleSplit {
+    pub target: WindowHandle,
+    pub new_window: WindowHandle,
+    pub direction: SplitDirection,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LayoutConfig {
+    pub kind: LayoutKind,
     pub gap: i32,
     pub border: i32,
     pub master_ratio_percent: u8,
+    pub smart_split: bool,
+    pub preserve_split: bool,
 }
 
 impl LayoutConfig {
@@ -153,12 +201,15 @@ impl LayoutConfig {
 
     pub fn normalized(self) -> Self {
         Self {
+            kind: self.kind,
             gap: self.gap.max(0),
             border: self.border.max(0),
             master_ratio_percent: self.master_ratio_percent.clamp(
                 Self::MIN_MASTER_RATIO_PERCENT,
                 Self::MAX_MASTER_RATIO_PERCENT,
             ),
+            smart_split: self.smart_split,
+            preserve_split: self.preserve_split || self.smart_split,
         }
     }
 }
@@ -166,9 +217,12 @@ impl LayoutConfig {
 impl Default for LayoutConfig {
     fn default() -> Self {
         Self {
+            kind: LayoutKind::MasterStack,
             gap: 0,
             border: 0,
             master_ratio_percent: 50,
+            smart_split: false,
+            preserve_split: false,
         }
     }
 }
@@ -180,6 +234,7 @@ pub struct MonitorLayoutState {
     windows: Vec<WindowHandle>,
     focused: Option<WindowHandle>,
     participation: BTreeMap<WindowHandle, WindowParticipation>,
+    dwindle_splits: Vec<DwindleSplit>,
 }
 
 impl MonitorLayoutState {
@@ -194,6 +249,7 @@ impl MonitorLayoutState {
             windows: Vec::new(),
             focused: None,
             participation: BTreeMap::new(),
+            dwindle_splits: Vec::new(),
         }
     }
 
@@ -349,10 +405,19 @@ impl MonitorLayoutState {
     pub fn reset_layout(&mut self) {
         self.config = LayoutConfig::default();
         self.participation.clear();
+        self.dwindle_splits.clear();
         self.focused = self.windows.first().copied();
     }
 
-    pub fn assignments(&self, work_area: Rect) -> Vec<TileAssignment> {
+    pub fn assignments(&mut self, work_area: Rect) -> Vec<TileAssignment> {
+        self.assignments_with_cursor(work_area, None)
+    }
+
+    pub fn assignments_with_cursor(
+        &mut self,
+        work_area: Rect,
+        cursor_position: Option<Point>,
+    ) -> Vec<TileAssignment> {
         let tiled_windows: Vec<_> = self
             .windows
             .iter()
@@ -360,7 +425,13 @@ impl MonitorLayoutState {
             .filter(|window| self.participation(*window).is_tiled())
             .collect();
 
-        master_stack_assignments(work_area, &tiled_windows, self.config)
+        tile_windows_with_state(
+            work_area,
+            &tiled_windows,
+            self.config,
+            cursor_position,
+            Some(&mut self.dwindle_splits),
+        )
     }
 
     fn neighbor(
@@ -452,12 +523,12 @@ impl LayoutEngine {
         true
     }
 
-    pub fn assignments(&self, monitors: &[MonitorInfo]) -> Vec<TileAssignment> {
+    pub fn assignments(&mut self, monitors: &[MonitorInfo]) -> Vec<TileAssignment> {
         monitors
             .iter()
             .flat_map(|monitor| {
                 self.monitors
-                    .get(&monitor.id)
+                    .get_mut(&monitor.id)
                     .map(|state| state.assignments(monitor.work_area))
                     .unwrap_or_default()
             })
@@ -677,7 +748,27 @@ pub fn tile_windows_with_config(
     windows: &[WindowHandle],
     config: LayoutConfig,
 ) -> Vec<TileAssignment> {
-    master_stack_assignments(work_area, windows, config)
+    tile_windows_with_state(work_area, windows, config, None, None)
+}
+
+pub fn tile_windows_with_state(
+    work_area: Rect,
+    windows: &[WindowHandle],
+    config: LayoutConfig,
+    cursor_position: Option<Point>,
+    dwindle_splits: Option<&mut Vec<DwindleSplit>>,
+) -> Vec<TileAssignment> {
+    let config = config.normalized();
+    match config.kind {
+        LayoutKind::MasterStack => master_stack_assignments(work_area, windows, config),
+        LayoutKind::Dwindle => {
+            dwindle_assignments(work_area, windows, config, cursor_position, dwindle_splits)
+        }
+        LayoutKind::VerticalStack => stack_assignments(work_area, windows, config, StackAxis::Rows),
+        LayoutKind::HorizontalStack => {
+            stack_assignments(work_area, windows, config, StackAxis::Columns)
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1041,6 +1132,397 @@ fn master_stack_assignments(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StackAxis {
+    Rows,
+    Columns,
+}
+
+fn stack_assignments(
+    work_area: Rect,
+    windows: &[WindowHandle],
+    config: LayoutConfig,
+    axis: StackAxis,
+) -> Vec<TileAssignment> {
+    if work_area.is_empty() || windows.is_empty() {
+        return Vec::new();
+    }
+
+    let config = config.normalized();
+    let outer_area = work_area.inset(config.gap);
+    if outer_area.is_empty() {
+        return Vec::new();
+    }
+
+    let rects: Vec<_> = match axis {
+        StackAxis::Rows => split_rows_with_gap(outer_area, windows.len(), config.gap).collect(),
+        StackAxis::Columns => {
+            split_columns_with_gap(outer_area, windows.len(), config.gap).collect()
+        }
+    };
+
+    rects
+        .into_iter()
+        .zip(windows)
+        .map(|(rect, window)| TileAssignment {
+            window: *window,
+            rect: reserve_window_rect(rect, config),
+        })
+        .collect()
+}
+
+fn dwindle_assignments(
+    work_area: Rect,
+    windows: &[WindowHandle],
+    config: LayoutConfig,
+    cursor_position: Option<Point>,
+    dwindle_splits: Option<&mut Vec<DwindleSplit>>,
+) -> Vec<TileAssignment> {
+    if work_area.is_empty() || windows.is_empty() {
+        if let Some(splits) = dwindle_splits {
+            splits.clear();
+        }
+        return Vec::new();
+    }
+
+    let config = config.normalized();
+    let outer_area = work_area.inset(config.gap);
+    if outer_area.is_empty() {
+        return Vec::new();
+    }
+
+    if windows.len() == 1 {
+        if let Some(splits) = dwindle_splits {
+            splits.clear();
+        }
+        return vec![TileAssignment {
+            window: windows[0],
+            rect: reserve_window_rect(outer_area, config),
+        }];
+    }
+
+    let current_windows: BTreeSet<_> = windows.iter().copied().collect();
+    let split_state = dwindle_splits;
+    let historical_splits = split_state
+        .as_ref()
+        .map(|splits| splits.as_slice())
+        .unwrap_or(&[]);
+    let root = dwindle_root_window(windows, historical_splits);
+    let mut tree = prune_dwindle_tree(
+        build_dwindle_tree(root, historical_splits),
+        &current_windows,
+    )
+    .unwrap_or(DwindleTree::Leaf(windows[0]));
+
+    let mut assignments = Vec::new();
+    collect_dwindle_assignments(&tree, outer_area, config, &mut assignments);
+
+    let initial_missing_count = windows
+        .iter()
+        .filter(|window| {
+            !assignments
+                .iter()
+                .any(|assignment| assignment.window == **window)
+        })
+        .count();
+    let use_smart_split_for_new_window = config.smart_split && initial_missing_count == 1;
+
+    for window in windows.iter().copied() {
+        if assignments
+            .iter()
+            .any(|assignment| assignment.window == window)
+        {
+            continue;
+        }
+
+        let target_assignment = new_dwindle_split_target(
+            &assignments,
+            use_smart_split_for_new_window,
+            cursor_position,
+        );
+        let split_cursor = use_smart_split_for_new_window
+            .then_some(cursor_position)
+            .flatten();
+        let direction = dwindle_split_direction(target_assignment.rect, config, split_cursor);
+        let split = DwindleSplit {
+            target: target_assignment.window,
+            new_window: window,
+            direction,
+        };
+
+        insert_dwindle_split(&mut tree, split);
+        assignments.clear();
+        collect_dwindle_assignments(&tree, outer_area, config, &mut assignments);
+    }
+
+    if let Some(splits) = split_state {
+        splits.clear();
+        serialize_dwindle_tree(&tree, splits);
+    }
+
+    sort_assignments_by_window_order(&mut assignments, windows);
+
+    assignments
+        .into_iter()
+        .map(|assignment| TileAssignment {
+            window: assignment.window,
+            rect: reserve_window_rect(assignment.rect, config),
+        })
+        .collect()
+}
+
+fn sort_assignments_by_window_order(assignments: &mut [TileAssignment], windows: &[WindowHandle]) {
+    assignments.sort_by_key(|assignment| {
+        windows
+            .iter()
+            .position(|window| *window == assignment.window)
+            .unwrap_or(usize::MAX)
+    });
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DwindleTree {
+    Leaf(WindowHandle),
+    Split {
+        direction: SplitDirection,
+        existing: Box<DwindleTree>,
+        new: Box<DwindleTree>,
+    },
+}
+
+fn dwindle_root_window(windows: &[WindowHandle], splits: &[DwindleSplit]) -> WindowHandle {
+    let new_windows: BTreeSet<_> = splits.iter().map(|split| split.new_window).collect();
+    splits
+        .iter()
+        .map(|split| split.target)
+        .find(|target| !new_windows.contains(target))
+        .unwrap_or(windows[0])
+}
+
+fn build_dwindle_tree(root: WindowHandle, splits: &[DwindleSplit]) -> DwindleTree {
+    let mut tree = DwindleTree::Leaf(root);
+
+    for split in splits {
+        insert_dwindle_split(&mut tree, *split);
+    }
+
+    tree
+}
+
+fn prune_dwindle_tree(tree: DwindleTree, windows: &BTreeSet<WindowHandle>) -> Option<DwindleTree> {
+    match tree {
+        DwindleTree::Leaf(window) if windows.contains(&window) => Some(DwindleTree::Leaf(window)),
+        DwindleTree::Leaf(_) => None,
+        DwindleTree::Split {
+            direction,
+            existing,
+            new,
+        } => match (
+            prune_dwindle_tree(*existing, windows),
+            prune_dwindle_tree(*new, windows),
+        ) {
+            (Some(existing), Some(new)) => Some(DwindleTree::Split {
+                direction,
+                existing: Box::new(existing),
+                new: Box::new(new),
+            }),
+            (Some(remaining), None) | (None, Some(remaining)) => Some(remaining),
+            (None, None) => None,
+        },
+    }
+}
+
+fn insert_dwindle_split(tree: &mut DwindleTree, split: DwindleSplit) -> bool {
+    if dwindle_tree_contains(tree, split.new_window) {
+        return false;
+    }
+
+    match tree {
+        DwindleTree::Leaf(window) if *window == split.target => {
+            *tree = DwindleTree::Split {
+                direction: split.direction,
+                existing: Box::new(DwindleTree::Leaf(split.target)),
+                new: Box::new(DwindleTree::Leaf(split.new_window)),
+            };
+            true
+        }
+        DwindleTree::Leaf(_) => false,
+        DwindleTree::Split { existing, new, .. } => {
+            insert_dwindle_split(existing, split) || insert_dwindle_split(new, split)
+        }
+    }
+}
+
+fn dwindle_tree_contains(tree: &DwindleTree, needle: WindowHandle) -> bool {
+    match tree {
+        DwindleTree::Leaf(window) => *window == needle,
+        DwindleTree::Split { existing, new, .. } => {
+            dwindle_tree_contains(existing, needle) || dwindle_tree_contains(new, needle)
+        }
+    }
+}
+
+fn collect_dwindle_assignments(
+    tree: &DwindleTree,
+    rect: Rect,
+    config: LayoutConfig,
+    assignments: &mut Vec<TileAssignment>,
+) {
+    match tree {
+        DwindleTree::Leaf(window) => assignments.push(TileAssignment {
+            window: *window,
+            rect,
+        }),
+        DwindleTree::Split {
+            direction,
+            existing,
+            new,
+        } => {
+            let (existing_rect, new_rect) = split_for_direction(rect, *direction, config);
+            collect_dwindle_assignments(existing, existing_rect, config, assignments);
+            collect_dwindle_assignments(new, new_rect, config, assignments);
+        }
+    }
+}
+
+fn serialize_dwindle_tree(tree: &DwindleTree, splits: &mut Vec<DwindleSplit>) {
+    if let DwindleTree::Split {
+        direction,
+        existing,
+        new,
+    } = tree
+    {
+        splits.push(DwindleSplit {
+            target: dwindle_tree_root_leaf(existing),
+            new_window: dwindle_tree_root_leaf(new),
+            direction: *direction,
+        });
+        serialize_dwindle_tree(existing, splits);
+        serialize_dwindle_tree(new, splits);
+    }
+}
+
+fn dwindle_tree_root_leaf(tree: &DwindleTree) -> WindowHandle {
+    match tree {
+        DwindleTree::Leaf(window) => *window,
+        DwindleTree::Split { existing, .. } => dwindle_tree_root_leaf(existing),
+    }
+}
+
+fn new_dwindle_split_target(
+    assignments: &[TileAssignment],
+    use_cursor_target: bool,
+    cursor_position: Option<Point>,
+) -> TileAssignment {
+    if use_cursor_target
+        && let Some(cursor_position) = cursor_position
+        && let Some(assignment) = assignments
+            .iter()
+            .find(|assignment| assignment.rect.contains(cursor_position))
+    {
+        return *assignment;
+    }
+
+    *assignments.last().unwrap_or(&TileAssignment {
+        window: WindowHandle(0),
+        rect: Rect::from_size(0, 0, 1, 1),
+    })
+}
+
+fn dwindle_split_direction(
+    target_rect: Rect,
+    config: LayoutConfig,
+    cursor_position: Option<Point>,
+) -> SplitDirection {
+    if config.smart_split
+        && let Some(cursor_position) = cursor_position
+        && target_rect.contains(cursor_position)
+    {
+        return split_direction_for_point(target_rect, cursor_position);
+    }
+
+    if target_rect.width() >= target_rect.height() {
+        SplitDirection::Right
+    } else {
+        SplitDirection::Down
+    }
+}
+
+pub fn split_direction_for_point(rect: Rect, point: Point) -> SplitDirection {
+    let width = f64::from(rect.width().max(1));
+    let height = f64::from(rect.height().max(1));
+    let center_x = f64::from(rect.left) + width / 2.0;
+    let center_y = f64::from(rect.top) + height / 2.0;
+    let normalized_x = (f64::from(point.x) - center_x) / (width / 2.0);
+    let normalized_y = (f64::from(point.y) - center_y) / (height / 2.0);
+
+    if normalized_x.abs() >= normalized_y.abs() {
+        if normalized_x < 0.0 {
+            SplitDirection::Left
+        } else {
+            SplitDirection::Right
+        }
+    } else if normalized_y < 0.0 {
+        SplitDirection::Up
+    } else {
+        SplitDirection::Down
+    }
+}
+
+fn split_for_direction(
+    rect: Rect,
+    direction: SplitDirection,
+    config: LayoutConfig,
+) -> (Rect, Rect) {
+    let gap = config.gap;
+    match direction {
+        SplitDirection::Left | SplitDirection::Right => {
+            let available_width = rect.width().saturating_sub(gap);
+            if available_width <= 0 {
+                return (rect, rect);
+            }
+
+            let first_width = scale_length(available_width, config.master_ratio_percent);
+            let second_width = available_width.saturating_sub(first_width);
+            let left = Rect::from_size(rect.left, rect.top, first_width, rect.height());
+            let right = Rect::from_size(
+                left.right.saturating_add(gap),
+                rect.top,
+                second_width,
+                rect.height(),
+            );
+
+            match direction {
+                SplitDirection::Left => (right, left),
+                SplitDirection::Right => (left, right),
+                SplitDirection::Down | SplitDirection::Up => unreachable!(),
+            }
+        }
+        SplitDirection::Up | SplitDirection::Down => {
+            let available_height = rect.height().saturating_sub(gap);
+            if available_height <= 0 {
+                return (rect, rect);
+            }
+
+            let first_height = scale_length(available_height, config.master_ratio_percent);
+            let second_height = available_height.saturating_sub(first_height);
+            let top = Rect::from_size(rect.left, rect.top, rect.width(), first_height);
+            let bottom = Rect::from_size(
+                rect.left,
+                top.bottom.saturating_add(gap),
+                rect.width(),
+                second_height,
+            );
+
+            match direction {
+                SplitDirection::Up => (bottom, top),
+                SplitDirection::Down => (top, bottom),
+                SplitDirection::Left | SplitDirection::Right => unreachable!(),
+            }
+        }
+    }
+}
+
 fn reserve_window_rect(rect: Rect, config: LayoutConfig) -> Rect {
     rect.inset(config.border)
 }
@@ -1057,6 +1539,22 @@ fn split_rows_with_gap(area: Rect, rows: usize, gap: i32) -> impl Iterator<Item 
         let height = base_height.saturating_add(extra);
         let rect = Rect::from_size(area.left, *top, area.width(), height);
         *top = top.saturating_add(height).saturating_add(gap);
+        Some(rect)
+    })
+}
+
+fn split_columns_with_gap(area: Rect, columns: usize, gap: i32) -> impl Iterator<Item = Rect> {
+    let gap = gap.max(0);
+    let total_gap = gap.saturating_mul(columns.saturating_sub(1).min(i32::MAX as usize) as i32);
+    let available_width = area.width().saturating_sub(total_gap);
+    let base_width = available_width / columns as i32;
+    let remainder = available_width % columns as i32;
+
+    (0..columns).scan(area.left, move |left, index| {
+        let extra = if (index as i32) < remainder { 1 } else { 0 };
+        let width = base_width.saturating_add(extra);
+        let rect = Rect::from_size(*left, area.top, width, area.height());
+        *left = left.saturating_add(width).saturating_add(gap);
         Some(rect)
     })
 }
@@ -1235,6 +1733,576 @@ mod tests {
     }
 
     #[test]
+    fn vertical_stack_splits_windows_into_rows() {
+        let work_area = Rect::from_size(0, 0, 100, 101);
+        let assignments = tile_windows_with_config(
+            work_area,
+            &[WindowHandle(1), WindowHandle(2), WindowHandle(3)],
+            LayoutConfig {
+                kind: LayoutKind::VerticalStack,
+                ..LayoutConfig::default()
+            },
+        );
+
+        assert_eq!(
+            assignments,
+            vec![
+                TileAssignment {
+                    window: WindowHandle(1),
+                    rect: Rect::from_size(0, 0, 100, 34),
+                },
+                TileAssignment {
+                    window: WindowHandle(2),
+                    rect: Rect::from_size(0, 34, 100, 34),
+                },
+                TileAssignment {
+                    window: WindowHandle(3),
+                    rect: Rect::from_size(0, 68, 100, 33),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn horizontal_stack_splits_windows_into_columns() {
+        let work_area = Rect::from_size(0, 0, 101, 100);
+        let assignments = tile_windows_with_config(
+            work_area,
+            &[WindowHandle(1), WindowHandle(2), WindowHandle(3)],
+            LayoutConfig {
+                kind: LayoutKind::HorizontalStack,
+                ..LayoutConfig::default()
+            },
+        );
+
+        assert_eq!(
+            assignments,
+            vec![
+                TileAssignment {
+                    window: WindowHandle(1),
+                    rect: Rect::from_size(0, 0, 34, 100),
+                },
+                TileAssignment {
+                    window: WindowHandle(2),
+                    rect: Rect::from_size(34, 0, 34, 100),
+                },
+                TileAssignment {
+                    window: WindowHandle(3),
+                    rect: Rect::from_size(68, 0, 33, 100),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn dwindle_splits_newest_leaf_by_available_shape() {
+        let work_area = Rect::from_size(0, 0, 1000, 800);
+        let assignments = tile_windows_with_config(
+            work_area,
+            &[WindowHandle(1), WindowHandle(2), WindowHandle(3)],
+            LayoutConfig {
+                kind: LayoutKind::Dwindle,
+                ..LayoutConfig::default()
+            },
+        );
+
+        assert_eq!(
+            assignments,
+            vec![
+                TileAssignment {
+                    window: WindowHandle(1),
+                    rect: Rect::from_size(0, 0, 500, 800),
+                },
+                TileAssignment {
+                    window: WindowHandle(2),
+                    rect: Rect::from_size(500, 0, 500, 400),
+                },
+                TileAssignment {
+                    window: WindowHandle(3),
+                    rect: Rect::from_size(500, 400, 500, 400),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn smart_split_uses_cursor_triangle_and_preserves_existing_splits() {
+        let work_area = Rect::from_size(0, 0, 1000, 800);
+        let mut splits = Vec::new();
+        let config = LayoutConfig {
+            kind: LayoutKind::Dwindle,
+            smart_split: true,
+            ..LayoutConfig::default()
+        };
+
+        let assignments = tile_windows_with_state(
+            work_area,
+            &[WindowHandle(1), WindowHandle(2)],
+            config,
+            Some(Point { x: 10, y: 400 }),
+            Some(&mut splits),
+        );
+
+        assert_eq!(
+            splits,
+            vec![DwindleSplit {
+                target: WindowHandle(1),
+                new_window: WindowHandle(2),
+                direction: SplitDirection::Left,
+            }]
+        );
+        assert_eq!(
+            assignments,
+            vec![
+                TileAssignment {
+                    window: WindowHandle(1),
+                    rect: Rect::from_size(500, 0, 500, 800),
+                },
+                TileAssignment {
+                    window: WindowHandle(2),
+                    rect: Rect::from_size(0, 0, 500, 800),
+                },
+            ]
+        );
+
+        let preserved = tile_windows_with_state(
+            work_area,
+            &[WindowHandle(1), WindowHandle(2)],
+            config,
+            Some(Point { x: 990, y: 400 }),
+            Some(&mut splits),
+        );
+
+        assert_eq!(
+            splits,
+            vec![DwindleSplit {
+                target: WindowHandle(1),
+                new_window: WindowHandle(2),
+                direction: SplitDirection::Left,
+            }]
+        );
+        assert_eq!(preserved, assignments);
+    }
+
+    #[test]
+    fn smart_split_reconstructs_missing_history_from_shape_when_many_splits_are_unknown() {
+        let work_area = Rect::from_size(0, 0, 1000, 800);
+        let mut splits = Vec::new();
+        let config = LayoutConfig {
+            kind: LayoutKind::Dwindle,
+            smart_split: true,
+            ..LayoutConfig::default()
+        };
+
+        let assignments = tile_windows_with_state(
+            work_area,
+            &[
+                WindowHandle(1),
+                WindowHandle(2),
+                WindowHandle(3),
+                WindowHandle(4),
+            ],
+            config,
+            Some(Point { x: 500, y: 799 }),
+            Some(&mut splits),
+        );
+
+        assert_eq!(
+            splits,
+            vec![
+                DwindleSplit {
+                    target: WindowHandle(1),
+                    new_window: WindowHandle(2),
+                    direction: SplitDirection::Right,
+                },
+                DwindleSplit {
+                    target: WindowHandle(2),
+                    new_window: WindowHandle(3),
+                    direction: SplitDirection::Down,
+                },
+                DwindleSplit {
+                    target: WindowHandle(3),
+                    new_window: WindowHandle(4),
+                    direction: SplitDirection::Right,
+                },
+            ]
+        );
+        assert_eq!(
+            assignments,
+            vec![
+                TileAssignment {
+                    window: WindowHandle(1),
+                    rect: Rect::from_size(0, 0, 500, 800),
+                },
+                TileAssignment {
+                    window: WindowHandle(2),
+                    rect: Rect::from_size(500, 0, 500, 400),
+                },
+                TileAssignment {
+                    window: WindowHandle(3),
+                    rect: Rect::from_size(500, 400, 250, 400),
+                },
+                TileAssignment {
+                    window: WindowHandle(4),
+                    rect: Rect::from_size(750, 400, 250, 400),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn smart_split_uses_cursor_for_single_new_split_only() {
+        let work_area = Rect::from_size(0, 0, 1000, 800);
+        let mut splits = vec![DwindleSplit {
+            target: WindowHandle(1),
+            new_window: WindowHandle(2),
+            direction: SplitDirection::Right,
+        }];
+        let config = LayoutConfig {
+            kind: LayoutKind::Dwindle,
+            smart_split: true,
+            ..LayoutConfig::default()
+        };
+
+        let assignments = tile_windows_with_state(
+            work_area,
+            &[WindowHandle(1), WindowHandle(2), WindowHandle(3)],
+            config,
+            Some(Point { x: 510, y: 400 }),
+            Some(&mut splits),
+        );
+
+        assert_eq!(
+            splits,
+            vec![
+                DwindleSplit {
+                    target: WindowHandle(1),
+                    new_window: WindowHandle(2),
+                    direction: SplitDirection::Right,
+                },
+                DwindleSplit {
+                    target: WindowHandle(2),
+                    new_window: WindowHandle(3),
+                    direction: SplitDirection::Left,
+                },
+            ]
+        );
+        assert_eq!(
+            assignments,
+            vec![
+                TileAssignment {
+                    window: WindowHandle(1),
+                    rect: Rect::from_size(0, 0, 500, 800),
+                },
+                TileAssignment {
+                    window: WindowHandle(2),
+                    rect: Rect::from_size(750, 0, 250, 800),
+                },
+                TileAssignment {
+                    window: WindowHandle(3),
+                    rect: Rect::from_size(500, 0, 250, 800),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn smart_split_targets_leaf_under_cursor_instead_of_always_newest_leaf() {
+        let work_area = Rect::from_size(0, 0, 1000, 800);
+        let mut splits = vec![DwindleSplit {
+            target: WindowHandle(1),
+            new_window: WindowHandle(2),
+            direction: SplitDirection::Right,
+        }];
+        let config = LayoutConfig {
+            kind: LayoutKind::Dwindle,
+            smart_split: true,
+            ..LayoutConfig::default()
+        };
+
+        let assignments = tile_windows_with_state(
+            work_area,
+            &[WindowHandle(1), WindowHandle(2), WindowHandle(3)],
+            config,
+            Some(Point { x: 10, y: 400 }),
+            Some(&mut splits),
+        );
+
+        assert_eq!(
+            splits,
+            vec![
+                DwindleSplit {
+                    target: WindowHandle(1),
+                    new_window: WindowHandle(2),
+                    direction: SplitDirection::Right,
+                },
+                DwindleSplit {
+                    target: WindowHandle(1),
+                    new_window: WindowHandle(3),
+                    direction: SplitDirection::Left,
+                },
+            ]
+        );
+        assert_eq!(
+            assignments,
+            vec![
+                TileAssignment {
+                    window: WindowHandle(1),
+                    rect: Rect::from_size(250, 0, 250, 800),
+                },
+                TileAssignment {
+                    window: WindowHandle(2),
+                    rect: Rect::from_size(500, 0, 500, 800),
+                },
+                TileAssignment {
+                    window: WindowHandle(3),
+                    rect: Rect::from_size(0, 0, 250, 800),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn dwindle_prunes_missing_leaf_and_expands_remaining_sibling_subtree() {
+        let work_area = Rect::from_size(0, 0, 1000, 800);
+        let mut splits = vec![
+            DwindleSplit {
+                target: WindowHandle(1),
+                new_window: WindowHandle(2),
+                direction: SplitDirection::Down,
+            },
+            DwindleSplit {
+                target: WindowHandle(1),
+                new_window: WindowHandle(3),
+                direction: SplitDirection::Right,
+            },
+        ];
+        let config = LayoutConfig {
+            kind: LayoutKind::Dwindle,
+            smart_split: true,
+            ..LayoutConfig::default()
+        };
+
+        let assignments = tile_windows_with_state(
+            work_area,
+            &[WindowHandle(1), WindowHandle(3)],
+            config,
+            Some(Point { x: 500, y: 700 }),
+            Some(&mut splits),
+        );
+
+        assert_eq!(
+            assignments,
+            vec![
+                TileAssignment {
+                    window: WindowHandle(1),
+                    rect: Rect::from_size(0, 0, 500, 800),
+                },
+                TileAssignment {
+                    window: WindowHandle(3),
+                    rect: Rect::from_size(500, 0, 500, 800),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn dwindle_prunes_missing_root_leaf_and_expands_remaining_sibling_subtree() {
+        let work_area = Rect::from_size(0, 0, 1000, 800);
+        let mut splits = vec![
+            DwindleSplit {
+                target: WindowHandle(1),
+                new_window: WindowHandle(2),
+                direction: SplitDirection::Right,
+            },
+            DwindleSplit {
+                target: WindowHandle(2),
+                new_window: WindowHandle(3),
+                direction: SplitDirection::Down,
+            },
+        ];
+        let config = LayoutConfig {
+            kind: LayoutKind::Dwindle,
+            smart_split: true,
+            ..LayoutConfig::default()
+        };
+
+        let assignments = tile_windows_with_state(
+            work_area,
+            &[WindowHandle(2), WindowHandle(3)],
+            config,
+            Some(Point { x: 100, y: 400 }),
+            Some(&mut splits),
+        );
+
+        assert_eq!(
+            assignments,
+            vec![
+                TileAssignment {
+                    window: WindowHandle(2),
+                    rect: Rect::from_size(0, 0, 1000, 400),
+                },
+                TileAssignment {
+                    window: WindowHandle(3),
+                    rect: Rect::from_size(0, 400, 1000, 400),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn dwindle_canonicalizes_split_history_after_pruning_dragged_leaf() {
+        let work_area = Rect::from_size(0, 0, 1000, 800);
+        let mut splits = vec![
+            DwindleSplit {
+                target: WindowHandle(1),
+                new_window: WindowHandle(3),
+                direction: SplitDirection::Right,
+            },
+            DwindleSplit {
+                target: WindowHandle(3),
+                new_window: WindowHandle(2),
+                direction: SplitDirection::Down,
+            },
+        ];
+        let config = LayoutConfig {
+            kind: LayoutKind::Dwindle,
+            smart_split: true,
+            ..LayoutConfig::default()
+        };
+
+        let assignments = tile_windows_with_state(
+            work_area,
+            &[WindowHandle(1), WindowHandle(2)],
+            config,
+            Some(Point { x: 750, y: 10 }),
+            Some(&mut splits),
+        );
+
+        assert_eq!(
+            assignments,
+            vec![
+                TileAssignment {
+                    window: WindowHandle(1),
+                    rect: Rect::from_size(0, 0, 500, 800),
+                },
+                TileAssignment {
+                    window: WindowHandle(2),
+                    rect: Rect::from_size(500, 0, 500, 800),
+                },
+            ]
+        );
+        assert_eq!(
+            splits,
+            vec![DwindleSplit {
+                target: WindowHandle(1),
+                new_window: WindowHandle(2),
+                direction: SplitDirection::Right,
+            }]
+        );
+    }
+
+    #[test]
+    fn smart_split_uses_diagonal_triangle_regions_in_wide_rects() {
+        let rect = Rect::from_size(0, 0, 1000, 200);
+
+        assert_eq!(
+            split_direction_for_point(rect, Point { x: 250, y: 80 }),
+            SplitDirection::Left
+        );
+        assert_eq!(
+            split_direction_for_point(rect, Point { x: 750, y: 80 }),
+            SplitDirection::Right
+        );
+        assert_eq!(
+            split_direction_for_point(rect, Point { x: 500, y: 10 }),
+            SplitDirection::Up
+        );
+        assert_eq!(
+            split_direction_for_point(rect, Point { x: 500, y: 190 }),
+            SplitDirection::Down
+        );
+    }
+
+    #[test]
+    fn smart_split_uses_diagonal_triangle_regions_in_tall_rects() {
+        let rect = Rect::from_size(0, 0, 200, 1000);
+
+        assert_eq!(
+            split_direction_for_point(rect, Point { x: 80, y: 250 }),
+            SplitDirection::Up
+        );
+        assert_eq!(
+            split_direction_for_point(rect, Point { x: 80, y: 750 }),
+            SplitDirection::Down
+        );
+        assert_eq!(
+            split_direction_for_point(rect, Point { x: 10, y: 500 }),
+            SplitDirection::Left
+        );
+        assert_eq!(
+            split_direction_for_point(rect, Point { x: 190, y: 500 }),
+            SplitDirection::Right
+        );
+    }
+
+    #[test]
+    fn smart_split_ignores_cursor_outside_split_target() {
+        let work_area = Rect::from_size(0, 0, 1000, 800);
+        let mut splits = vec![DwindleSplit {
+            target: WindowHandle(1),
+            new_window: WindowHandle(2),
+            direction: SplitDirection::Right,
+        }];
+        let config = LayoutConfig {
+            kind: LayoutKind::Dwindle,
+            smart_split: true,
+            ..LayoutConfig::default()
+        };
+
+        let assignments = tile_windows_with_state(
+            work_area,
+            &[WindowHandle(1), WindowHandle(2), WindowHandle(3)],
+            config,
+            Some(Point { x: 2000, y: 400 }),
+            Some(&mut splits),
+        );
+
+        assert_eq!(
+            splits,
+            vec![
+                DwindleSplit {
+                    target: WindowHandle(1),
+                    new_window: WindowHandle(2),
+                    direction: SplitDirection::Right,
+                },
+                DwindleSplit {
+                    target: WindowHandle(2),
+                    new_window: WindowHandle(3),
+                    direction: SplitDirection::Down,
+                },
+            ]
+        );
+        assert_eq!(
+            assignments,
+            vec![
+                TileAssignment {
+                    window: WindowHandle(1),
+                    rect: Rect::from_size(0, 0, 500, 800),
+                },
+                TileAssignment {
+                    window: WindowHandle(2),
+                    rect: Rect::from_size(500, 0, 500, 400),
+                },
+                TileAssignment {
+                    window: WindowHandle(3),
+                    rect: Rect::from_size(500, 400, 500, 400),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn layout_state_inserts_windows_without_duplicates() {
         let mut layout = MonitorLayoutState::new(MonitorId(1));
 
@@ -1333,6 +2401,7 @@ mod tests {
                 gap: 10,
                 border: 2,
                 master_ratio_percent: 50,
+                ..LayoutConfig::default()
             },
         );
         layout.insert_window(WindowHandle(1));
@@ -1435,6 +2504,7 @@ mod tests {
                 gap: 12,
                 border: 4,
                 master_ratio_percent: 70,
+                ..LayoutConfig::default()
             },
         );
         layout.insert_window(WindowHandle(1));

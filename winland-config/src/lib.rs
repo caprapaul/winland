@@ -5,11 +5,17 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use winland_core::{
-    LayoutConfig, TextMatcher, WindowRule, WindowRuleAction, WindowRuleMatch, WorkspaceId,
+    LayoutConfig, LayoutKind, MonitorId, TextMatcher, WindowRule, WindowRuleAction,
+    WindowRuleMatch, WorkspaceId,
 };
 
 pub const DEFAULT_FILE_NAME: &str = "winland.toml";
-pub const SUPPORTED_LAYOUT: &str = "master-stack";
+pub const SUPPORTED_LAYOUTS: &[&str] = &[
+    "master-stack",
+    "dwindle",
+    "vertical-stack",
+    "horizontal-stack",
+];
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
@@ -47,11 +53,39 @@ impl Config {
 
     pub fn layout_config(&self) -> LayoutConfig {
         LayoutConfig {
+            kind: LayoutKind::from_name(&self.layout.default).unwrap_or_default(),
             gap: self.layout.gap as i32,
             border: self.layout.border as i32,
             master_ratio_percent: self.layout.master_ratio_percent,
+            smart_split: self.layout.smart_split,
+            preserve_split: self.layout.preserve_split,
         }
         .normalized()
+    }
+
+    pub fn layout_config_for_monitor(
+        &self,
+        monitor: MonitorId,
+        is_primary: bool,
+        workspace: WorkspaceId,
+    ) -> LayoutConfig {
+        let mut layout = self
+            .layout
+            .per_workspace
+            .get(&workspace.0.to_string())
+            .map(|override_config| merge_layout_override(self.layout_config(), override_config))
+            .unwrap_or_else(|| self.layout_config());
+
+        if is_primary && let Some(override_config) = self.layout.per_monitor.get("primary") {
+            layout = merge_layout_override(self.layout_config(), override_config);
+        }
+
+        self.layout
+            .per_monitor
+            .get(&monitor.to_string())
+            .map(|override_config| merge_layout_override(self.layout_config(), override_config))
+            .unwrap_or(layout)
+            .normalized()
     }
 
     pub fn workspace_count(&self) -> u16 {
@@ -64,6 +98,26 @@ impl Config {
             .map(WindowRuleConfig::to_core_rule)
             .collect()
     }
+}
+
+fn merge_layout_override(base: LayoutConfig, override_config: &LayoutOverride) -> LayoutConfig {
+    LayoutConfig {
+        kind: override_config
+            .layout
+            .as_deref()
+            .and_then(LayoutKind::from_name)
+            .unwrap_or(base.kind),
+        gap: override_config.gap.map(i32::from).unwrap_or(base.gap),
+        border: override_config.border.map(i32::from).unwrap_or(base.border),
+        master_ratio_percent: override_config
+            .master_ratio_percent
+            .unwrap_or(base.master_ratio_percent),
+        smart_split: override_config.smart_split.unwrap_or(base.smart_split),
+        preserve_split: override_config
+            .preserve_split
+            .unwrap_or(base.preserve_split),
+    }
+    .normalized()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -153,6 +207,8 @@ pub struct LayoutSection {
     pub gap: u16,
     pub border: u16,
     pub master_ratio_percent: u8,
+    pub smart_split: bool,
+    pub preserve_split: bool,
     pub per_monitor: BTreeMap<String, LayoutOverride>,
     pub per_workspace: BTreeMap<String, LayoutOverride>,
 }
@@ -160,10 +216,12 @@ pub struct LayoutSection {
 impl Default for LayoutSection {
     fn default() -> Self {
         Self {
-            default: SUPPORTED_LAYOUT.to_owned(),
+            default: LayoutKind::MasterStack.name().to_owned(),
             gap: 0,
             border: 0,
             master_ratio_percent: 50,
+            smart_split: false,
+            preserve_split: false,
             per_monitor: BTreeMap::new(),
             per_workspace: BTreeMap::new(),
         }
@@ -177,6 +235,8 @@ pub struct LayoutOverride {
     pub gap: Option<u16>,
     pub border: Option<u16>,
     pub master_ratio_percent: Option<u8>,
+    pub smart_split: Option<bool>,
+    pub preserve_split: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -546,6 +606,12 @@ pub fn candidate_config_paths() -> Vec<PathBuf> {
         );
     }
 
+    if let Ok(current_exe) = env::current_exe()
+        && let Some(exe_dir) = current_exe.parent()
+    {
+        paths.push(exe_dir.join(DEFAULT_FILE_NAME));
+    }
+
     if let Ok(current_dir) = env::current_dir() {
         paths.push(current_dir.join(DEFAULT_FILE_NAME));
     }
@@ -636,10 +702,18 @@ fn validate_layout(layout: &LayoutSection, errors: &mut Vec<String>) {
         layout.master_ratio_percent,
         errors,
     );
+    validate_dwindle_flags(
+        "layout",
+        &layout.default,
+        layout.smart_split,
+        layout.preserve_split,
+        errors,
+    );
 
     for (monitor, override_config) in &layout.per_monitor {
         validate_layout_override(
             &format!("layout.per_monitor.{monitor}"),
+            &layout.default,
             override_config,
             errors,
         );
@@ -653,13 +727,19 @@ fn validate_layout(layout: &LayoutSection, errors: &mut Vec<String>) {
         );
         validate_layout_override(
             &format!("layout.per_workspace.{workspace}"),
+            &layout.default,
             override_config,
             errors,
         );
     }
 }
 
-fn validate_layout_override(context: &str, value: &LayoutOverride, errors: &mut Vec<String>) {
+fn validate_layout_override(
+    context: &str,
+    default_layout: &str,
+    value: &LayoutOverride,
+    errors: &mut Vec<String>,
+) {
     if let Some(layout) = &value.layout {
         validate_layout_name(&format!("{context}.layout"), layout, errors);
     }
@@ -672,12 +752,35 @@ fn validate_layout_override(context: &str, value: &LayoutOverride, errors: &mut 
     if let Some(ratio) = value.master_ratio_percent {
         validate_ratio(&format!("{context}.master_ratio_percent"), ratio, errors);
     }
+    let effective_layout = value.layout.as_deref().unwrap_or(default_layout);
+    validate_dwindle_flags(
+        context,
+        effective_layout,
+        value.smart_split.unwrap_or(false),
+        value.preserve_split.unwrap_or(false),
+        errors,
+    );
 }
 
 fn validate_layout_name(context: &str, layout: &str, errors: &mut Vec<String>) {
-    if layout != SUPPORTED_LAYOUT {
+    if !SUPPORTED_LAYOUTS.contains(&layout) {
         errors.push(format!(
-            "{context} must be '{SUPPORTED_LAYOUT}' until more layouts exist"
+            "{context} must be one of {}",
+            SUPPORTED_LAYOUTS.join(", ")
+        ));
+    }
+}
+
+fn validate_dwindle_flags(
+    context: &str,
+    layout: &str,
+    smart_split: bool,
+    preserve_split: bool,
+    errors: &mut Vec<String>,
+) {
+    if layout != LayoutKind::Dwindle.name() && (smart_split || preserve_split) {
+        errors.push(format!(
+            "{context}.smart_split and {context}.preserve_split only apply to dwindle layout"
         ));
     }
 }
@@ -1050,9 +1153,11 @@ mod tests {
             ]
 
             [layout]
+            default = "dwindle"
             gap = 8
             border = 1
             master_ratio_percent = 60
+            smart_split = true
 
             [workspaces]
             count = 2
@@ -1084,7 +1189,10 @@ mod tests {
         assert_eq!(config.hotkeys.bindings[1].launch.as_deref(), Some("wt.exe"));
         assert_eq!(config.hotkeys.override_latency_budget_micros, 300);
         assert_eq!(config.hotkeys.bypass.process_name.len(), 1);
+        assert_eq!(config.layout_config().kind, LayoutKind::Dwindle);
         assert_eq!(config.layout_config().gap, 8);
+        assert!(config.layout_config().smart_split);
+        assert!(config.layout_config().preserve_split);
         assert_eq!(config.workspace_count(), 2);
         assert!(config.behavior.startup_retile);
         assert!(!config.behavior.dynamic_retile);

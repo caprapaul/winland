@@ -50,6 +50,10 @@ bypass = { fullscreen = true, class = [], executable_path = [], process_name = [
 # Example:
 # bypass = { fullscreen = true, process_name = ["eldenring.exe", "cs2.exe"] }
 
+# Hold these modifiers and left-drag anywhere inside a normal top-level window
+# to move it without grabbing the title bar.
+modifier_drag = { enabled = true, modifiers = "Win" }
+
 # Supported command names:
 # focus-left, focus-down, focus-up, focus-right
 # swap-left, swap-down, swap-up, swap-right

@@ -1,17 +1,22 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{File, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::MakeWriter;
 use winland_config::{
     Config, HotkeyBindingConfig, HotkeyKey, HotkeyMode, HotkeyModifier, OverflowFocusPolicy,
     TextMatcherConfig,
 };
 use winland_core::{
-    DwindleSplit, LayoutConfig, LayoutKind, MonitorId, MonitorInfo, Rect, TileAssignment,
+    DwindleSplit, LayoutConfig, LayoutKind, MonitorId, MonitorInfo, Point, Rect, TileAssignment,
     WindowHandle, WindowInfo, WindowLayoutInfo, WindowParticipation, WindowRule,
     WindowRuleDecision, WindowSizeConstraints, WorkspaceId, WorkspaceManager,
     WorkspaceVisibilityChange, evaluate_window_rules, split_direction_for_point,
@@ -23,8 +28,8 @@ use winland_ipc::{
 };
 use winland_win32::{
     HotkeyBinding, HotkeyBypassRules, HotkeyEvent, HotkeyId, HotkeyLowLevelEvent,
-    HotkeyModifierSet, HotkeyOverrideOptions, IpcTransportRequest, VirtualKey, WindowEvent,
-    WindowEventKind,
+    HotkeyModifierSet, HotkeyOverrideOptions, IpcTransportRequest, ModifierDragOptions,
+    MouseDragEvent, MouseDragEventKind, VirtualKey, WindowEvent, WindowEventKind,
 };
 
 const RECONCILE_DEBOUNCE: Duration = Duration::from_millis(50);
@@ -64,6 +69,10 @@ fn main() -> Result<()> {
     );
     let hotkey_bridge = spawn_hotkey_bridge(hotkey_receiver, daemon_sender.clone())
         .context("spawn hotkey bridge")?;
+    let (mouse_drag_sender, mouse_drag_receiver) = mpsc::channel();
+    let modifier_drag = install_modifier_drag(&loaded_config.config, mouse_drag_sender)?;
+    let mouse_drag_bridge = spawn_mouse_drag_bridge(mouse_drag_receiver, daemon_sender.clone())
+        .context("spawn modifier drag bridge")?;
     drop(daemon_sender);
 
     let mut state = DaemonState::discover(runtime_config, hotkey_commands)
@@ -79,9 +88,11 @@ fn main() -> Result<()> {
         winland_win32::run_message_loop().context("run Win32 daemon message loop");
 
     drop(hotkey_backend);
+    drop(modifier_drag);
     drop(subscription);
     join_bridge(window_bridge, "window event bridge")?;
     join_bridge(hotkey_bridge, "hotkey bridge")?;
+    join_bridge(mouse_drag_bridge, "modifier drag bridge")?;
 
     match processor.join() {
         Ok(Ok(())) => message_loop_result,
@@ -93,10 +104,98 @@ fn main() -> Result<()> {
 fn init_tracing(default_level: &str) {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
+    let log_path = daemon_log_path();
+    let log_file = open_daemon_log_file(&log_path);
+    let writer = DaemonLogWriter {
+        file: log_file.map(|file| Arc::new(Mutex::new(file))),
+    };
+
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
+        .with_ansi(false)
+        .with_writer(writer)
         .init();
+
+    info!(path = %log_path.display(), "writing daemon logs to file");
+}
+
+#[derive(Clone)]
+struct DaemonLogWriter {
+    file: Option<Arc<Mutex<File>>>,
+}
+
+struct DaemonLogOutput {
+    file: Option<Arc<Mutex<File>>>,
+}
+
+impl<'a> MakeWriter<'a> for DaemonLogWriter {
+    type Writer = DaemonLogOutput;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        DaemonLogOutput {
+            file: self.file.clone(),
+        }
+    }
+}
+
+impl Write for DaemonLogOutput {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if let Some(file) = &self.file
+            && let Ok(mut file) = file.lock()
+        {
+            let _ = file.write_all(buffer);
+        }
+
+        io::stdout().write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if let Some(file) = &self.file
+            && let Ok(mut file) = file.lock()
+        {
+            let _ = file.flush();
+        }
+
+        io::stdout().flush()
+    }
+}
+
+fn daemon_log_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("WINLAND_LOG_FILE") {
+        return PathBuf::from(path);
+    }
+
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| {
+            path.parent()
+                .map(|parent| parent.join("winland-daemon.log"))
+        })
+        .unwrap_or_else(|| std::env::temp_dir().join("winland-daemon.log"))
+}
+
+fn open_daemon_log_file(path: &Path) -> Option<File> {
+    if let Some(parent) = path.parent()
+        && let Err(error) = std::fs::create_dir_all(parent)
+    {
+        eprintln!(
+            "failed to create Winland log directory '{}': {error}",
+            parent.display()
+        );
+        return None;
+    }
+
+    match OpenOptions::new().create(true).append(true).open(path) {
+        Ok(file) => Some(file),
+        Err(error) => {
+            eprintln!(
+                "failed to open Winland log file '{}': {error}",
+                path.display()
+            );
+            None
+        }
+    }
 }
 
 fn log_loaded_config(loaded: &winland_config::LoadedConfig) {
@@ -264,6 +363,22 @@ fn spawn_hotkey_bridge(
         .map_err(Into::into)
 }
 
+fn spawn_mouse_drag_bridge(
+    receiver: Receiver<MouseDragEvent>,
+    sender: Sender<DaemonEvent>,
+) -> Result<JoinHandle<()>> {
+    thread::Builder::new()
+        .name("winland-modifier-drag-bridge".to_owned())
+        .spawn(move || {
+            for event in receiver {
+                if sender.send(DaemonEvent::MouseDrag(event)).is_err() {
+                    break;
+                }
+            }
+        })
+        .map_err(Into::into)
+}
+
 fn spawn_ipc_bridge(
     receiver: Receiver<IpcTransportRequest>,
     sender: Sender<DaemonEvent>,
@@ -294,6 +409,7 @@ fn process_daemon_events(receiver: Receiver<DaemonEvent>, mut state: DaemonState
                 state.reconcile_after_events(&batch)?;
             }
             DaemonEvent::Hotkey(event) => state.handle_hotkey(event)?,
+            DaemonEvent::MouseDrag(event) => state.handle_mouse_drag(event)?,
             DaemonEvent::Ipc(request) => state.handle_ipc(request),
         }
     }
@@ -313,6 +429,7 @@ fn receive_window_batch(
         match receiver.recv_timeout(RECONCILE_DEBOUNCE) {
             Ok(DaemonEvent::Window(event)) => batch.push(event),
             Ok(DaemonEvent::Hotkey(event)) => state.handle_hotkey(event)?,
+            Ok(DaemonEvent::MouseDrag(event)) => state.handle_mouse_drag(event)?,
             Ok(DaemonEvent::Ipc(request)) => state.handle_ipc(request),
             Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
         }
@@ -325,6 +442,7 @@ fn receive_window_batch(
 enum DaemonEvent {
     Window(WindowEvent),
     Hotkey(HotkeyEvent),
+    MouseDrag(MouseDragEvent),
     Ipc(IpcTransportRequest),
 }
 
@@ -340,8 +458,26 @@ struct DaemonState {
     window_monitor_overrides: BTreeMap<WindowHandle, MonitorId>,
     overflow_floating: BTreeSet<WindowHandle>,
     workspaces: WorkspaceManager,
+    active_modifier_drag: Option<ActiveModifierDrag>,
+    suppressed_modifier_drag_events: BTreeSet<WindowHandle>,
     config: RuntimeConfig,
     hotkey_commands: HotkeyCommandMap,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ActiveModifierDrag {
+    window: WindowHandle,
+    start_cursor: Point,
+    last_cursor: Point,
+    start_rect: Rect,
+    move_count: u32,
+    started_temporary_float: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DropContext {
+    rect: Rect,
+    cursor: Option<Point>,
 }
 
 impl DaemonState {
@@ -366,6 +502,8 @@ impl DaemonState {
             window_monitor_overrides: BTreeMap::new(),
             overflow_floating: BTreeSet::new(),
             workspaces: WorkspaceManager::new(config.workspace_count),
+            active_modifier_drag: None,
+            suppressed_modifier_drag_events: BTreeSet::new(),
             config,
             hotkey_commands,
         };
@@ -402,6 +540,24 @@ impl DaemonState {
             );
         }
 
+        let filtered_batch: Vec<_> = batch
+            .iter()
+            .copied()
+            .filter(|event| !self.should_ignore_modifier_drag_window_event(*event))
+            .collect();
+        let ignored_modifier_drag_events = batch.len().saturating_sub(filtered_batch.len());
+        self.suppressed_modifier_drag_events.clear();
+        if ignored_modifier_drag_events > 0 {
+            debug!(
+                ignored_modifier_drag_events,
+                "ignored modifier-drag window events"
+            );
+        }
+        if filtered_batch.is_empty() {
+            return Ok(());
+        }
+        let batch = filtered_batch.as_slice();
+
         let mut refreshed = Self::discover(self.config.clone(), self.hotkey_commands.clone())
             .context("refresh window snapshot after event batch")?;
         let monitors = winland_win32::enumerate_monitors()
@@ -412,7 +568,7 @@ impl DaemonState {
         let event_plan = self.plan_after_window_events(batch, &diff, &monitors);
         self.apply_tile_assignments_with_feedback(&event_plan.moves, &monitors, "dynamic retile");
 
-        info!(
+        debug!(
             event_count = batch.len(),
             created_events = count_events(batch, WindowEventKind::Created),
             destroyed_events = count_events(batch, WindowEventKind::Destroyed),
@@ -436,6 +592,15 @@ impl DaemonState {
             moved_between_monitors = diff.moved_between_monitors,
             foreground_changed = diff.foreground_changed,
             retile_moves = event_plan.moves.len(),
+            "reconciled window snapshot details"
+        );
+
+        info!(
+            event_count = batch.len(),
+            moved_events = count_events(batch, WindowEventKind::Moved),
+            movesize_start_events = count_events(batch, WindowEventKind::MoveSizeStart),
+            movesize_end_events = count_events(batch, WindowEventKind::MoveSizeEnd),
+            retile_moves = event_plan.moves.len(),
             "reconciled window snapshot"
         );
 
@@ -457,6 +622,192 @@ impl DaemonState {
 
         info!(?command, "routing daemon hotkey command");
         self.execute_command(command)
+    }
+
+    fn should_ignore_modifier_drag_window_event(&self, event: WindowEvent) -> bool {
+        matches!(
+            event.kind,
+            WindowEventKind::Moved | WindowEventKind::MoveSizeStart | WindowEventKind::MoveSizeEnd
+        ) && (self
+            .active_modifier_drag
+            .is_some_and(|drag| drag.window == event.window)
+            || self.suppressed_modifier_drag_events.contains(&event.window))
+    }
+
+    fn handle_mouse_drag(&mut self, event: MouseDragEvent) -> Result<()> {
+        match event.kind {
+            MouseDragEventKind::Started => self.start_modifier_drag(event),
+            MouseDragEventKind::Moved => self.move_modifier_drag(event),
+            MouseDragEventKind::Ended => self.end_modifier_drag(event),
+        }
+    }
+
+    fn start_modifier_drag(&mut self, event: MouseDragEvent) -> Result<()> {
+        self.foreground = Some(event.window);
+        if let Err(error) = winland_win32::focus_window(event.window) {
+            debug!(
+                window = %event.window,
+                %error,
+                "failed to focus window at modifier drag start"
+            );
+        }
+
+        let start_rect =
+            winland_win32::window_rect_for_handle(event.window).with_context(|| {
+                format!("read window rect before modifier drag for {}", event.window)
+            })?;
+        let started_temporary_float = self.handle_movesize_start(event.window);
+
+        self.active_modifier_drag = Some(ActiveModifierDrag {
+            window: event.window,
+            start_cursor: event.cursor,
+            last_cursor: event.cursor,
+            start_rect,
+            move_count: 0,
+            started_temporary_float,
+        });
+
+        if started_temporary_float && self.config.dynamic_retile {
+            let monitors = winland_win32::enumerate_monitors()
+                .context("enumerate monitors after modifier drag start")?;
+            let assignments = self.tile_assignments(&monitors);
+            self.apply_tile_assignments_with_feedback(
+                &assignments,
+                &monitors,
+                "modifier drag start",
+            );
+        }
+
+        info!(
+            window = %event.window,
+            start_cursor = ?event.cursor,
+            start_rect = %start_rect,
+            started_temporary_float,
+            participation = ?self.window_participation(event.window),
+            "drag.start"
+        );
+        Ok(())
+    }
+
+    fn move_modifier_drag(&mut self, event: MouseDragEvent) -> Result<()> {
+        let Some(drag) = self.active_modifier_drag.as_mut() else {
+            return Ok(());
+        };
+        if drag.window != event.window {
+            return Ok(());
+        }
+
+        let rect = offset_rect_by_cursor_delta(drag.start_rect, drag.start_cursor, event.cursor);
+        drag.last_cursor = event.cursor;
+        drag.move_count = drag.move_count.saturating_add(1);
+        self.apply_modifier_drag_move_rect(event.window, rect);
+
+        Ok(())
+    }
+
+    fn end_modifier_drag(&mut self, event: MouseDragEvent) -> Result<()> {
+        let Some(drag) = self.active_modifier_drag.take() else {
+            return Ok(());
+        };
+        if drag.window != event.window {
+            return Ok(());
+        }
+
+        let final_rect =
+            offset_rect_by_cursor_delta(drag.start_rect, drag.start_cursor, event.cursor);
+        let dropped_rect = self.apply_modifier_drag_final_rect(event.window, final_rect);
+
+        info!(
+            window = %event.window,
+            end_cursor = ?event.cursor,
+            requested_rect = %final_rect,
+            accepted_rect = %dropped_rect,
+            started_temporary_float = drag.started_temporary_float,
+            move_count = drag.move_count,
+            last_move_cursor = ?drag.last_cursor,
+            "drag.end"
+        );
+
+        if drag.started_temporary_float {
+            let monitors = winland_win32::enumerate_monitors()
+                .context("enumerate monitors after modifier drag end")?;
+            let drop_context = DropContext {
+                rect: dropped_rect,
+                cursor: Some(event.cursor),
+            };
+            if self.handle_movesize_end(event.window, &monitors, Some(drop_context))
+                && self.config.retile_on_drag_end
+            {
+                self.suppressed_modifier_drag_events.insert(event.window);
+                let assignments = self.tile_assignments(&monitors);
+                info!(
+                    window = %event.window,
+                    tile_order = ?self.tile_order,
+                    assignment_count = assignments.len(),
+                    "drag.retile"
+                );
+                self.apply_tile_assignments_with_feedback(
+                    &assignments,
+                    &monitors,
+                    "modifier drag end",
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_modifier_drag_final_rect(&mut self, window: WindowHandle, rect: Rect) -> Rect {
+        if let Err(error) = winland_win32::move_resize_window(window, rect) {
+            warn!(
+                window = %window,
+                rect = %rect,
+                %error,
+                "failed to apply final modifier drag rect"
+            );
+        }
+
+        let accepted_rect = match winland_win32::window_rect_for_handle(window) {
+            Ok(actual) => actual,
+            Err(error) => {
+                debug!(
+                    window = %window,
+                    rect = %rect,
+                    %error,
+                    "failed to read accepted modifier drag rect; using requested rect"
+                );
+                rect
+            }
+        };
+
+        if accepted_rect != rect {
+            debug!(
+                window = %window,
+                requested = %rect,
+                accepted = %accepted_rect,
+                "Windows adjusted final modifier drag rect"
+            );
+        }
+
+        if let Some(info) = self.windows.get_mut(&window) {
+            info.rect = accepted_rect;
+        }
+        self.workspaces.update_window_rect(window, accepted_rect);
+        accepted_rect
+    }
+
+    fn apply_modifier_drag_move_rect(&mut self, window: WindowHandle, rect: Rect) {
+        if let Err(error) = winland_win32::move_resize_window(window, rect) {
+            warn!(
+                window = %window,
+                rect = %rect,
+                %error,
+                "failed to move window during modifier drag"
+            );
+        }
+        if let Some(info) = self.windows.get_mut(&window) {
+            info.rect = rect;
+        }
+        self.workspaces.update_window_rect(window, rect);
     }
 
     fn handle_ipc(&mut self, transport: IpcTransportRequest) {
@@ -747,19 +1098,12 @@ impl DaemonState {
             for event in batch {
                 match event.kind {
                     WindowEventKind::MoveSizeStart => {
-                        self.forget_learned_size_constraint(event.window);
-                        if self.start_temporary_float(event.window) {
+                        if self.handle_movesize_start(event.window) {
                             should_retile = should_retile || self.config.dynamic_retile;
                         }
                     }
                     WindowEventKind::MoveSizeEnd => {
-                        if self.window_participation(event.window)
-                            == WindowParticipation::TemporarilyFloating
-                        {
-                            self.reorder_temporary_float_by_drop(event.window, monitors);
-                        }
-
-                        if self.clear_temporary_float(event.window)
+                        if self.handle_movesize_end(event.window, monitors, None)
                             && self.config.retile_on_drag_end
                         {
                             should_retile = true;
@@ -805,6 +1149,41 @@ impl DaemonState {
         }) || diff.moved_between_monitors > 0
     }
 
+    fn handle_movesize_start(&mut self, window: WindowHandle) -> bool {
+        if !self.config.drag_to_float {
+            return false;
+        }
+
+        self.forget_learned_size_constraint(window);
+        self.start_temporary_float(window)
+    }
+
+    fn handle_movesize_end(
+        &mut self,
+        window: WindowHandle,
+        monitors: &[MonitorInfo],
+        drop_context: Option<DropContext>,
+    ) -> bool {
+        if !self.config.drag_to_float {
+            return false;
+        }
+
+        if self.window_participation(window) == WindowParticipation::TemporarilyFloating {
+            if let Some(drop_context) = drop_context {
+                self.reorder_temporary_float_by_drop_at(
+                    window,
+                    monitors,
+                    drop_context.rect,
+                    drop_context.cursor,
+                );
+            } else {
+                self.reorder_temporary_float_by_drop(window, monitors);
+            }
+        }
+
+        self.clear_temporary_float(window)
+    }
+
     fn start_temporary_float(&mut self, window: WindowHandle) -> bool {
         if self.window_participation(window) == WindowParticipation::Floating
             || !self.is_tilable_window(window)
@@ -834,10 +1213,19 @@ impl DaemonState {
         let Some(window_info) = self.windows.get(&window) else {
             return false;
         };
-        let cursor_position = winland_win32::cursor_position().ok();
+        self.reorder_temporary_float_by_drop_at(window, monitors, window_info.rect, None)
+    }
+
+    fn reorder_temporary_float_by_drop_at(
+        &mut self,
+        window: WindowHandle,
+        monitors: &[MonitorInfo],
+        dropped_rect: Rect,
+        cursor_position: Option<Point>,
+    ) -> bool {
         let Some(target_monitor) = cursor_position
             .and_then(|point| monitor_for_point(point, monitors))
-            .or_else(|| monitor_for_rect(window_info.rect, monitors))
+            .or_else(|| monitor_for_rect(dropped_rect, monitors))
         else {
             return false;
         };
@@ -845,7 +1233,6 @@ impl DaemonState {
             return false;
         };
         self.window_monitor_overrides.insert(window, target_monitor);
-        let dropped_rect = window_info.rect;
 
         let target_handles: Vec<_> = self
             .tile_order
@@ -882,7 +1269,9 @@ impl DaemonState {
             return true;
         }
 
-        let local_index = self.drop_insert_index(window, dropped_rect, &target_handles, monitor);
+        let drop_point = cursor_position.unwrap_or_else(|| dropped_rect.center());
+        let local_index =
+            self.drop_insert_index_at_point(window, drop_point, &target_handles, monitor);
 
         self.reinsert_window_at_local_index(window, &target_handles, local_index)
     }
@@ -937,15 +1326,13 @@ impl DaemonState {
         order_changed || splits_changed
     }
 
-    fn drop_insert_index(
+    fn drop_insert_index_at_point(
         &self,
         window: WindowHandle,
-        dropped_rect: Rect,
+        drop_point: Point,
         target_handles: &[WindowHandle],
         monitor: &MonitorInfo,
     ) -> usize {
-        let dropped_center = dropped_rect.center();
-
         (0..=target_handles.len())
             .filter_map(|index| {
                 let mut handles = target_handles.to_vec();
@@ -959,8 +1346,8 @@ impl DaemonState {
                         .into_iter()
                         .find(|assignment| assignment.window == window)?;
                 let center = assignment.rect.center();
-                let dx = i64::from(center.x - dropped_center.x);
-                let dy = i64::from(center.y - dropped_center.y);
+                let dx = i64::from(center.x - drop_point.x);
+                let dy = i64::from(center.y - drop_point.y);
                 Some((dx * dx + dy * dy, index))
             })
             .min_by_key(|(distance, index)| (*distance, *index))
@@ -1445,6 +1832,15 @@ impl DaemonState {
             .copied()
             .filter(|handle| known_workspace_windows.contains(handle))
             .collect();
+        refreshed.active_modifier_drag = self
+            .active_modifier_drag
+            .filter(|drag| refreshed.windows.contains_key(&drag.window));
+        refreshed.suppressed_modifier_drag_events = self
+            .suppressed_modifier_drag_events
+            .iter()
+            .copied()
+            .filter(|handle| refreshed.windows.contains_key(handle))
+            .collect();
     }
 
     fn diff(&self, refreshed: &Self, monitors: &[MonitorInfo]) -> SnapshotDiff {
@@ -1649,6 +2045,18 @@ fn count_events(batch: &[WindowEvent], kind: WindowEventKind) -> usize {
     batch.iter().filter(|event| event.kind == kind).count()
 }
 
+fn offset_rect_by_cursor_delta(rect: Rect, start: Point, current: Point) -> Rect {
+    let dx = current.x.saturating_sub(start.x);
+    let dy = current.y.saturating_sub(start.y);
+
+    Rect {
+        left: rect.left.saturating_add(dx),
+        top: rect.top.saturating_add(dy),
+        right: rect.right.saturating_add(dx),
+        bottom: rect.bottom.saturating_add(dy),
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct HotkeyCommandMap {
     commands: BTreeMap<HotkeyId, DaemonCommand>,
@@ -1704,6 +2112,35 @@ fn install_hotkey_backend(
             })
         }
     }
+}
+
+fn install_modifier_drag(
+    config: &Config,
+    mouse_drag_sender: Sender<MouseDragEvent>,
+) -> Result<Option<winland_win32::ModifierDragRegistration>> {
+    if !config.hotkeys.modifier_drag.enabled {
+        info!("modifier drag is disabled by config");
+        return Ok(None);
+    }
+
+    let modifiers = modifier_drag_modifiers_from_config(config)?;
+    let options = ModifierDragOptions {
+        modifiers,
+        bypass: HotkeyBypassRules {
+            fullscreen: config.hotkeys.bypass.fullscreen,
+            class_names: text_matchers_from_config(&config.hotkeys.bypass.class)?,
+            executable_paths: text_matchers_from_config(&config.hotkeys.bypass.executable_path)?,
+            process_names: text_matchers_from_config(&config.hotkeys.bypass.process_name)?,
+        },
+    };
+    let registration = winland_win32::install_modifier_drag(options, mouse_drag_sender)
+        .context("install documented low-level mouse hook for modifier drag")?;
+
+    info!(
+        modifiers = %config.hotkeys.modifier_drag.modifiers,
+        "installed modifier drag hook"
+    );
+    Ok(Some(registration))
 }
 
 fn hotkey_bindings_from_config(config: &Config) -> Result<(Vec<HotkeyBinding>, HotkeyCommandMap)> {
@@ -1822,16 +2259,33 @@ fn daemon_command_from_name(command: &str) -> Option<DaemonCommand> {
 }
 
 fn hotkey_modifiers_from_config(chord: &winland_config::HotkeyChord) -> HotkeyModifierSet {
-    let mut modifiers = HotkeyModifierSet::new();
-    for modifier in &chord.modifiers {
-        modifiers = match modifier {
-            HotkeyModifier::Alt => modifiers.alt(),
-            HotkeyModifier::Control => modifiers.control(),
-            HotkeyModifier::Shift => modifiers.shift(),
-            HotkeyModifier::Super => modifiers.super_key(),
+    hotkey_modifier_set_from_modifiers(&chord.modifiers)
+}
+
+fn modifier_drag_modifiers_from_config(config: &Config) -> Result<HotkeyModifierSet> {
+    let modifiers = winland_config::parse_hotkey_modifiers(&config.hotkeys.modifier_drag.modifiers)
+        .with_context(|| {
+            format!(
+                "parse modifier drag modifiers '{}'",
+                config.hotkeys.modifier_drag.modifiers
+            )
+        })?;
+    Ok(hotkey_modifier_set_from_modifiers(&modifiers))
+}
+
+fn hotkey_modifier_set_from_modifiers(
+    modifiers: &BTreeSet<winland_config::HotkeyModifier>,
+) -> HotkeyModifierSet {
+    let mut set = HotkeyModifierSet::new();
+    for modifier in modifiers {
+        set = match modifier {
+            HotkeyModifier::Alt => set.alt(),
+            HotkeyModifier::Control => set.control(),
+            HotkeyModifier::Shift => set.shift(),
+            HotkeyModifier::Super => set.super_key(),
         };
     }
-    modifiers
+    set
 }
 
 fn virtual_key_from_config(key: &HotkeyKey) -> VirtualKey {
@@ -2694,6 +3148,36 @@ mod tests {
     }
 
     #[test]
+    fn modifier_drag_delta_offsets_original_rect() {
+        let rect = offset_rect_by_cursor_delta(
+            Rect::from_size(100, 200, 300, 400),
+            Point { x: 125, y: 250 },
+            Point { x: 175, y: 225 },
+        );
+
+        assert_eq!(rect, Rect::from_size(150, 175, 300, 400));
+    }
+
+    #[test]
+    fn modifier_drag_start_uses_temporary_float_like_normal_drag() {
+        let mut state = daemon_state([
+            window(1, "One", Rect::from_size(0, 0, 100, 100)),
+            window(2, "Two", Rect::from_size(200, 0, 100, 100)),
+        ]);
+
+        assert!(state.handle_movesize_start(WindowHandle(1)));
+
+        assert_eq!(
+            state.window_participation(WindowHandle(1)),
+            WindowParticipation::TemporarilyFloating
+        );
+        assert_eq!(
+            state.previous_rects.get(&WindowHandle(1)).copied(),
+            Some(Rect::from_size(0, 0, 100, 100))
+        );
+    }
+
+    #[test]
     fn movesize_end_reorders_tiled_window_from_drop_position() {
         let mut state = daemon_state([
             window(1, "One", Rect::from_size(700, 500, 100, 100)),
@@ -2718,6 +3202,125 @@ mod tests {
                 .map(|assignment| assignment.window)
                 .collect::<Vec<_>>(),
             vec![WindowHandle(2), WindowHandle(3), WindowHandle(1)]
+        );
+    }
+
+    #[test]
+    fn explicit_modifier_drop_uses_supplied_final_position() {
+        let mut state = daemon_state([
+            window(1, "One", Rect::from_size(0, 0, 100, 100)),
+            window(2, "Two", Rect::from_size(300, 0, 100, 100)),
+            window(3, "Three", Rect::from_size(600, 0, 100, 100)),
+        ]);
+        state.set_window_participation(WindowHandle(1), WindowParticipation::TemporarilyFloating);
+
+        assert!(state.reorder_temporary_float_by_drop_at(
+            WindowHandle(1),
+            &[primary_test_monitor()],
+            Rect::from_size(850, 500, 100, 100),
+            Some(Point { x: 900, y: 550 }),
+        ));
+
+        assert_eq!(
+            state.tile_order,
+            vec![WindowHandle(2), WindowHandle(3), WindowHandle(1)]
+        );
+    }
+
+    #[test]
+    fn explicit_modifier_drop_uses_cursor_instead_of_final_rect_center() {
+        let mut state = daemon_state([
+            window(1, "One", Rect::from_size(0, 0, 100, 100)),
+            window(2, "Two", Rect::from_size(300, 0, 100, 100)),
+            window(3, "Three", Rect::from_size(600, 0, 100, 100)),
+        ]);
+        state.set_window_participation(WindowHandle(1), WindowParticipation::TemporarilyFloating);
+
+        assert!(state.reorder_temporary_float_by_drop_at(
+            WindowHandle(1),
+            &[primary_test_monitor()],
+            Rect::from_size(0, 0, 100, 100),
+            Some(Point { x: 900, y: 550 }),
+        ));
+
+        assert_eq!(
+            state.tile_order,
+            vec![WindowHandle(2), WindowHandle(3), WindowHandle(1)]
+        );
+    }
+
+    #[test]
+    fn movesize_end_accepts_explicit_modifier_drop_context() {
+        let mut state = daemon_state([
+            window(1, "One", Rect::from_size(0, 0, 100, 100)),
+            window(2, "Two", Rect::from_size(300, 0, 100, 100)),
+            window(3, "Three", Rect::from_size(600, 0, 100, 100)),
+        ]);
+        state.set_window_participation(WindowHandle(1), WindowParticipation::TemporarilyFloating);
+
+        assert!(state.handle_movesize_end(
+            WindowHandle(1),
+            &[primary_test_monitor()],
+            Some(DropContext {
+                rect: Rect::from_size(0, 0, 100, 100),
+                cursor: Some(Point { x: 900, y: 550 }),
+            }),
+        ));
+
+        assert_eq!(
+            state.window_participation(WindowHandle(1)),
+            WindowParticipation::Tiled
+        );
+        assert_eq!(
+            state.tile_order,
+            vec![WindowHandle(2), WindowHandle(3), WindowHandle(1)]
+        );
+    }
+
+    #[test]
+    fn active_modifier_drag_window_events_are_ignored_while_batching() {
+        let mut state = daemon_state([window(1, "One", Rect::from_size(0, 0, 100, 100))]);
+        state.active_modifier_drag = Some(ActiveModifierDrag {
+            window: WindowHandle(1),
+            start_cursor: Point { x: 10, y: 10 },
+            last_cursor: Point { x: 10, y: 10 },
+            start_rect: Rect::from_size(0, 0, 100, 100),
+            move_count: 0,
+            started_temporary_float: true,
+        });
+
+        assert!(state.should_ignore_modifier_drag_window_event(event(WindowEventKind::Moved, 1)));
+        assert!(
+            state
+                .should_ignore_modifier_drag_window_event(event(WindowEventKind::MoveSizeStart, 1))
+        );
+        assert!(
+            state.should_ignore_modifier_drag_window_event(event(WindowEventKind::MoveSizeEnd, 1))
+        );
+    }
+
+    #[test]
+    fn stale_modifier_drag_window_events_are_ignored_after_drop() {
+        let mut state = daemon_state([window(1, "One", Rect::from_size(0, 0, 100, 100))]);
+        state
+            .suppressed_modifier_drag_events
+            .insert(WindowHandle(1));
+
+        state
+            .reconcile_after_events(&[
+                event(WindowEventKind::Moved, 1),
+                event(WindowEventKind::MoveSizeStart, 1),
+                event(WindowEventKind::MoveSizeEnd, 1),
+            ])
+            .unwrap();
+
+        assert!(state.suppressed_modifier_drag_events.is_empty());
+        assert_eq!(
+            state
+                .windows
+                .get(&WindowHandle(1))
+                .map(|window| window.rect),
+            Some(Rect::from_size(0, 0, 100, 100))
         );
     }
 
@@ -3012,6 +3615,8 @@ mod tests {
             window_monitor_overrides: BTreeMap::new(),
             overflow_floating: BTreeSet::new(),
             workspaces: WorkspaceManager::new(9),
+            active_modifier_drag: None,
+            suppressed_modifier_drag_events: BTreeSet::new(),
             config: RuntimeConfig::default(),
             hotkey_commands: HotkeyCommandMap::default(),
         };

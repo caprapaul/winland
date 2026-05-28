@@ -141,6 +141,7 @@ pub struct HotkeysConfig {
     pub panic_hotkey: String,
     pub override_latency_budget_micros: u64,
     pub bypass: HotkeyBypassConfig,
+    pub modifier_drag: ModifierDragConfig,
     pub bindings: Vec<HotkeyBindingConfig>,
 }
 
@@ -151,6 +152,7 @@ impl Default for HotkeysConfig {
             panic_hotkey: "Ctrl+Alt+Shift+P".to_owned(),
             override_latency_budget_micros: 250,
             bypass: HotkeyBypassConfig::default(),
+            modifier_drag: ModifierDragConfig::default(),
             bindings: default_hotkey_bindings(),
         }
     }
@@ -180,6 +182,22 @@ impl Default for HotkeyBypassConfig {
             class: Vec::new(),
             executable_path: Vec::new(),
             process_name: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ModifierDragConfig {
+    pub enabled: bool,
+    pub modifiers: String,
+}
+
+impl Default for ModifierDragConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            modifiers: "Win".to_owned(),
         }
     }
 }
@@ -642,6 +660,28 @@ pub fn parse_hotkey_chord(input: &str) -> Result<HotkeyChord, ConfigError> {
     }
 
     let key_part = parts.pop().expect("parts is not empty");
+    let modifiers = parse_modifier_parts(parts)?;
+
+    let key = parse_hotkey_key(key_part)?;
+    Ok(HotkeyChord { modifiers, key })
+}
+
+pub fn parse_hotkey_modifiers(input: &str) -> Result<BTreeSet<HotkeyModifier>, ConfigError> {
+    let parts: Vec<_> = input
+        .split('+')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect();
+    if parts.is_empty() {
+        return Err(ConfigError::Validation(ValidationErrors(vec![
+            "hotkey modifiers must include at least one modifier".to_owned(),
+        ])));
+    }
+
+    parse_modifier_parts(parts)
+}
+
+fn parse_modifier_parts(parts: Vec<&str>) -> Result<BTreeSet<HotkeyModifier>, ConfigError> {
     let mut modifiers = BTreeSet::new();
     for modifier in parts {
         let parsed = match modifier.to_ascii_lowercase().as_str() {
@@ -663,8 +703,7 @@ pub fn parse_hotkey_chord(input: &str) -> Result<HotkeyChord, ConfigError> {
         }
     }
 
-    let key = parse_hotkey_key(key_part)?;
-    Ok(HotkeyChord { modifiers, key })
+    Ok(modifiers)
 }
 
 fn parse_hotkey_key(input: &str) -> Result<HotkeyKey, ConfigError> {
@@ -871,6 +910,7 @@ fn validate_hotkeys(hotkeys: &HotkeysConfig, workspace_count: u16, errors: &mut 
     }
 
     validate_hotkey_bypass(&hotkeys.bypass, errors);
+    validate_modifier_drag(&hotkeys.modifier_drag, errors);
 
     let mut chords = BTreeSet::new();
     for (index, binding) in hotkeys.bindings.iter().enumerate() {
@@ -943,6 +983,22 @@ fn validate_hotkey_bypass(bypass: &HotkeyBypassConfig, errors: &mut Vec<String>)
     }
     for (index, matcher) in bypass.process_name.iter().enumerate() {
         matcher.validate(format!("hotkeys.bypass.process_name[{index}]"), errors);
+    }
+}
+
+fn validate_modifier_drag(modifier_drag: &ModifierDragConfig, errors: &mut Vec<String>) {
+    if !modifier_drag.enabled {
+        return;
+    }
+
+    match parse_hotkey_modifiers(&modifier_drag.modifiers) {
+        Ok(_) => {}
+        Err(ConfigError::Validation(validation)) => {
+            for error in validation.0 {
+                errors.push(format!("hotkeys.modifier_drag.modifiers: {error}"));
+            }
+        }
+        Err(error) => errors.push(format!("hotkeys.modifier_drag.modifiers: {error}")),
     }
 }
 
@@ -1127,6 +1183,8 @@ mod tests {
         assert_eq!(config.hotkeys.panic_hotkey, "Ctrl+Alt+Shift+P");
         assert_eq!(config.hotkeys.override_latency_budget_micros, 250);
         assert!(config.hotkeys.bypass.fullscreen);
+        assert!(config.hotkeys.modifier_drag.enabled);
+        assert_eq!(config.hotkeys.modifier_drag.modifiers, "Win");
         assert_eq!(config.hotkeys.bindings.len(), 31);
         assert_eq!(config.hotkeys.bindings[0].keys, "Win+T");
         assert_eq!(config.hotkeys.bindings[0].launch.as_deref(), Some("wt.exe"));
@@ -1160,6 +1218,7 @@ mod tests {
             panic_hotkey = "Ctrl+Alt+Shift+P"
             override_latency_budget_micros = 300
             bypass = { fullscreen = true, process_name = ["game.exe"] }
+            modifier_drag = { enabled = true, modifiers = "Alt+Shift" }
             bindings = [
               { keys = "Ctrl+Alt+R", command = "retile", override_app = true },
               { keys = "Win+T", launch = "wt.exe" },
@@ -1204,6 +1263,7 @@ mod tests {
         assert_eq!(config.hotkeys.bindings[1].launch.as_deref(), Some("wt.exe"));
         assert_eq!(config.hotkeys.override_latency_budget_micros, 300);
         assert_eq!(config.hotkeys.bypass.process_name.len(), 1);
+        assert_eq!(config.hotkeys.modifier_drag.modifiers, "Alt+Shift");
         assert_eq!(config.layout_config().kind, LayoutKind::Dwindle);
         assert_eq!(config.layout_config().gap, 8);
         assert!(config.layout_config().smart_split);
@@ -1234,6 +1294,7 @@ mod tests {
             count = 1
 
             [hotkeys]
+            modifier_drag = { enabled = true, modifiers = "Ctrl+Ctrl" }
             bindings = [
               { keys = "Ctrl+Ctrl+R", command = "retile" },
               { keys = "Ctrl+Alt+2", command = "switch-workspace-2" },
@@ -1256,6 +1317,7 @@ mod tests {
         assert!(output.contains("general.log_level"));
         assert!(output.contains("layout.master_ratio_percent"));
         assert!(output.contains("duplicate hotkey modifier"));
+        assert!(output.contains("hotkeys.modifier_drag.modifiers"));
         assert!(output.contains("switch-workspace-2"));
         assert!(output.contains("window_rules[0].action.workspace"));
     }

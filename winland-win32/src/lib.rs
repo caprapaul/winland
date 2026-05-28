@@ -30,29 +30,30 @@ mod platform {
         PIPE_TYPE_MESSAGE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
     };
     use windows::Win32::System::Threading::{
-        GetCurrentThreadId, OpenProcess, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
-        QueryFullProcessImageNameW,
+        AttachThreadInput, GetCurrentThreadId, OpenProcess, PROCESS_NAME_FORMAT,
+        PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
     };
     use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT,
-        MOD_WIN, RegisterHotKey, UnregisterHotKey,
+        MOD_WIN, RegisterHotKey, SetFocus, UnregisterHotKey,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        CallNextHookEx, DispatchMessageW, EVENT_OBJECT_CLOAKED, EVENT_OBJECT_CREATE,
-        EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE,
+        BringWindowToTop, CallNextHookEx, DispatchMessageW, EVENT_OBJECT_CLOAKED,
+        EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE,
         EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_SHOW, EVENT_OBJECT_STATECHANGE,
         EVENT_OBJECT_UNCLOAKED, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND,
         EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZESTART,
-        EnumWindows, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetClassNameW, GetCursorPos,
-        GetForegroundWindow, GetMessageW, GetWindow, GetWindowLongPtrW, GetWindowRect,
-        GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HC_ACTION, HHOOK, IsIconic,
-        IsWindowVisible, KBDLLHOOKSTRUCT, MINMAXINFO, MONITORINFOF_PRIMARY, MSG, OBJID_WINDOW,
-        PostThreadMessageW, SMTO_ABORTIFHUNG, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
-        SWP_NOOWNERZORDER, SWP_NOZORDER, SendMessageTimeoutW, SetForegroundWindow, SetWindowPos,
-        SetWindowsHookExW, ShowWindow, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL,
-        WINEVENT_OUTOFCONTEXT, WM_GETMINMAXINFO, WM_HOTKEY, WM_KEYDOWN, WM_QUIT, WM_SYSKEYDOWN,
-        WS_CAPTION, WS_EX_TOOLWINDOW, WS_THICKFRAME,
+        EnumWindows, GA_ROOT, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetAncestor, GetClassNameW,
+        GetCursorPos, GetForegroundWindow, GetMessageW, GetWindow, GetWindowLongPtrW,
+        GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HC_ACTION,
+        HHOOK, IsIconic, IsWindowVisible, KBDLLHOOKSTRUCT, MINMAXINFO, MONITORINFOF_PRIMARY, MSG,
+        MSLLHOOKSTRUCT, OBJID_WINDOW, PostThreadMessageW, SMTO_ABORTIFHUNG, SW_HIDE,
+        SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER, SendMessageTimeoutW,
+        SetForegroundWindow, SetWindowPos, SetWindowsHookExW, ShowWindow, TranslateMessage,
+        UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WINEVENT_OUTOFCONTEXT, WM_GETMINMAXINFO,
+        WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_QUIT, WM_SYSKEYDOWN,
+        WS_CAPTION, WS_EX_TOOLWINDOW, WS_THICKFRAME, WindowFromPoint,
     };
     use windows::core::{PCWSTR, PWSTR};
     use winland_core::{
@@ -63,15 +64,18 @@ mod platform {
     use crate::{
         HotkeyBinding, HotkeyEvent, HotkeyInterceptionDecision, HotkeyLowLevelEvent,
         HotkeyModifierSet, HotkeyOverrideOptions, HotkeyRegistrationFailure, HotkeyWindowContext,
-        IPC_BUFFER_SIZE, IpcTransportRequest, Result, VirtualKey, Win32Error, WindowEvent,
-        WindowEventKind, classify_intercepted_hotkey, rect_covers_any_monitor,
+        IPC_BUFFER_SIZE, IpcTransportRequest, ModifierDragOptions, MouseDragEvent,
+        MouseDragEventKind, Result, VirtualKey, Win32Error, WindowEvent, WindowEventKind,
+        classify_intercepted_hotkey, modifiers_match, rect_covers_any_monitor,
     };
 
     static EVENT_SENDER: OnceLock<Mutex<Option<Sender<WindowEvent>>>> = OnceLock::new();
     static HOTKEY_SENDER: OnceLock<Mutex<Option<HotkeySenderState>>> = OnceLock::new();
     static HOTKEY_OVERRIDE: OnceLock<Mutex<Option<HotkeyOverrideState>>> = OnceLock::new();
+    static MOUSE_DRAG: OnceLock<Mutex<Option<MouseDragState>>> = OnceLock::new();
     const MINMAXINFO_TIMEOUT_MS: u32 = 50;
     const GEOMETRY_CORRECTION_PASSES: usize = 3;
+    const MODIFIER_DRAG_MOVE_INTERVAL: Duration = Duration::from_millis(16);
 
     pub fn enumerate_windows() -> Result<Vec<WindowInfo>> {
         let mut windows = Vec::new();
@@ -212,12 +216,47 @@ mod platform {
 
     pub fn focus_window(handle: WindowHandle) -> Result<()> {
         let hwnd = hwnd_from_handle(handle);
+        activate_window(hwnd)
+    }
+
+    fn activate_window(hwnd: HWND) -> Result<()> {
+        let current_thread_id = unsafe { GetCurrentThreadId() };
+        // SAFETY: hwnd is a live top-level window handle. Passing None asks
+        // Windows to return the owning GUI thread id without writing a process
+        // id.
+        let target_thread_id = unsafe { GetWindowThreadProcessId(hwnd, None) };
+        // SAFETY: GetForegroundWindow only returns the current foreground HWND.
+        let foreground_hwnd = unsafe { GetForegroundWindow() };
+        let foreground_thread_id = if foreground_hwnd.0.is_null() {
+            0
+        } else {
+            // SAFETY: foreground_hwnd came from GetForegroundWindow and is used
+            // only to query its owning GUI thread id.
+            unsafe { GetWindowThreadProcessId(foreground_hwnd, None) }
+        };
+
+        let _target_input = ThreadInputAttachment::attach(current_thread_id, target_thread_id);
+        let _foreground_input = (foreground_thread_id != target_thread_id)
+            .then(|| ThreadInputAttachment::attach(current_thread_id, foreground_thread_id));
 
         // SAFETY: hwnd is a top-level window handle tracked from documented
-        // enumeration or foreground APIs. SetForegroundWindow may still be
-        // denied by Windows focus rules; the BOOL return is checked below.
+        // enumeration, hit-testing, or foreground APIs. BringWindowToTop and
+        // SetForegroundWindow request activation through the documented window
+        // manager path; their return values are checked or treated as best
+        // effort below.
+        unsafe {
+            let _ = BringWindowToTop(hwnd);
+        }
         let ok = unsafe { SetForegroundWindow(hwnd) };
-        if ok.as_bool() {
+        // SAFETY: With thread input temporarily attached, SetFocus can complete
+        // the activation that a swallowed mouse click would normally perform.
+        unsafe {
+            let _ = SetFocus(hwnd);
+        }
+        // SAFETY: GetForegroundWindow only returns the current foreground HWND.
+        let foreground_after = unsafe { GetForegroundWindow() };
+
+        if ok.as_bool() || foreground_after == hwnd {
             Ok(())
         } else {
             Err(Win32Error::last_error("SetForegroundWindow"))
@@ -367,6 +406,47 @@ mod platform {
         Ok(HotkeyOverrideRegistration { hook })
     }
 
+    pub fn install_modifier_drag(
+        options: ModifierDragOptions,
+        sender: Sender<MouseDragEvent>,
+    ) -> Result<ModifierDragRegistration> {
+        {
+            let mut guard = mouse_drag_slot()
+                .lock()
+                .map_err(|_| Win32Error::ModifierDragLockPoisoned)?;
+            if guard.is_some() {
+                return Err(Win32Error::ModifierDragAlreadyInstalled);
+            }
+
+            *guard = Some(MouseDragState {
+                sender,
+                options,
+                active_drag: None,
+            });
+        }
+
+        // SAFETY: The callback is a process-static low-level mouse hook
+        // procedure. Thread id 0 installs it for the current desktop without
+        // injecting Winland code into other processes.
+        let hook = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(low_level_mouse_proc), None, 0) };
+        let hook = match hook {
+            Ok(hook) => hook,
+            Err(source) => {
+                clear_mouse_drag();
+                return Err(Win32Error::Windows {
+                    context: "SetWindowsHookExW(WH_MOUSE_LL)",
+                    source,
+                });
+            }
+        };
+        if hook.0.is_null() {
+            clear_mouse_drag();
+            return Err(Win32Error::last_error("SetWindowsHookExW(WH_MOUSE_LL)"));
+        }
+
+        Ok(ModifierDragRegistration { hook })
+    }
+
     pub fn request_message_loop_stop() -> Result<()> {
         let thread_id = {
             let guard = hotkey_sender_slot()
@@ -484,6 +564,10 @@ mod platform {
         hook: HHOOK,
     }
 
+    pub struct ModifierDragRegistration {
+        hook: HHOOK,
+    }
+
     pub struct IpcServer {
         _handle: JoinHandle<()>,
     }
@@ -501,6 +585,19 @@ mod platform {
         }
     }
 
+    impl Drop for ModifierDragRegistration {
+        fn drop(&mut self) {
+            // SAFETY: This hook handle was returned by SetWindowsHookExW for
+            // this registration and is unhooked at most once here.
+            let ok = unsafe { UnhookWindowsHookEx(self.hook) };
+            if let Err(error) = ok {
+                warn!(?error, "failed to remove low-level mouse hook");
+            }
+
+            clear_mouse_drag();
+        }
+    }
+
     struct HotkeySenderState {
         sender: Sender<HotkeyEvent>,
         message_thread_id: u32,
@@ -510,6 +607,66 @@ mod platform {
         sender: Sender<HotkeyEvent>,
         bindings: Vec<HotkeyBinding>,
         options: HotkeyOverrideOptions,
+    }
+
+    struct MouseDragState {
+        sender: Sender<MouseDragEvent>,
+        options: ModifierDragOptions,
+        active_drag: Option<ActiveMouseDrag>,
+    }
+
+    struct ActiveMouseDrag {
+        window: WindowHandle,
+        last_cursor: Point,
+        last_sent_move_at: Instant,
+        sent_move: bool,
+    }
+
+    struct ThreadInputAttachment {
+        from: u32,
+        to: u32,
+        attached: bool,
+    }
+
+    impl ThreadInputAttachment {
+        fn attach(from: u32, to: u32) -> Self {
+            if from == 0 || to == 0 || from == to {
+                return Self {
+                    from,
+                    to,
+                    attached: false,
+                };
+            }
+
+            // SAFETY: The thread ids come from documented Win32 thread-query
+            // APIs. The attachment is process-local state and is detached by
+            // this RAII guard.
+            let attached = unsafe { AttachThreadInput(from, to, TRUE).as_bool() };
+            if !attached {
+                debug!(
+                    from_thread = from,
+                    to_thread = to,
+                    error = ?windows::core::Error::from_win32(),
+                    "failed to attach thread input for window activation"
+                );
+            }
+
+            Self { from, to, attached }
+        }
+    }
+
+    impl Drop for ThreadInputAttachment {
+        fn drop(&mut self) {
+            if !self.attached {
+                return;
+            }
+
+            // SAFETY: This reverses the successful AttachThreadInput call made
+            // by ThreadInputAttachment::attach for the same thread pair.
+            unsafe {
+                let _ = AttachThreadInput(self.from, self.to, BOOL(0));
+            }
+        }
     }
 
     struct OwnedPipe(HANDLE);
@@ -800,6 +957,112 @@ mod platform {
         unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) }
     }
 
+    unsafe extern "system" fn low_level_mouse_proc(
+        code: i32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        if code != HC_ACTION as i32 {
+            // SAFETY: Forwarding unhandled hook events preserves the documented
+            // low-level hook chain contract.
+            return unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) };
+        }
+
+        let message = wparam.0 as u32;
+        if !matches!(message, WM_LBUTTONDOWN | WM_MOUSEMOVE | WM_LBUTTONUP) {
+            // SAFETY: See the forwarding note above.
+            return unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) };
+        }
+
+        // SAFETY: For HC_ACTION mouse events, lparam points to an
+        // MSLLHOOKSTRUCT owned by Windows for the duration of this callback.
+        let mouse = unsafe { *(lparam.0 as *const MSLLHOOKSTRUCT) };
+        let cursor = Point {
+            x: mouse.pt.x,
+            y: mouse.pt.y,
+        };
+
+        let Some(slot) = MOUSE_DRAG.get() else {
+            // SAFETY: See the forwarding note above.
+            return unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) };
+        };
+        let Ok(mut guard) = slot.lock() else {
+            warn!("modifier drag lock is poisoned");
+            // SAFETY: See the forwarding note above.
+            return unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) };
+        };
+        let Some(state) = guard.as_mut() else {
+            // SAFETY: See the forwarding note above.
+            return unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) };
+        };
+
+        match message {
+            WM_LBUTTONDOWN => {
+                if !modifiers_match(current_modifier_state(), state.options.modifiers) {
+                    // SAFETY: See the forwarding note above.
+                    return unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) };
+                }
+
+                let Some(window) = modifier_drag_window_at(cursor, &state.options) else {
+                    // SAFETY: See the forwarding note above.
+                    return unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) };
+                };
+
+                let now = Instant::now();
+                state.active_drag = Some(ActiveMouseDrag {
+                    window,
+                    last_cursor: cursor,
+                    last_sent_move_at: now,
+                    sent_move: false,
+                });
+                let _ = state.sender.send(MouseDragEvent {
+                    kind: MouseDragEventKind::Started,
+                    window,
+                    cursor,
+                });
+                LRESULT(1)
+            }
+            WM_MOUSEMOVE => {
+                if let Some(drag) = state.active_drag.as_mut() {
+                    drag.last_cursor = cursor;
+                    let now = Instant::now();
+                    if !drag.sent_move
+                        || now.duration_since(drag.last_sent_move_at) >= MODIFIER_DRAG_MOVE_INTERVAL
+                    {
+                        drag.last_sent_move_at = now;
+                        drag.sent_move = true;
+                        let _ = state.sender.send(MouseDragEvent {
+                            kind: MouseDragEventKind::Moved,
+                            window: drag.window,
+                            cursor,
+                        });
+                    }
+                    LRESULT(1)
+                } else {
+                    // SAFETY: See the forwarding note above.
+                    unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) }
+                }
+            }
+            WM_LBUTTONUP => {
+                if let Some(drag) = state.active_drag.take() {
+                    let _ = state.sender.send(MouseDragEvent {
+                        kind: MouseDragEventKind::Ended,
+                        window: drag.window,
+                        cursor: drag.last_cursor,
+                    });
+                    LRESULT(1)
+                } else {
+                    // SAFETY: See the forwarding note above.
+                    unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) }
+                }
+            }
+            _ => {
+                // SAFETY: See the forwarding note above.
+                unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) }
+            }
+        }
+    }
+
     fn register_hotkey(binding: &HotkeyBinding) -> Result<()> {
         let modifiers = hotkey_modifiers(binding.modifiers);
 
@@ -891,10 +1154,17 @@ mod platform {
             return None;
         }
 
+        hotkey_context_for_window(hwnd, options.bypass.needs_process_metadata())
+    }
+
+    fn hotkey_context_for_window(
+        hwnd: HWND,
+        include_process_metadata: bool,
+    ) -> Option<HotkeyWindowContext> {
         let rect = visible_window_rect(hwnd).or_else(|| window_rect(hwnd).ok());
         let styles = window_styles(hwnd);
-        let executable_path = if options.bypass.needs_process_metadata() {
-            foreground_executable_path(hwnd)
+        let executable_path = if include_process_metadata {
+            window_executable_path(hwnd)
         } else {
             None
         };
@@ -908,15 +1178,66 @@ mod platform {
         })
     }
 
-    fn foreground_executable_path(hwnd: HWND) -> Option<String> {
+    fn window_executable_path(hwnd: HWND) -> Option<String> {
         let mut process_id = 0;
-        // SAFETY: hwnd is the current foreground window. process_id points to
+        // SAFETY: hwnd is a live window handle. process_id points to
         // valid writable storage for the duration of the call.
         unsafe {
             GetWindowThreadProcessId(hwnd, Some(&mut process_id));
         }
 
         executable_path(process_id)
+    }
+
+    fn modifier_drag_window_at(
+        cursor: Point,
+        options: &ModifierDragOptions,
+    ) -> Option<WindowHandle> {
+        let point = POINT {
+            x: cursor.x,
+            y: cursor.y,
+        };
+        // SAFETY: WindowFromPoint only reads the window at the supplied screen
+        // coordinate and does not retain pointers.
+        let mut hwnd = unsafe { WindowFromPoint(point) };
+        if hwnd.0.is_null() {
+            return None;
+        }
+
+        // SAFETY: hwnd came from WindowFromPoint. GA_ROOT asks Windows for the
+        // owning top-level window without mutating application state.
+        hwnd = unsafe { GetAncestor(hwnd, GA_ROOT) };
+        if hwnd.0.is_null() || !is_modifier_drag_candidate(hwnd) {
+            return None;
+        }
+
+        let context = hotkey_context_for_window(hwnd, options.bypass.needs_process_metadata())?;
+        if options.bypass.matches(&context) {
+            return None;
+        }
+
+        Some(handle_from_hwnd(hwnd))
+    }
+
+    fn is_modifier_drag_candidate(hwnd: HWND) -> bool {
+        // SAFETY: hwnd is queried for visibility only.
+        if !unsafe { IsWindowVisible(hwnd).as_bool() } {
+            return false;
+        }
+        if dwm_cloaked(hwnd) {
+            return false;
+        }
+        if layout_window_rect(hwnd).is_ok_and(Rect::is_empty) {
+            return false;
+        }
+
+        match class_name(hwnd) {
+            Ok(class_name) => !matches!(
+                class_name.as_str(),
+                "Progman" | "WorkerW" | "Shell_TrayWnd" | "NotifyIconOverflowWindow"
+            ),
+            Err(_) => true,
+        }
     }
 
     fn rect_matches_monitor(rect: Rect) -> bool {
@@ -1340,6 +1661,10 @@ mod platform {
         HOTKEY_OVERRIDE.get_or_init(|| Mutex::new(None))
     }
 
+    fn mouse_drag_slot() -> &'static Mutex<Option<MouseDragState>> {
+        MOUSE_DRAG.get_or_init(|| Mutex::new(None))
+    }
+
     fn clear_event_sender() {
         match event_sender_slot().lock() {
             Ok(mut guard) => *guard = None,
@@ -1358,6 +1683,13 @@ mod platform {
         match hotkey_override_slot().lock() {
             Ok(mut guard) => *guard = None,
             Err(_) => warn!("hotkey override lock is poisoned while clearing"),
+        }
+    }
+
+    fn clear_mouse_drag() {
+        match mouse_drag_slot().lock() {
+            Ok(mut guard) => *guard = None,
+            Err(_) => warn!("modifier drag lock is poisoned while clearing"),
         }
     }
 
@@ -1382,7 +1714,10 @@ mod shell;
 mod platform {
     use std::sync::mpsc::Sender;
 
-    use crate::{HotkeyBinding, HotkeyEvent, IpcTransportRequest, Result, Win32Error};
+    use crate::{
+        HotkeyBinding, HotkeyEvent, IpcTransportRequest, ModifierDragOptions, MouseDragEvent,
+        Result, Win32Error,
+    };
     use winland_core::{MonitorInfo, Point, Rect, WindowHandle, WindowInfo};
 
     use crate::WindowEvent;
@@ -1444,6 +1779,13 @@ mod platform {
         Err(Win32Error::UnsupportedPlatform)
     }
 
+    pub fn install_modifier_drag(
+        _options: ModifierDragOptions,
+        _sender: Sender<MouseDragEvent>,
+    ) -> Result<ModifierDragRegistration> {
+        Err(Win32Error::UnsupportedPlatform)
+    }
+
     pub fn request_message_loop_stop() -> Result<()> {
         Err(Win32Error::UnsupportedPlatform)
     }
@@ -1466,6 +1808,7 @@ mod platform {
     pub struct WindowEventSubscription;
     pub struct HotkeyRegistration;
     pub struct HotkeyOverrideRegistration;
+    pub struct ModifierDragRegistration;
     pub struct IpcServer;
 
     impl HotkeyRegistration {
@@ -1478,6 +1821,7 @@ mod platform {
 pub use platform::HotkeyOverrideRegistration;
 pub use platform::HotkeyRegistration;
 pub use platform::IpcServer;
+pub use platform::ModifierDragRegistration;
 pub use platform::WindowEventSubscription;
 pub use platform::cursor_position;
 pub use platform::enumerate_monitors;
@@ -1486,6 +1830,7 @@ pub use platform::focus_window;
 pub use platform::foreground_window;
 pub use platform::hide_window;
 pub use platform::install_hotkey_override;
+pub use platform::install_modifier_drag;
 pub use platform::move_resize_window;
 pub use platform::register_hotkeys;
 pub use platform::request_message_loop_stop;
@@ -1642,6 +1987,12 @@ pub struct HotkeyOverrideOptions {
     pub latency_budget: Duration,
 }
 
+#[derive(Debug, Clone)]
+pub struct ModifierDragOptions {
+    pub modifiers: HotkeyModifierSet,
+    pub bypass: HotkeyBypassRules,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct HotkeyBypassRules {
     pub fullscreen: bool,
@@ -1788,7 +2139,7 @@ impl HotkeyLowLevelEvent {
     }
 }
 
-fn modifiers_match(actual: HotkeyModifierSet, expected: HotkeyModifierSet) -> bool {
+pub(crate) fn modifiers_match(actual: HotkeyModifierSet, expected: HotkeyModifierSet) -> bool {
     actual.alt == expected.alt
         && actual.control == expected.control
         && actual.shift == expected.shift
@@ -1810,6 +2161,20 @@ pub struct WindowEvent {
     pub kind: WindowEventKind,
     pub window: WindowHandle,
     pub event_time: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MouseDragEvent {
+    pub kind: MouseDragEventKind,
+    pub window: WindowHandle,
+    pub cursor: winland_core::Point,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseDragEventKind {
+    Started,
+    Moved,
+    Ended,
 }
 
 #[derive(Debug)]
@@ -1859,6 +2224,10 @@ pub enum Win32Error {
     HotkeyOverrideAlreadyInstalled,
     #[error("hotkey override hook state lock is poisoned")]
     HotkeyOverrideLockPoisoned,
+    #[error("modifier drag hook is already installed")]
+    ModifierDragAlreadyInstalled,
+    #[error("modifier drag hook state lock is poisoned")]
+    ModifierDragLockPoisoned,
     #[cfg(windows)]
     #[error("failed to register hotkey {id} ({description}): {source}")]
     HotkeyRegistration {

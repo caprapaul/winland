@@ -36,7 +36,7 @@ cargo run -p winland-cli -- state
 cargo run -p winland-cli -- state --json
 ```
 
-Human output includes config version/path, total/manageable/floating counts, active workspace, foreground HWND, monitor workspace state, and window participation.
+Human output includes config version/path, total/manageable/floating counts, active workspace, foreground HWND, lightweight performance counters, monitor workspace state, and window participation.
 
 JSON output matches the current IPC snapshot shape:
 
@@ -51,6 +51,16 @@ JSON output matches the current IPC snapshot shape:
   "temporary_floating_windows": 0,
   "active_workspace": 1,
   "foreground_window": 51966,
+  "performance": {
+    "relayout_count": 12,
+    "skipped_relayout_count": 7,
+    "last_relayout_duration_ms": 2,
+    "last_relayout_move_count": 3,
+    "managed_window_count": 2,
+    "border_window_count": 2,
+    "game_mode_active": false,
+    "config_reload_count": 1
+  },
   "monitors": [
     { "monitor_id": 1, "workspace_id": 1, "focused": true }
   ],
@@ -168,4 +178,3 @@ These commands exist, but they are not normal Winland startup. Use them only in 
 | `shell install-elevated-task --experimental` | Create/update the elevated daemon scheduled task. |
 | `shell uninstall-elevated-task --experimental` | Delete the elevated daemon scheduled task. |
 | `shell elevated-task-status` | Report whether the elevated task exists. |
-

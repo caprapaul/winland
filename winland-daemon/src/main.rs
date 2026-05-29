@@ -2,10 +2,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 use tracing::{debug, info, warn};
@@ -25,9 +26,9 @@ use winland_core::{
     tile_layout_windows_with_config, tile_layout_windows_with_state,
 };
 use winland_ipc::{
-    DaemonStateSnapshot, IpcCommand, IpcRequest, IpcResponse, MonitorStateSnapshot,
-    ReloadConfigReport, WindowParticipationSnapshot, WindowStateSnapshot, decode_request,
-    encode_response,
+    DaemonPerformanceSnapshot, DaemonStateSnapshot, IpcCommand, IpcRequest, IpcResponse,
+    MonitorStateSnapshot, ReloadConfigReport, WindowParticipationSnapshot, WindowStateSnapshot,
+    decode_request, encode_response,
 };
 use winland_win32::{
     BorderColor, BorderManager, BorderUpdate, HotkeyBinding, HotkeyBypassRules, HotkeyEvent,
@@ -37,9 +38,13 @@ use winland_win32::{
 };
 
 const RECONCILE_DEBOUNCE: Duration = Duration::from_millis(50);
+const LOW_LATENCY_MOVE_DEBOUNCE: Duration = Duration::from_millis(8);
+const INTERACTIVE_DRAG_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const MAX_BATCH_SIZE: usize = 512;
 const TILE_FEEDBACK_PASSES: usize = 3;
 const TILE_FEEDBACK_TOLERANCE_PX: i32 = 0;
+const LAYOUT_APPLY_TOLERANCE_PX: i32 = 1;
+const GAME_MODE_FULLSCREEN_DEACTIVATE_CONFIRMATIONS: u8 = 2;
 
 fn main() -> Result<()> {
     let loaded_config = winland_config::load_or_default(None).context("load Winland config")?;
@@ -54,10 +59,10 @@ fn main() -> Result<()> {
     let window_bridge = spawn_window_bridge(window_receiver, daemon_sender.clone())
         .context("spawn window event bridge")?;
     let (ipc_sender, ipc_receiver) = mpsc::channel();
-    let _ipc_server =
+    let ipc_server =
         winland_win32::spawn_ipc_server(winland_win32::DEFAULT_IPC_PIPE_NAME, ipc_sender)
             .context("start local IPC named pipe server")?;
-    let _ipc_bridge = spawn_ipc_bridge(ipc_receiver, daemon_sender.clone())
+    let ipc_bridge = spawn_ipc_bridge(ipc_receiver, daemon_sender.clone())
         .context("spawn IPC request bridge")?;
 
     let (hotkey_sender, hotkey_receiver) = mpsc::channel();
@@ -77,6 +82,8 @@ fn main() -> Result<()> {
     let modifier_drag = install_modifier_drag(&loaded_config.config, mouse_drag_sender.clone())?;
     let mouse_drag_bridge = spawn_mouse_drag_bridge(mouse_drag_receiver, daemon_sender.clone())
         .context("spawn modifier drag bridge")?;
+    let shutdown_sender = daemon_sender.clone();
+    let processor_sender = shutdown_sender.clone();
     drop(daemon_sender);
 
     let mut state = DaemonState::discover(runtime_config, hotkey_commands)
@@ -93,7 +100,7 @@ fn main() -> Result<()> {
     state.sync_borders("startup border sync")?;
     let processor = thread::Builder::new()
         .name("winland-daemon-events".to_owned())
-        .spawn(move || process_daemon_events(daemon_receiver, state))
+        .spawn(move || process_daemon_events(daemon_receiver, state, processor_sender))
         .context("spawn daemon event processor")?;
 
     info!("winland daemon started; entering Win32 message loop");
@@ -101,15 +108,21 @@ fn main() -> Result<()> {
         winland_win32::run_message_loop().context("run Win32 daemon message loop");
 
     drop(subscription);
-    join_bridge(window_bridge, "window event bridge")?;
-    join_bridge(hotkey_bridge, "hotkey bridge")?;
-    join_bridge(mouse_drag_bridge, "modifier drag bridge")?;
+    drop(ipc_server);
+    let _ = shutdown_sender.send(DaemonEvent::Shutdown);
 
-    match processor.join() {
+    let processor_result = match processor.join() {
         Ok(Ok(())) => message_loop_result,
         Ok(Err(error)) => Err(error).context("process daemon events"),
         Err(_) => Err(anyhow!("daemon event processor thread panicked")),
-    }
+    };
+
+    join_bridge(window_bridge, "window event bridge")?;
+    join_bridge(hotkey_bridge, "hotkey bridge")?;
+    join_bridge(mouse_drag_bridge, "modifier drag bridge")?;
+    join_bridge(ipc_bridge, "IPC request bridge")?;
+
+    processor_result
 }
 
 fn init_tracing(default_level: &str) {
@@ -481,26 +494,131 @@ fn join_bridge(handle: JoinHandle<()>, name: &'static str) -> Result<()> {
     handle.join().map_err(|_| anyhow!("{name} thread panicked"))
 }
 
-fn process_daemon_events(receiver: Receiver<DaemonEvent>, mut state: DaemonState) -> Result<()> {
+fn process_daemon_events(
+    receiver: Receiver<DaemonEvent>,
+    mut state: DaemonState,
+    sender: Sender<DaemonEvent>,
+) -> Result<()> {
     state.log_snapshot("initial window snapshot");
+    let mut interactive_drag_tracker = None;
 
     while let Ok(event) = receiver.recv() {
         match event {
             DaemonEvent::Window(first_event) => {
-                if should_process_window_event_immediately(first_event) {
-                    state.reconcile_after_events(&[first_event])?;
+                if state.should_process_moved_event_immediately(first_event) {
+                    process_window_batch(
+                        &mut state,
+                        &mut interactive_drag_tracker,
+                        &sender,
+                        &[first_event],
+                    )?;
+                } else if first_event.kind == WindowEventKind::Moved {
+                    let Some(batch) = receive_window_batch_with_timeout(
+                        &receiver,
+                        &mut state,
+                        first_event,
+                        LOW_LATENCY_MOVE_DEBOUNCE,
+                    )?
+                    else {
+                        break;
+                    };
+                    process_window_batch(
+                        &mut state,
+                        &mut interactive_drag_tracker,
+                        &sender,
+                        &batch,
+                    )?;
+                } else if should_process_window_event_immediately(first_event) {
+                    process_window_batch(
+                        &mut state,
+                        &mut interactive_drag_tracker,
+                        &sender,
+                        &[first_event],
+                    )?;
                 } else {
-                    let batch = receive_window_batch(&receiver, &mut state, first_event)?;
-                    state.reconcile_after_events(&batch)?;
+                    let Some(batch) = receive_window_batch(&receiver, &mut state, first_event)?
+                    else {
+                        break;
+                    };
+                    process_window_batch(
+                        &mut state,
+                        &mut interactive_drag_tracker,
+                        &sender,
+                        &batch,
+                    )?;
                 }
             }
             DaemonEvent::Hotkey(event) => state.handle_hotkey_event(event),
-            DaemonEvent::MouseDrag(event) => state.handle_mouse_drag(event)?,
+            DaemonEvent::MouseDrag(event) => {
+                state.handle_mouse_drag(event)?;
+                sync_interactive_drag_tracker(
+                    &mut interactive_drag_tracker,
+                    &sender,
+                    state.active_interactive_drag_window(),
+                    &[],
+                );
+            }
             DaemonEvent::Ipc(request) => state.handle_ipc(request),
+            DaemonEvent::InteractiveDragTick { window, cursor } => {
+                state.handle_interactive_drag_tick(window, cursor)?
+            }
+            DaemonEvent::InteractiveDragEnded { window } => {
+                state.finish_interactive_drag(window);
+                if interactive_drag_tracker
+                    .as_ref()
+                    .is_some_and(|tracker| tracker.window == window)
+                {
+                    interactive_drag_tracker = None;
+                }
+            }
+            DaemonEvent::Shutdown => break,
         }
     }
 
+    drop(interactive_drag_tracker);
     info!("daemon event channel closed; event processor stopping");
+    Ok(())
+}
+
+fn process_window_batch(
+    state: &mut DaemonState,
+    interactive_drag_tracker: &mut Option<InteractiveDragTracker>,
+    sender: &Sender<DaemonEvent>,
+    batch: &[WindowEvent],
+) -> Result<()> {
+    let movesize_start = batch
+        .iter()
+        .find(|event| event.kind == WindowEventKind::MoveSizeStart)
+        .map(|event| event.window);
+    if let Some(window) = movesize_start {
+        let monitors = winland_win32::enumerate_monitors()
+            .context("enumerate monitors for native drag prestart")?;
+        state.start_interactive_drag(window, &monitors);
+        sync_interactive_drag_tracker(
+            interactive_drag_tracker,
+            sender,
+            state.active_interactive_drag_window(),
+            batch,
+        );
+        state.sync_border_geometry_with_monitors(&monitors, "native drag prestart borders")?;
+    } else if let Some(monitors) = state.start_interactive_drag_from_moved_events(batch)? {
+        sync_interactive_drag_tracker(
+            interactive_drag_tracker,
+            sender,
+            state.active_interactive_drag_window(),
+            batch,
+        );
+        state
+            .sync_border_geometry_with_monitors(&monitors, "native drag inferred-start borders")?;
+    }
+
+    state.reconcile_after_events(batch)?;
+    sync_interactive_drag_tracker(
+        interactive_drag_tracker,
+        sender,
+        state.active_interactive_drag_window(),
+        batch,
+    );
     Ok(())
 }
 
@@ -518,20 +636,50 @@ fn receive_window_batch(
     receiver: &Receiver<DaemonEvent>,
     state: &mut DaemonState,
     first_event: WindowEvent,
-) -> Result<Vec<WindowEvent>> {
+) -> Result<Option<Vec<WindowEvent>>> {
+    receive_window_batch_with_timeout(receiver, state, first_event, RECONCILE_DEBOUNCE)
+}
+
+fn receive_window_batch_with_timeout(
+    receiver: &Receiver<DaemonEvent>,
+    state: &mut DaemonState,
+    first_event: WindowEvent,
+    timeout: Duration,
+) -> Result<Option<Vec<WindowEvent>>> {
     let mut batch = vec![first_event];
 
     while batch.len() < MAX_BATCH_SIZE {
-        match receiver.recv_timeout(RECONCILE_DEBOUNCE) {
+        match receiver.recv_timeout(timeout) {
             Ok(DaemonEvent::Window(event)) => batch.push(event),
             Ok(DaemonEvent::Hotkey(event)) => state.handle_hotkey_event(event),
             Ok(DaemonEvent::MouseDrag(event)) => state.handle_mouse_drag(event)?,
             Ok(DaemonEvent::Ipc(request)) => state.handle_ipc(request),
+            Ok(DaemonEvent::InteractiveDragTick { window, cursor }) => {
+                state.handle_interactive_drag_tick(window, cursor)?
+            }
+            Ok(DaemonEvent::InteractiveDragEnded { window }) => {
+                state.finish_interactive_drag(window);
+            }
+            Ok(DaemonEvent::Shutdown) => return Ok(None),
             Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
         }
     }
 
-    Ok(batch)
+    Ok(Some(batch))
+}
+
+fn coalesce_window_events(batch: &[WindowEvent]) -> Vec<WindowEvent> {
+    let mut seen = BTreeSet::new();
+    let mut coalesced = Vec::with_capacity(batch.len());
+
+    for event in batch.iter().rev().copied() {
+        if seen.insert((event.kind, event.window)) {
+            coalesced.push(event);
+        }
+    }
+
+    coalesced.reverse();
+    coalesced
 }
 
 #[derive(Debug)]
@@ -540,6 +688,109 @@ enum DaemonEvent {
     Hotkey(HotkeyEvent),
     MouseDrag(MouseDragEvent),
     Ipc(IpcTransportRequest),
+    InteractiveDragTick { window: WindowHandle, cursor: Point },
+    InteractiveDragEnded { window: WindowHandle },
+    Shutdown,
+}
+
+struct InteractiveDragTracker {
+    window: WindowHandle,
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl InteractiveDragTracker {
+    fn start(window: WindowHandle, sender: Sender<DaemonEvent>) -> Result<Self> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let handle = thread::Builder::new()
+            .name("winland-native-drag-tracker".to_owned())
+            .spawn(move || {
+                let mut last_cursor = None;
+                while !worker_stop.load(Ordering::Relaxed) {
+                    if !winland_win32::left_mouse_button_is_down() {
+                        let _ = sender.send(DaemonEvent::InteractiveDragEnded { window });
+                        break;
+                    }
+
+                    match winland_win32::cursor_position() {
+                        Ok(cursor) if last_cursor != Some(cursor) => {
+                            last_cursor = Some(cursor);
+                            if sender
+                                .send(DaemonEvent::InteractiveDragTick { window, cursor })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            debug!(window = %window, %error, "stopping native drag tracker");
+                            break;
+                        }
+                    }
+
+                    thread::sleep(INTERACTIVE_DRAG_POLL_INTERVAL);
+                }
+            })
+            .context("spawn native drag tracker")?;
+
+        Ok(Self {
+            window,
+            stop,
+            handle: Some(handle),
+        })
+    }
+}
+
+impl Drop for InteractiveDragTracker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take()
+            && handle.join().is_err()
+        {
+            warn!(
+                window = %self.window,
+                "native drag tracker thread panicked while stopping"
+            );
+        }
+    }
+}
+
+fn sync_interactive_drag_tracker(
+    tracker: &mut Option<InteractiveDragTracker>,
+    sender: &Sender<DaemonEvent>,
+    active_drag: Option<WindowHandle>,
+    batch: &[WindowEvent],
+) {
+    let tracker_window = tracker.as_ref().map(|tracker| tracker.window);
+    let ended = batch.iter().any(|event| {
+        event.kind == WindowEventKind::MoveSizeEnd && Some(event.window) == tracker_window
+    });
+
+    if ended || tracker_window.is_some() && tracker_window != active_drag {
+        *tracker = None;
+    }
+
+    let Some(active_drag) = active_drag else {
+        return;
+    };
+
+    if tracker
+        .as_ref()
+        .is_some_and(|tracker| tracker.window == active_drag)
+    {
+        return;
+    }
+
+    match InteractiveDragTracker::start(active_drag, sender.clone()) {
+        Ok(next) => {
+            *tracker = Some(next);
+        }
+        Err(error) => {
+            warn!(window = %active_drag, %error, "failed to start native drag tracker");
+        }
+    }
 }
 
 struct DaemonState {
@@ -554,7 +805,7 @@ struct DaemonState {
     overflow_floating: BTreeSet<WindowHandle>,
     workspaces: WorkspaceManager,
     active_modifier_drag: Option<ActiveModifierDrag>,
-    active_interactive_drag: Option<WindowHandle>,
+    active_interactive_drag: Option<ActiveInteractiveDrag>,
     suppressed_modifier_drag_events: BTreeSet<WindowHandle>,
     config: RuntimeConfig,
     source_config: Config,
@@ -568,11 +819,42 @@ struct DaemonState {
     mouse_drag_sender: Option<Sender<MouseDragEvent>>,
     border_manager: Option<BorderManager>,
     game_mode: GameModeRuntimeState,
+    perf: DaemonPerformance,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct GameModeRuntimeState {
     active: Option<GameModeActivation>,
+    fullscreen_deactivate_misses: u8,
+}
+
+#[derive(Debug, Clone, Default)]
+struct DaemonPerformance {
+    relayout_count: u64,
+    skipped_relayout_count: u64,
+    last_relayout_duration: Duration,
+    last_relayout_move_count: usize,
+    border_window_count: usize,
+    config_reload_count: u64,
+}
+
+impl DaemonPerformance {
+    fn snapshot(
+        &self,
+        managed_window_count: usize,
+        game_mode_active: bool,
+    ) -> DaemonPerformanceSnapshot {
+        DaemonPerformanceSnapshot {
+            relayout_count: self.relayout_count,
+            skipped_relayout_count: self.skipped_relayout_count,
+            last_relayout_duration_ms: saturating_duration_millis(self.last_relayout_duration),
+            last_relayout_move_count: self.last_relayout_move_count,
+            managed_window_count,
+            border_window_count: self.border_window_count,
+            game_mode_active,
+            config_reload_count: self.config_reload_count,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -609,6 +891,14 @@ struct ActiveModifierDrag {
     start_rect: Rect,
     move_count: u32,
     started_temporary_float: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveInteractiveDrag {
+    window: WindowHandle,
+    start_cursor: Point,
+    start_rect: Rect,
+    monitors: Vec<MonitorInfo>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -654,6 +944,7 @@ impl DaemonState {
             mouse_drag_sender: None,
             border_manager: None,
             game_mode: GameModeRuntimeState::default(),
+            perf: DaemonPerformance::default(),
         };
         state.tile_order = state.manageable_handles_sorted();
         state.sync_workspace_state(&monitors);
@@ -691,7 +982,28 @@ impl DaemonState {
         self.sync_workspace_state(monitors);
         let detection = self.current_game_mode_detection(monitors);
         let previous = self.game_mode.active.clone();
-        let next = self.activation_from_detection(detection, monitors);
+        let mut next = self.activation_from_detection(detection, monitors);
+        let mut retained_fullscreen_misses = 0;
+        if next.is_none()
+            && let Some(previous_active) = previous.as_ref()
+            && self.should_confirm_fullscreen_game_mode_deactivation(previous_active)
+        {
+            let misses = self
+                .game_mode
+                .fullscreen_deactivate_misses
+                .saturating_add(1);
+            if misses < GAME_MODE_FULLSCREEN_DEACTIVATE_CONFIRMATIONS {
+                retained_fullscreen_misses = misses;
+                next = Some(previous_active.clone());
+                debug!(
+                    focused = %previous_active.window,
+                    misses,
+                    required = GAME_MODE_FULLSCREEN_DEACTIVATE_CONFIRMATIONS,
+                    operation,
+                    "retained fullscreen game mode pending deactivation confirmation"
+                );
+            }
+        }
         let transition = GameModeTransition {
             activated: previous.is_none() && next.is_some(),
             deactivated: previous.is_some() && next.is_none(),
@@ -733,6 +1045,11 @@ impl DaemonState {
         }
 
         self.game_mode.active = next;
+        self.game_mode.fullscreen_deactivate_misses = if retained_fullscreen_misses > 0 {
+            retained_fullscreen_misses
+        } else {
+            0
+        };
 
         winland_win32::set_input_hooks_paused(
             self.game_mode
@@ -743,13 +1060,20 @@ impl DaemonState {
 
         if self.game_mode_hides_borders()
             && let Some(manager) = &self.border_manager
+            && let Err(error) = manager.clear()
         {
-            manager
-                .clear()
-                .context("clear border overlays for game mode")?;
+            warn!(%error, operation, "failed to hide border overlays for game mode");
         }
 
         Ok(transition)
+    }
+
+    fn should_confirm_fullscreen_game_mode_deactivation(
+        &self,
+        active: &GameModeActivation,
+    ) -> bool {
+        self.foreground == Some(active.window)
+            && matches!(active.reason, GameModeReason::Fullscreen { .. })
     }
 
     fn current_game_mode_detection(&self, monitors: &[MonitorInfo]) -> GameModeDetection {
@@ -819,15 +1143,6 @@ impl DaemonState {
     }
 
     fn reconcile_after_events(&mut self, batch: &[WindowEvent]) -> Result<()> {
-        for event in batch {
-            debug!(
-                kind = ?event.kind,
-                window = %event.window,
-                event_time = event.event_time,
-                "observed window event"
-            );
-        }
-
         let filtered_batch: Vec<_> = batch
             .iter()
             .copied()
@@ -844,7 +1159,15 @@ impl DaemonState {
         if filtered_batch.is_empty() {
             return Ok(());
         }
-        let batch = filtered_batch.as_slice();
+        let coalesced_batch = coalesce_window_events(&filtered_batch);
+        if coalesced_batch.len() < filtered_batch.len() {
+            debug!(
+                original_event_count = filtered_batch.len(),
+                coalesced_event_count = coalesced_batch.len(),
+                "coalesced duplicate window events"
+            );
+        }
+        let batch = coalesced_batch.as_slice();
 
         if self.reconcile_low_latency_window_events(batch)? {
             return Ok(());
@@ -866,13 +1189,16 @@ impl DaemonState {
         let hotkey_sender = self.hotkey_sender.clone();
         let modifier_drag = self.modifier_drag.take();
         let mouse_drag_sender = self.mouse_drag_sender.clone();
+        let perf = self.perf.clone();
         *self = refreshed;
         self.border_manager = border_manager;
         self.hotkey_backend = hotkey_backend;
         self.hotkey_sender = hotkey_sender;
         self.modifier_drag = modifier_drag;
         self.mouse_drag_sender = mouse_drag_sender;
+        self.perf = perf;
         let transition = self.update_game_mode(&monitors, "event reconciliation")?;
+        self.refresh_active_interactive_drag_rect_from_cursor(&monitors);
         let mut event_plan = self.plan_after_window_events(batch, &diff, &monitors);
         if transition.deactivated && self.config.dynamic_retile {
             event_plan.moves = self.tile_assignments(&monitors);
@@ -955,6 +1281,14 @@ impl DaemonState {
             || self.suppressed_modifier_drag_events.contains(&event.window))
     }
 
+    fn should_process_moved_event_immediately(&self, event: WindowEvent) -> bool {
+        event.kind == WindowEventKind::Moved
+            && (self.active_interactive_drag_window() == Some(event.window)
+                || self
+                    .active_modifier_drag
+                    .is_some_and(|drag| drag.window == event.window))
+    }
+
     fn reconcile_low_latency_window_events(&mut self, batch: &[WindowEvent]) -> Result<bool> {
         if batch.is_empty() {
             return Ok(true);
@@ -1011,6 +1345,9 @@ impl DaemonState {
             }
             handles.insert(event.window);
         }
+        let active_drag_move = handles
+            .iter()
+            .any(|window| self.active_interactive_drag_window() == Some(*window));
 
         let monitors = winland_win32::enumerate_monitors()
             .context("enumerate monitors for low-latency move event")?;
@@ -1022,7 +1359,8 @@ impl DaemonState {
                 return Ok(false);
             };
             let old_monitor = monitor_for_rect(old_rect, &monitors);
-            let rect = winland_win32::window_rect_for_handle(window)
+            let rect = self
+                .current_move_event_rect(window, active_drag_move)
                 .with_context(|| format!("read moved window rect for {window}"))?;
             let new_monitor = monitor_for_rect(rect, &monitors);
 
@@ -1054,7 +1392,11 @@ impl DaemonState {
 
         if moved_between_monitors && self.config.dynamic_retile {
             if self.game_mode_pauses_layouts() {
-                self.sync_borders_with_monitors(&monitors, "low-latency moved borders")?;
+                self.sync_drag_border_geometry_with_monitors(
+                    &monitors,
+                    active_drag_move,
+                    "low-latency moved borders",
+                )?;
                 return Ok(true);
             }
             let assignments = self.tile_assignments(&monitors);
@@ -1075,8 +1417,82 @@ impl DaemonState {
             );
         }
 
-        self.sync_borders_with_monitors(&monitors, "low-latency moved borders")?;
+        self.sync_drag_border_geometry_with_monitors(
+            &monitors,
+            active_drag_move,
+            "low-latency moved borders",
+        )?;
         Ok(true)
+    }
+
+    fn current_move_event_rect(
+        &self,
+        window: WindowHandle,
+        active_drag_move: bool,
+    ) -> winland_win32::Result<Rect> {
+        if active_drag_move && self.active_interactive_drag_window() == Some(window) {
+            if let Ok(cursor) = winland_win32::cursor_position()
+                && let Some(rect) = self.interactive_drag_rect_from_cursor(window, cursor)
+            {
+                return Ok(rect);
+            }
+
+            if let Some(info) = self.windows.get(&window) {
+                return Ok(info.rect);
+            }
+        }
+
+        match winland_win32::window_rect_for_handle(window) {
+            Ok(rect) => Ok(rect),
+            Err(error)
+                if active_drag_move && self.active_interactive_drag_window() == Some(window) =>
+            {
+                if let Some(info) = self.windows.get(&window) {
+                    Ok(info.rect)
+                } else {
+                    Err(error)
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn handle_interactive_drag_tick(&mut self, window: WindowHandle, cursor: Point) -> Result<()> {
+        let Some(monitors) = self.active_interactive_drag_monitors(window) else {
+            return Ok(());
+        };
+        let Some(rect) = self.interactive_drag_rect_from_cursor(window, cursor) else {
+            return Ok(());
+        };
+        if self.apply_interactive_drag_rect(window, rect, &monitors) {
+            self.sync_border_geometry_with_monitors(&monitors, "native drag tracker borders")?;
+        }
+        Ok(())
+    }
+
+    fn apply_interactive_drag_rect(
+        &mut self,
+        window: WindowHandle,
+        rect: Rect,
+        monitors: &[MonitorInfo],
+    ) -> bool {
+        if self.active_interactive_drag_window() != Some(window)
+            || !self.windows.contains_key(&window)
+        {
+            return false;
+        }
+
+        if let Some(info) = self.windows.get_mut(&window) {
+            if info.rect == rect {
+                return false;
+            }
+            info.rect = rect;
+        }
+        self.workspaces.update_window_rect(window, rect);
+        if let Some(monitor) = monitor_for_rect(rect, monitors) {
+            self.window_monitor_overrides.insert(window, monitor);
+        }
+        true
     }
 
     fn reconcile_movesize_event(&mut self, event: WindowEvent) -> Result<bool> {
@@ -1086,18 +1502,18 @@ impl DaemonState {
 
         let monitors = winland_win32::enumerate_monitors()
             .context("enumerate monitors for low-latency movesize event")?;
-        if let Ok(rect) = winland_win32::window_rect_for_handle(event.window) {
-            if let Some(info) = self.windows.get_mut(&event.window) {
-                info.rect = rect;
-            }
-            self.workspaces.update_window_rect(event.window, rect);
-            if let Some(monitor) = monitor_for_rect(rect, &monitors) {
-                self.window_monitor_overrides.insert(event.window, monitor);
-            }
-        }
 
         let transition = self.update_game_mode(&monitors, "low-latency movesize update")?;
-        let plan = self.plan_after_window_events(&[event], &SnapshotDiff::default(), &monitors);
+        let sync_drag_start_borders = event.kind == WindowEventKind::MoveSizeStart;
+        let plan = if sync_drag_start_borders {
+            let plan = self.plan_after_window_events(&[event], &SnapshotDiff::default(), &monitors);
+            self.refresh_movesize_event_rect(event.window, &monitors);
+            self.sync_border_geometry_with_monitors(&monitors, "native drag start borders")?;
+            plan
+        } else {
+            self.refresh_movesize_event_rect(event.window, &monitors);
+            self.plan_after_window_events(&[event], &SnapshotDiff::default(), &monitors)
+        };
         let moves = if transition.deactivated && self.config.dynamic_retile {
             self.tile_assignments(&monitors)
         } else if self.game_mode_pauses_layouts() {
@@ -1116,6 +1532,48 @@ impl DaemonState {
         Ok(true)
     }
 
+    fn refresh_movesize_event_rect(&mut self, window: WindowHandle, monitors: &[MonitorInfo]) {
+        if self.active_interactive_drag_window() == Some(window) {
+            self.refresh_active_interactive_drag_rect_from_cursor(monitors);
+            return;
+        }
+
+        if let Ok(rect) = winland_win32::window_rect_for_handle(window) {
+            self.update_cached_window_rect(window, rect, monitors);
+        }
+    }
+
+    fn update_cached_window_rect(
+        &mut self,
+        window: WindowHandle,
+        rect: Rect,
+        monitors: &[MonitorInfo],
+    ) {
+        if let Some(info) = self.windows.get_mut(&window) {
+            info.rect = rect;
+        }
+        self.workspaces.update_window_rect(window, rect);
+        if let Some(monitor) = monitor_for_rect(rect, monitors) {
+            self.window_monitor_overrides.insert(window, monitor);
+        }
+    }
+
+    fn refresh_active_interactive_drag_rect_from_cursor(
+        &mut self,
+        monitors: &[MonitorInfo],
+    ) -> bool {
+        let Some(window) = self.active_interactive_drag_window() else {
+            return false;
+        };
+        let Some(rect) = winland_win32::cursor_position()
+            .ok()
+            .and_then(|cursor| self.interactive_drag_rect_from_cursor(window, cursor))
+        else {
+            return false;
+        };
+        self.apply_interactive_drag_rect(window, rect, monitors)
+    }
+
     fn handle_mouse_drag(&mut self, event: MouseDragEvent) -> Result<()> {
         if self.game_mode_pauses_layouts() {
             debug!(
@@ -1130,7 +1588,47 @@ impl DaemonState {
             MouseDragEventKind::Started => self.start_modifier_drag(event),
             MouseDragEventKind::Moved => self.move_modifier_drag(event),
             MouseDragEventKind::Ended => self.end_modifier_drag(event),
+            MouseDragEventKind::TitlebarStarted => self.start_titlebar_drag(event),
+            MouseDragEventKind::TitlebarMoved => {
+                self.handle_interactive_drag_tick(event.window, event.cursor)
+            }
+            MouseDragEventKind::TitlebarEnded => {
+                self.finish_interactive_drag(event.window);
+                Ok(())
+            }
         }
+    }
+
+    fn start_titlebar_drag(&mut self, event: MouseDragEvent) -> Result<()> {
+        if self.active_modifier_drag.is_some()
+            || self.active_interactive_drag_window() == Some(event.window)
+        {
+            return Ok(());
+        }
+
+        let monitors = winland_win32::enumerate_monitors()
+            .context("enumerate monitors before native titlebar drag start")?;
+        self.start_interactive_drag_with_cursor(event.window, event.cursor, &monitors);
+        if self.active_interactive_drag_window() == Some(event.window) {
+            if let Some(drag) = self.active_interactive_drag.as_ref() {
+                let (title, class_name) = self
+                    .windows
+                    .get(&event.window)
+                    .map(|window| (window.title.as_str(), window.class_name.as_str()))
+                    .unwrap_or(("", ""));
+                info!(
+                    window = %event.window,
+                    title,
+                    class_name,
+                    start_cursor_x = drag.start_cursor.x,
+                    start_cursor_y = drag.start_cursor.y,
+                    start_rect = %drag.start_rect,
+                    "started native titlebar drag"
+                );
+            }
+            self.sync_border_geometry_with_monitors(&monitors, "native titlebar down borders")?;
+        }
+        Ok(())
     }
 
     fn start_modifier_drag(&mut self, event: MouseDragEvent) -> Result<()> {
@@ -1358,6 +1856,7 @@ impl DaemonState {
     }
 
     fn state_snapshot_with_monitors(&self, monitors: &[MonitorInfo]) -> DaemonStateSnapshot {
+        let manageable_windows = self.manageable_window_count();
         DaemonStateSnapshot {
             config_path: self
                 .config_path
@@ -1366,13 +1865,16 @@ impl DaemonState {
             config_version: self.config_version,
             config_loaded_at_unix_ms: system_time_unix_ms(self.config_loaded_at),
             total_windows: self.windows.len(),
-            manageable_windows: self.manageable_window_count(),
+            manageable_windows,
             floating_windows: self.floating_window_count(),
             temporary_floating_windows: self.temporary_floating_window_count(),
             active_workspace: self.workspaces.active_workspace().0,
             foreground_window: self.foreground.map(|handle| handle.0),
             monitors: self.monitor_snapshots(monitors),
             windows: self.window_snapshots(monitors),
+            performance: self
+                .perf
+                .snapshot(manageable_windows, self.game_mode.active.is_some()),
         }
     }
 
@@ -1439,12 +1941,29 @@ impl DaemonState {
             .config
             .validate()
             .context("validate reloaded Winland config")?;
+        let diff = ConfigDiff::between(&self.source_config, &loaded_config.config);
+        self.perf.config_reload_count = self.perf.config_reload_count.saturating_add(1);
+
+        if diff.is_noop() {
+            let monitors = winland_win32::enumerate_monitors()
+                .context("enumerate monitors for unchanged config reload report")?;
+            info!("config reload skipped; config is unchanged");
+            return Ok(ReloadConfigReport {
+                config_path: self
+                    .config_path
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
+                config_version: self.config_version,
+                reloaded_at_unix_ms: system_time_unix_ms(SystemTime::now()),
+                changed_sections: diff.changed_sections,
+                state: self.state_snapshot_with_monitors(&monitors),
+            });
+        }
         let runtime_config =
             RuntimeConfig::from_config(&loaded_config.config).context("prepare runtime config")?;
         let (new_hotkey_bindings, new_hotkey_commands) =
             hotkey_bindings_from_config(&loaded_config.config)
                 .context("prepare hotkey bindings for reloaded config")?;
-        let diff = ConfigDiff::between(&self.source_config, &loaded_config.config);
 
         let mut refreshed = Self::discover(runtime_config, new_hotkey_commands.clone())
             .context("build reloaded daemon window snapshot")?;
@@ -1480,6 +1999,7 @@ impl DaemonState {
         let hotkey_sender = self.hotkey_sender.clone();
         let modifier_drag = self.modifier_drag.take();
         let mouse_drag_sender = self.mouse_drag_sender.clone();
+        let perf = self.perf.clone();
 
         refreshed.source_config = loaded_config.config.clone();
         refreshed.config_path = loaded_config.path.clone();
@@ -1491,6 +2011,7 @@ impl DaemonState {
         refreshed.modifier_drag = modifier_drag;
         refreshed.mouse_drag_sender = mouse_drag_sender;
         refreshed.game_mode = self.game_mode.clone();
+        refreshed.perf = perf;
 
         *self = refreshed;
         let rule_stats = self.reapply_window_rules_after_reload(&monitors);
@@ -1929,24 +2450,135 @@ impl DaemonState {
         self.clear_temporary_float(window)
     }
 
+    fn start_interactive_drag_from_moved_events(
+        &mut self,
+        batch: &[WindowEvent],
+    ) -> Result<Option<Vec<MonitorInfo>>> {
+        if self.active_interactive_drag_window().is_some()
+            || self.active_modifier_drag.is_some()
+            || !winland_win32::left_mouse_button_is_down()
+            || !batch
+                .iter()
+                .all(|event| event.kind == WindowEventKind::Moved)
+        {
+            return Ok(None);
+        }
+
+        let Some(window) = self.inferred_native_drag_window(batch) else {
+            return Ok(None);
+        };
+        let monitors = winland_win32::enumerate_monitors()
+            .context("enumerate monitors for inferred native drag start")?;
+        self.start_interactive_drag(window, &monitors);
+        Ok((self.active_interactive_drag_window() == Some(window)).then_some(monitors))
+    }
+
+    fn inferred_native_drag_window(&self, batch: &[WindowEvent]) -> Option<WindowHandle> {
+        if let Some(foreground) = self.foreground
+            && batch
+                .iter()
+                .any(|event| event.window == foreground && self.windows.contains_key(&foreground))
+        {
+            return Some(foreground);
+        }
+
+        batch.iter().find_map(|event| {
+            self.windows
+                .contains_key(&event.window)
+                .then_some(event.window)
+        })
+    }
+
     fn start_interactive_drag(&mut self, window: WindowHandle, monitors: &[MonitorInfo]) {
+        let cursor = winland_win32::cursor_position().ok();
+        self.start_interactive_drag_with_optional_cursor(window, cursor, monitors);
+    }
+
+    fn start_interactive_drag_with_cursor(
+        &mut self,
+        window: WindowHandle,
+        cursor: Point,
+        monitors: &[MonitorInfo],
+    ) {
+        self.start_interactive_drag_with_optional_cursor(window, Some(cursor), monitors);
+    }
+
+    fn start_interactive_drag_with_optional_cursor(
+        &mut self,
+        window: WindowHandle,
+        start_cursor: Option<Point>,
+        monitors: &[MonitorInfo],
+    ) {
+        if self.active_interactive_drag_window() == Some(window) {
+            return;
+        }
+
         if !self.is_command_movable_window(window, monitors) {
             return;
         }
 
-        self.active_interactive_drag = Some(window);
+        let Some(cached_rect) = self.windows.get(&window).map(|info| info.rect) else {
+            return;
+        };
+        let visible_rect = winland_win32::window_rect_for_handle(window).unwrap_or_else(|error| {
+            debug!(
+                window = %window,
+                %error,
+                cached_rect = %cached_rect,
+                "failed to read native drag start rect; using cached visible rect"
+            );
+            cached_rect
+        });
+        let start_cursor = start_cursor.unwrap_or_else(|| visible_rect.center());
+        self.update_cached_window_rect(window, visible_rect, monitors);
+        self.active_interactive_drag = Some(ActiveInteractiveDrag {
+            window,
+            start_cursor,
+            start_rect: visible_rect,
+            monitors: monitors.to_vec(),
+        });
     }
 
     fn finish_interactive_drag(&mut self, window: WindowHandle) {
-        if self.active_interactive_drag == Some(window) {
+        if self.active_interactive_drag_window() == Some(window) {
             self.active_interactive_drag = None;
         }
+    }
+
+    fn active_interactive_drag_window(&self) -> Option<WindowHandle> {
+        self.active_interactive_drag
+            .as_ref()
+            .map(|drag| drag.window)
+    }
+
+    fn active_interactive_drag_monitors(&self, window: WindowHandle) -> Option<Vec<MonitorInfo>> {
+        self.active_interactive_drag
+            .as_ref()
+            .filter(|drag| drag.window == window)
+            .map(|drag| drag.monitors.clone())
+    }
+
+    fn interactive_drag_rect_from_cursor(
+        &self,
+        window: WindowHandle,
+        cursor: Point,
+    ) -> Option<Rect> {
+        let drag = self.active_interactive_drag.as_ref()?;
+        if drag.window != window {
+            return None;
+        }
+
+        Some(offset_rect_by_cursor_delta(
+            drag.start_rect,
+            drag.start_cursor,
+            cursor,
+        ))
     }
 
     fn active_drag_window(&self) -> Option<WindowHandle> {
         self.active_modifier_drag
             .map(|drag| drag.window)
-            .or(self.active_interactive_drag)
+            .or_else(|| self.active_interactive_drag_window())
     }
 
     fn start_temporary_float(&mut self, window: WindowHandle, monitors: &[MonitorInfo]) -> bool {
@@ -2500,23 +3132,101 @@ impl DaemonState {
         monitors: &[MonitorInfo],
         operation: &'static str,
     ) {
+        let started = Instant::now();
         let mut assignments = assignments.to_vec();
+        let mut had_assignments = false;
+        let mut applied_count = 0usize;
+        let mut skipped_count = 0usize;
 
         for pass in 0..TILE_FEEDBACK_PASSES {
             if assignments.is_empty() {
-                return;
+                break;
+            }
+            had_assignments = true;
+
+            let actionable = self.actionable_tile_assignments(&assignments, monitors);
+            skipped_count =
+                skipped_count.saturating_add(assignments.len().saturating_sub(actionable.len()));
+            if actionable.is_empty() {
+                break;
             }
 
-            apply_tile_assignments_once(&assignments, operation);
+            apply_tile_assignments_once(&actionable, operation);
+            applied_count = applied_count.saturating_add(actionable.len());
 
-            if !self.learn_constraints_from_actual_rects(&assignments, operation) {
-                return;
+            if !self.learn_constraints_from_actual_rects(&actionable, operation) {
+                break;
             }
 
             if pass + 1 < TILE_FEEDBACK_PASSES {
                 assignments = self.tile_assignments(monitors);
             }
         }
+
+        self.record_relayout_result(
+            had_assignments,
+            applied_count,
+            skipped_count,
+            started.elapsed(),
+            operation,
+        );
+        // Overflow resolution can make an existing tiled window floating without
+        // otherwise touching its HWND, so promote floating windows after every
+        // layout pass, independent of focus or border overlay sync.
+        self.sync_floating_z_order_with_monitors(monitors, operation);
+    }
+
+    fn actionable_tile_assignments(
+        &self,
+        assignments: &[TileAssignment],
+        monitors: &[MonitorInfo],
+    ) -> Vec<TileAssignment> {
+        assignments
+            .iter()
+            .copied()
+            .filter(|assignment| self.is_safe_to_move_window(assignment.window, monitors))
+            .filter(|assignment| {
+                !self.windows.get(&assignment.window).is_some_and(|window| {
+                    rect_within_tolerance(window.rect, assignment.rect, LAYOUT_APPLY_TOLERANCE_PX)
+                })
+            })
+            .collect()
+    }
+
+    fn record_relayout_result(
+        &mut self,
+        had_assignments: bool,
+        applied_count: usize,
+        skipped_count: usize,
+        elapsed: Duration,
+        operation: &'static str,
+    ) {
+        if applied_count == 0 {
+            if had_assignments {
+                self.perf.skipped_relayout_count =
+                    self.perf.skipped_relayout_count.saturating_add(1);
+                self.perf.last_relayout_duration = elapsed;
+                self.perf.last_relayout_move_count = 0;
+                debug!(
+                    skipped_assignments = skipped_count,
+                    duration_ms = saturating_duration_millis(elapsed),
+                    operation,
+                    "skipped no-op relayout"
+                );
+            }
+            return;
+        }
+
+        self.perf.relayout_count = self.perf.relayout_count.saturating_add(1);
+        self.perf.last_relayout_duration = elapsed;
+        self.perf.last_relayout_move_count = applied_count;
+        debug!(
+            applied_moves = applied_count,
+            skipped_assignments = skipped_count,
+            duration_ms = saturating_duration_millis(elapsed),
+            operation,
+            "applied relayout"
+        );
     }
 
     fn learn_constraints_from_actual_rects(
@@ -2530,6 +3240,11 @@ impl DaemonState {
             let Ok(actual) = winland_win32::window_rect_for_handle(assignment.window) else {
                 continue;
             };
+            if let Some(info) = self.windows.get_mut(&assignment.window) {
+                info.rect = actual;
+            }
+            self.workspaces
+                .update_window_rect(assignment.window, actual);
 
             let extra_width = actual
                 .width()
@@ -3116,7 +3831,8 @@ impl DaemonState {
             .filter(|drag| refreshed.windows.contains_key(&drag.window));
         refreshed.active_interactive_drag = self
             .active_interactive_drag
-            .filter(|window| refreshed.windows.contains_key(window));
+            .clone()
+            .filter(|drag| refreshed.windows.contains_key(&drag.window));
         refreshed.suppressed_modifier_drag_events = self
             .suppressed_modifier_drag_events
             .iter()
@@ -3478,35 +4194,43 @@ impl DaemonState {
         operation: &'static str,
     ) -> Result<()> {
         self.sync_floating_z_order_with_monitors(monitors, operation);
+        self.sync_border_geometry_with_monitors(monitors, operation)
+    }
 
+    fn sync_border_geometry_with_monitors(
+        &mut self,
+        monitors: &[MonitorInfo],
+        operation: &'static str,
+    ) -> Result<()> {
         let Some(manager) = &self.border_manager else {
             return Ok(());
         };
 
-        let candidates = self.border_candidates(monitors);
-        if candidates.is_empty() {
-            manager.clear().context("clear border overlays")?;
-            debug!(operation, "cleared border overlays");
-            return Ok(());
-        }
-
-        let updates: Vec<_> = candidates
-            .into_iter()
-            .map(|candidate| {
-                let rect = winland_win32::window_rect_for_handle(candidate.window)
-                    .unwrap_or(candidate.rect);
-                BorderUpdate {
-                    window: candidate.window,
-                    rect,
-                    color: candidate.color,
-                }
-            })
-            .collect();
+        let updates = self.border_updates(monitors);
+        let visible_count = updates.iter().filter(|update| update.visible).count();
         manager
             .sync(updates, self.config.borders.width)
             .context("sync border overlays")?;
-        debug!(operation, "synced border overlays");
+        self.perf.border_window_count = visible_count;
+        debug!(
+            operation,
+            visible_border_windows = visible_count,
+            "synced border overlays"
+        );
         Ok(())
+    }
+
+    fn sync_drag_border_geometry_with_monitors(
+        &mut self,
+        monitors: &[MonitorInfo],
+        active_drag_move: bool,
+        operation: &'static str,
+    ) -> Result<()> {
+        if active_drag_move {
+            self.sync_border_geometry_with_monitors(monitors, operation)
+        } else {
+            self.sync_borders_with_monitors(monitors, operation)
+        }
     }
 
     fn sync_floating_z_order_with_monitors(
@@ -3648,6 +4372,78 @@ impl DaemonState {
                     rect: window.rect,
                     color,
                 })
+            })
+            .collect()
+    }
+
+    fn border_updates(&self, monitors: &[MonitorInfo]) -> Vec<BorderUpdate> {
+        let visible_candidates: BTreeMap<_, _> = self
+            .border_candidates(monitors)
+            .into_iter()
+            .map(|candidate| (candidate.window, candidate))
+            .collect();
+
+        self.border_retention_candidates(monitors)
+            .into_iter()
+            .map(|candidate| {
+                let visible = visible_candidates.contains_key(&candidate.window);
+                let candidate = visible_candidates
+                    .get(&candidate.window)
+                    .copied()
+                    .unwrap_or(candidate);
+                let rect = if visible && self.active_drag_window() != Some(candidate.window) {
+                    winland_win32::window_rect_for_handle(candidate.window)
+                        .unwrap_or(candidate.rect)
+                } else {
+                    candidate.rect
+                };
+                BorderUpdate {
+                    window: candidate.window,
+                    rect,
+                    color: candidate.color,
+                    visible,
+                }
+            })
+            .collect()
+    }
+
+    fn border_retention_candidates(&self, monitors: &[MonitorInfo]) -> Vec<BorderCandidate> {
+        let config = self.config.borders;
+
+        self.windows
+            .iter()
+            .filter(|(handle, window)| {
+                let Some(monitor) = self.window_owner_monitor(**handle, monitors) else {
+                    return false;
+                };
+
+                self.is_manageable_window(**handle, monitors)
+                    && !self.game_mode_pauses_monitor(monitor)
+                    && !is_fullscreen_window(
+                        window,
+                        monitors,
+                        self.config.game_mode.policy.fullscreen_tolerance_px,
+                    )
+            })
+            .map(|(handle, window)| {
+                let participation = self.window_participation(*handle);
+                let focused = self.foreground == Some(*handle);
+                let floating =
+                    participation.is_floating() || self.overflow_floating.contains(handle);
+
+                let color = if focused {
+                    config.active_color
+                } else if floating {
+                    config.floating_color
+                } else {
+                    config.inactive_color
+                };
+
+                BorderCandidate {
+                    window: *handle,
+                    rect: window.rect,
+                    color,
+                }
             })
             .collect()
     }
@@ -3829,6 +4625,10 @@ impl ConfigDiff {
 
         Self { changed_sections }
     }
+
+    fn is_noop(&self) -> bool {
+        self.changed_sections.len() == 1 && self.changed_sections[0] == "none"
+    }
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -3853,6 +4653,18 @@ struct BorderCandidate {
 
 fn count_events(batch: &[WindowEvent], kind: WindowEventKind) -> usize {
     batch.iter().filter(|event| event.kind == kind).count()
+}
+
+fn rect_within_tolerance(actual: Rect, expected: Rect, tolerance: i32) -> bool {
+    let tolerance = tolerance.max(0);
+    (actual.left - expected.left).abs() <= tolerance
+        && (actual.top - expected.top).abs() <= tolerance
+        && (actual.right - expected.right).abs() <= tolerance
+        && (actual.bottom - expected.bottom).abs() <= tolerance
+}
+
+fn saturating_duration_millis(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 fn system_time_unix_ms(time: SystemTime) -> u64 {
@@ -4745,7 +5557,7 @@ mod tests {
             window(2, "Flexible", Rect::from_size(200, 0, 100, 100)),
         ]);
 
-        let plan = state.plan_command(DaemonCommand::Retile, &[monitor]);
+        let plan = state.plan_command(DaemonCommand::Retile, std::slice::from_ref(&monitor));
 
         assert_eq!(
             plan.moves,
@@ -4773,7 +5585,7 @@ mod tests {
         let mut state = daemon_state([focused, other]);
         state.foreground = Some(WindowHandle(1));
 
-        let plan = state.plan_command(DaemonCommand::Retile, &[monitor]);
+        let plan = state.plan_command(DaemonCommand::Retile, std::slice::from_ref(&monitor));
 
         assert_eq!(
             plan.moves,
@@ -4783,6 +5595,10 @@ mod tests {
             }]
         );
         assert_eq!(state.overflow_floating, BTreeSet::from([WindowHandle(2)]));
+        assert_eq!(
+            state.floating_z_order_windows(std::slice::from_ref(&monitor)),
+            vec![WindowHandle(2)]
+        );
     }
 
     #[test]
@@ -5375,6 +6191,76 @@ mod tests {
     }
 
     #[test]
+    fn native_drag_moved_events_are_processed_without_debounce() {
+        let mut state = daemon_state([window(1, "Dragged", Rect::from_size(0, 0, 100, 100))]);
+        state.active_interactive_drag = Some(active_interactive_drag(WindowHandle(1)));
+
+        assert!(state.should_process_moved_event_immediately(event(WindowEventKind::Moved, 1)));
+        assert!(!state.should_process_moved_event_immediately(event(WindowEventKind::Moved, 2)));
+        assert!(!state.should_process_moved_event_immediately(event(WindowEventKind::Shown, 1)));
+    }
+
+    #[test]
+    fn native_drag_tick_updates_cached_rect_and_monitor_override() {
+        let mut state = daemon_state([window(1, "Dragged", Rect::from_size(0, 0, 100, 100))]);
+        let monitors = [primary_test_monitor(), secondary_test_monitor()];
+        let dragged = WindowHandle(1);
+        state.active_interactive_drag = Some(ActiveInteractiveDrag {
+            window: dragged,
+            start_cursor: Point { x: 10, y: 10 },
+            start_rect: Rect::from_size(1000, 0, 240, 180),
+            monitors: monitors.to_vec(),
+        });
+        let dragged_rect = state
+            .interactive_drag_rect_from_cursor(dragged, Point { x: 210, y: 30 })
+            .unwrap();
+
+        assert!(state.apply_interactive_drag_rect(dragged, dragged_rect, &monitors));
+        assert_eq!(dragged_rect, Rect::from_size(1200, 20, 240, 180));
+        assert_eq!(state.windows.get(&dragged).unwrap().rect, dragged_rect);
+        assert_eq!(
+            state.window_monitor_overrides.get(&dragged),
+            Some(&MonitorId(2))
+        );
+    }
+
+    #[test]
+    fn native_drag_delta_uses_initial_cursor_and_visible_rect() {
+        let state = {
+            let mut state =
+                daemon_state([window(1, "Dragged", Rect::from_size(100, 100, 200, 120))]);
+            state.active_interactive_drag = Some(ActiveInteractiveDrag {
+                window: WindowHandle(1),
+                start_cursor: Point { x: 124, y: 118 },
+                start_rect: Rect::from_size(100, 100, 200, 120),
+                monitors: vec![primary_test_monitor()],
+            });
+            state
+        };
+
+        assert_eq!(
+            state.interactive_drag_rect_from_cursor(WindowHandle(1), Point { x: 324, y: 218 }),
+            Some(Rect::from_size(300, 200, 200, 120))
+        );
+    }
+
+    #[test]
+    fn native_drag_tick_ignores_stale_windows() {
+        let mut state = daemon_state([window(1, "Dragged", Rect::from_size(0, 0, 100, 100))]);
+        let monitors = [primary_test_monitor()];
+
+        assert!(!state.apply_interactive_drag_rect(
+            WindowHandle(1),
+            Rect::from_size(10, 10, 100, 100),
+            &monitors
+        ));
+        assert_eq!(
+            state.windows.get(&WindowHandle(1)).unwrap().rect,
+            Rect::from_size(0, 0, 100, 100)
+        );
+    }
+
+    #[test]
     fn permanent_floating_survives_movesize_start() {
         let mut state = daemon_state([
             window(1, "One", Rect::from_size(0, 0, 100, 100)),
@@ -5581,7 +6467,10 @@ mod tests {
         state.set_window_participation(WindowHandle(1), WindowParticipation::Floating);
 
         assert!(!state.handle_movesize_start(WindowHandle(1), &[primary_test_monitor()]));
-        assert_eq!(state.active_interactive_drag, Some(WindowHandle(1)));
+        assert_eq!(
+            state.active_interactive_drag_window(),
+            Some(WindowHandle(1))
+        );
 
         let plan = state.plan_command(
             DaemonCommand::SwitchWorkspace(WorkspaceId(2)),
@@ -5611,7 +6500,7 @@ mod tests {
         assert!(plan.moves.is_empty());
 
         assert!(!state.handle_movesize_end(WindowHandle(1), &[primary_test_monitor()], None));
-        assert_eq!(state.active_interactive_drag, None);
+        assert_eq!(state.active_interactive_drag_window(), None);
     }
 
     #[test]
@@ -5693,7 +6582,7 @@ mod tests {
             window(1, "Fullscreen", primary_test_monitor().rect),
             window(2, "Stays Behind", Rect::from_size(200, 0, 100, 100)),
         ]);
-        state.active_interactive_drag = Some(WindowHandle(1));
+        state.active_interactive_drag = Some(active_interactive_drag(WindowHandle(1)));
 
         let plan = state.plan_command(
             DaemonCommand::SwitchWorkspace(WorkspaceId(2)),
@@ -5924,6 +6813,22 @@ mod tests {
     }
 
     #[test]
+    fn floating_z_order_stays_above_focused_tiled_window() {
+        let mut state = daemon_state([
+            window(1, "Focused Tiled", Rect::from_size(0, 0, 100, 100)),
+            window(2, "Floating", Rect::from_size(200, 0, 100, 100)),
+            window(3, "Overflow", Rect::from_size(400, 0, 100, 100)),
+        ]);
+        state.foreground = Some(WindowHandle(1));
+        state.set_window_participation(WindowHandle(2), WindowParticipation::Floating);
+        state.overflow_floating.insert(WindowHandle(3));
+
+        let windows = state.floating_z_order_windows(&[primary_test_monitor()]);
+
+        assert_eq!(windows, vec![WindowHandle(2), WindowHandle(3)]);
+    }
+
+    #[test]
     fn floating_z_order_excludes_inactive_workspace_windows() {
         let mut state = daemon_state([window(1, "Hidden", Rect::from_size(0, 0, 100, 100))]);
         state.set_window_participation(WindowHandle(1), WindowParticipation::Floating);
@@ -6100,6 +7005,48 @@ mod tests {
         assert_eq!(count_events(&batch, WindowEventKind::Shown), 2);
         assert_eq!(count_events(&batch, WindowEventKind::Moved), 1);
         assert_eq!(count_events(&batch, WindowEventKind::Hidden), 0);
+    }
+
+    #[test]
+    fn duplicate_window_events_are_coalesced_to_last_observation() {
+        let batch = [
+            event(WindowEventKind::Shown, 1),
+            event(WindowEventKind::Hidden, 2),
+            event(WindowEventKind::Shown, 1),
+            event(WindowEventKind::Moved, 1),
+            event(WindowEventKind::Moved, 1),
+        ];
+
+        let coalesced = coalesce_window_events(&batch);
+
+        assert_eq!(
+            coalesced,
+            vec![
+                event(WindowEventKind::Hidden, 2),
+                event(WindowEventKind::Shown, 1),
+                event(WindowEventKind::Moved, 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn no_op_relayout_is_counted_without_calling_win32_move() {
+        let monitor = primary_test_monitor();
+        let mut state = daemon_state([window(1, "Editor", monitor.work_area)]);
+        let assignments = vec![TileAssignment {
+            window: WindowHandle(1),
+            rect: monitor.work_area,
+        }];
+
+        state.apply_tile_assignments_with_feedback(
+            &assignments,
+            std::slice::from_ref(&monitor),
+            "test no-op relayout",
+        );
+
+        assert_eq!(state.perf.relayout_count, 0);
+        assert_eq!(state.perf.skipped_relayout_count, 1);
+        assert_eq!(state.perf.last_relayout_move_count, 0);
     }
 
     #[test]
@@ -6488,7 +7435,7 @@ mod tests {
     }
 
     #[test]
-    fn game_mode_exit_requests_one_retile() {
+    fn fullscreen_game_mode_exit_waits_for_confirmation_then_retiles() {
         let monitor = primary_test_monitor();
         let mut state = daemon_state([
             window(1, "Former Game", Rect::from_size(0, 0, 100, 100)),
@@ -6515,6 +7462,12 @@ mod tests {
                 area: Some(FullscreenArea::MonitorBounds),
             },
         });
+
+        let first_transition = state
+            .update_game_mode(std::slice::from_ref(&monitor), "test")
+            .unwrap();
+        assert!(!first_transition.deactivated);
+        assert!(state.game_mode.active.is_some());
 
         let transition = state
             .update_game_mode(std::slice::from_ref(&monitor), "test")
@@ -6556,6 +7509,7 @@ mod tests {
             mouse_drag_sender: None,
             border_manager: None,
             game_mode: GameModeRuntimeState::default(),
+            perf: DaemonPerformance::default(),
         };
         state.tile_order = state.manageable_handles_sorted();
         state.sync_workspace_state(&[primary_test_monitor()]);
@@ -6606,6 +7560,15 @@ mod tests {
             },
             size_constraints: winland_core::WindowSizeConstraints::NONE,
             rect,
+        }
+    }
+
+    fn active_interactive_drag(window: WindowHandle) -> ActiveInteractiveDrag {
+        ActiveInteractiveDrag {
+            window,
+            start_cursor: Point { x: 0, y: 0 },
+            start_rect: Rect::from_size(0, 0, 100, 100),
+            monitors: vec![primary_test_monitor()],
         }
     }
 }

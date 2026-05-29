@@ -88,6 +88,19 @@ pub struct DaemonStateSnapshot {
     pub foreground_window: Option<u64>,
     pub monitors: Vec<MonitorStateSnapshot>,
     pub windows: Vec<WindowStateSnapshot>,
+    pub performance: DaemonPerformanceSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonPerformanceSnapshot {
+    pub relayout_count: u64,
+    pub skipped_relayout_count: u64,
+    pub last_relayout_duration_ms: u64,
+    pub last_relayout_move_count: usize,
+    pub managed_window_count: usize,
+    pub border_window_count: usize,
+    pub game_mode_active: bool,
+    pub config_reload_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -218,6 +231,7 @@ mod tests {
                 constrained: false,
                 visible_on_active_workspace: true,
             }],
+            performance: performance(),
         };
 
         let encoded = encode_response(&IpcResponse::state(snapshot.clone())).unwrap();
@@ -253,6 +267,7 @@ mod tests {
                 constrained: true,
                 visible_on_active_workspace: false,
             }],
+            performance: performance(),
         };
 
         let encoded = encode_response(&IpcResponse::state(snapshot)).unwrap();
@@ -290,6 +305,7 @@ mod tests {
             foreground_window: None,
             monitors: Vec::new(),
             windows: Vec::new(),
+            performance: performance(),
         };
         let report = ReloadConfigReport {
             config_path: None,
@@ -316,5 +332,18 @@ mod tests {
                 expected: PROTOCOL_VERSION,
             })
         ));
+    }
+
+    fn performance() -> DaemonPerformanceSnapshot {
+        DaemonPerformanceSnapshot {
+            relayout_count: 0,
+            skipped_relayout_count: 0,
+            last_relayout_duration_ms: 0,
+            last_relayout_move_count: 0,
+            managed_window_count: 0,
+            border_window_count: 0,
+            game_mode_active: false,
+            config_reload_count: 0,
+        }
     }
 }

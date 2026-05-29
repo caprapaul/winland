@@ -5,6 +5,7 @@ mod platform {
     use std::ffi::c_void;
     use std::mem::size_of;
     use std::os::windows::ffi::OsStringExt;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{self, Receiver, Sender};
     use std::sync::{Mutex, OnceLock};
@@ -18,7 +19,8 @@ mod platform {
         WPARAM,
     };
     use windows::Win32::Graphics::Dwm::{
-        DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute,
+        DWMNCRENDERINGPOLICY, DWMNCRP_DISABLED, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
+        DWMWA_NCRENDERING_POLICY, DwmGetWindowAttribute, DwmSetWindowAttribute,
     };
     use windows::Win32::Graphics::Gdi::{
         BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, EnumDisplayMonitors, FillRect,
@@ -51,17 +53,17 @@ mod platform {
         EVENT_SYSTEM_MOVESIZESTART, EnumWindows, GA_ROOT, GW_OWNER, GWL_EXSTYLE, GWL_STYLE,
         GWLP_USERDATA, GetAncestor, GetClassNameW, GetCursorPos, GetForegroundWindow, GetMessageW,
         GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
-        GetWindowThreadProcessId, HC_ACTION, HHOOK, HTTRANSPARENT, HWND_TOP, IsIconic,
-        IsWindowVisible, KBDLLHOOKSTRUCT, MINMAXINFO, MONITORINFOF_PRIMARY, MSG, MSLLHOOKSTRUCT,
-        OBJID_WINDOW, PM_NOREMOVE, PeekMessageW, PostThreadMessageW, RegisterClassW,
-        SMTO_ABORTIFHUNG, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE,
-        SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SendMessageTimeoutW,
-        SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, SetWindowsHookExW, ShowWindow,
-        TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WINEVENT_OUTOFCONTEXT,
-        WM_APP, WM_GETMINMAXINFO, WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
-        WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WM_QUIT, WM_SYSKEYDOWN, WNDCLASSW, WS_CAPTION,
-        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP, WS_THICKFRAME,
-        WindowFromPoint,
+        GetWindowThreadProcessId, HC_ACTION, HHOOK, HTCAPTION, HTSYSMENU, HTTRANSPARENT,
+        HWND_NOTOPMOST, HWND_TOPMOST, IsIconic, IsWindowVisible, KBDLLHOOKSTRUCT, MINMAXINFO,
+        MONITORINFOF_PRIMARY, MSG, MSLLHOOKSTRUCT, OBJID_WINDOW, PM_NOREMOVE, PeekMessageW,
+        PostThreadMessageW, RegisterClassW, SMTO_ABORTIFHUNG, SW_HIDE, SW_SHOWNOACTIVATE,
+        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
+        SendMessageTimeoutW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
+        SetWindowsHookExW, ShowWindow, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL,
+        WH_MOUSE_LL, WINEVENT_OUTOFCONTEXT, WM_APP, WM_GETMINMAXINFO, WM_HOTKEY, WM_KEYDOWN,
+        WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WM_QUIT, WM_SYSKEYDOWN,
+        WNDCLASSW, WS_CAPTION, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
+        WS_THICKFRAME, WindowFromPoint,
     };
     use windows::core::{PCWSTR, PWSTR};
     use winland_core::{
@@ -87,6 +89,7 @@ mod platform {
     const MINMAXINFO_TIMEOUT_MS: u32 = 50;
     const GEOMETRY_CORRECTION_PASSES: usize = 3;
     const MODIFIER_DRAG_MOVE_INTERVAL: Duration = Duration::from_millis(16);
+    const TITLEBAR_DRAG_MOVE_INTERVAL: Duration = Duration::from_millis(4);
 
     pub fn enumerate_windows() -> Result<Vec<WindowInfo>> {
         let mut windows = Vec::new();
@@ -175,12 +178,13 @@ mod platform {
         let hwnd = hwnd_from_handle(handle);
 
         // SAFETY: hwnd comes from documented window enumeration or daemon state.
-        // HWND_TOP raises within the normal non-topmost z-order band; the flags
-        // keep the existing size, position, owner ordering, and activation.
+        // The TOPMOST/NOTOPMOST pair is a documented way to place a window at
+        // the top of the normal non-topmost band. SWP_NOACTIVATE keeps the
+        // focused tiled window active while preserving Winland's floating layer.
         unsafe {
             SetWindowPos(
                 hwnd,
-                HWND_TOP,
+                HWND_TOPMOST,
                 0,
                 0,
                 0,
@@ -188,7 +192,20 @@ mod platform {
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
             )
             .map_err(|source| Win32Error::Windows {
-                context: "SetWindowPos(HWND_TOP)",
+                context: "SetWindowPos(HWND_TOPMOST)",
+                source,
+            })?;
+            SetWindowPos(
+                hwnd,
+                HWND_NOTOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+            )
+            .map_err(|source| Win32Error::Windows {
+                context: "SetWindowPos(HWND_NOTOPMOST)",
                 source,
             })
         }
@@ -246,6 +263,10 @@ mod platform {
             x: point.x,
             y: point.y,
         })
+    }
+
+    pub fn left_mouse_button_is_down() -> bool {
+        key_is_down(0x01)
     }
 
     pub fn focus_window(handle: WindowHandle) -> Result<()> {
@@ -427,17 +448,26 @@ mod platform {
                 0 => break,
                 _ if message.message == BORDER_COMMAND_MESSAGE => {
                     let mut shutdown = false;
+                    let mut pending_sync = None;
                     while let Ok(command) = receiver.try_recv() {
                         match command {
                             BorderCommand::Sync { updates, width } => {
-                                state.sync(updates, width);
+                                pending_sync = Some((updates, width));
                             }
-                            BorderCommand::Clear => state.clear(),
-                            BorderCommand::Shutdown => {
+                            BorderCommand::Clear => {
+                                pending_sync = None;
                                 state.clear();
+                            }
+                            BorderCommand::Shutdown => {
+                                pending_sync = None;
+                                state.destroy_all();
                                 shutdown = true;
+                                break;
                             }
                         }
+                    }
+                    if let Some((updates, width)) = pending_sync {
+                        state.sync(updates, width);
                     }
                     if shutdown {
                         break;
@@ -453,7 +483,7 @@ mod platform {
             }
         }
 
-        state.clear();
+        state.destroy_all();
         debug!("border overlay worker stopped");
     }
 
@@ -590,6 +620,7 @@ mod platform {
                 sender,
                 options,
                 active_drag: None,
+                active_titlebar_drag: None,
             });
         }
 
@@ -671,15 +702,21 @@ mod platform {
         pipe_name: &'static str,
         sender: Sender<IpcTransportRequest>,
     ) -> Result<IpcServer> {
+        let running = Arc::new(AtomicBool::new(true));
+        let worker_running = running.clone();
         let handle = thread::Builder::new()
             .name("winland-ipc-named-pipe".to_owned())
-            .spawn(move || ipc_server_loop(pipe_name, sender))
+            .spawn(move || ipc_server_loop(pipe_name, sender, worker_running))
             .map_err(|source| Win32Error::ThreadSpawn {
                 name: "winland-ipc-named-pipe",
                 message: source.to_string(),
             })?;
 
-        Ok(IpcServer { _handle: handle })
+        Ok(IpcServer {
+            handle: Some(handle),
+            running,
+            pipe_name,
+        })
     }
 
     pub fn send_ipc_request(pipe_name: &str, request: &[u8]) -> Result<Vec<u8>> {
@@ -750,7 +787,21 @@ mod platform {
     unsafe impl Send for ModifierDragRegistration {}
 
     pub struct IpcServer {
-        _handle: JoinHandle<()>,
+        handle: Option<JoinHandle<()>>,
+        running: Arc<AtomicBool>,
+        pipe_name: &'static str,
+    }
+
+    impl Drop for IpcServer {
+        fn drop(&mut self) {
+            self.running.store(false, Ordering::Relaxed);
+            wake_ipc_server(self.pipe_name);
+            if let Some(handle) = self.handle.take()
+                && handle.join().is_err()
+            {
+                warn!("IPC named pipe server thread panicked while stopping");
+            }
+        }
     }
 
     impl Drop for HotkeyOverrideRegistration {
@@ -784,6 +835,7 @@ mod platform {
         message_thread_id: u32,
     }
 
+    #[derive(Clone)]
     struct HotkeyOverrideState {
         sender: Sender<HotkeyEvent>,
         bindings: Vec<HotkeyBinding>,
@@ -794,6 +846,7 @@ mod platform {
         sender: Sender<MouseDragEvent>,
         options: ModifierDragOptions,
         active_drag: Option<ActiveMouseDrag>,
+        active_titlebar_drag: Option<ActiveMouseDrag>,
     }
 
     struct ActiveMouseDrag {
@@ -860,8 +913,12 @@ mod platform {
         }
     }
 
-    fn ipc_server_loop(pipe_name: &'static str, sender: Sender<IpcTransportRequest>) {
-        loop {
+    fn ipc_server_loop(
+        pipe_name: &'static str,
+        sender: Sender<IpcTransportRequest>,
+        running: Arc<AtomicBool>,
+    ) {
+        while running.load(Ordering::Relaxed) {
             let pipe = match create_ipc_server_pipe(pipe_name) {
                 Ok(pipe) => pipe,
                 Err(error) => {
@@ -872,6 +929,9 @@ mod platform {
             };
 
             if let Err(error) = connect_ipc_server_pipe(pipe.0) {
+                if !running.load(Ordering::Relaxed) {
+                    break;
+                }
                 warn!(%error, "failed to accept IPC named pipe client");
                 continue;
             }
@@ -879,6 +939,10 @@ mod platform {
             let request = match read_pipe_message(pipe.0, "ReadFile(IPC request)") {
                 Ok(request) => request,
                 Err(error) => {
+                    if !running.load(Ordering::Relaxed) {
+                        let _ = disconnect_pipe(pipe.0);
+                        break;
+                    }
                     warn!(%error, "failed to read IPC request");
                     let _ = disconnect_pipe(pipe.0);
                     continue;
@@ -910,6 +974,10 @@ mod platform {
 
             let _ = disconnect_pipe(pipe.0);
         }
+    }
+
+    fn wake_ipc_server(pipe_name: &str) {
+        let _ = open_ipc_client(pipe_name);
     }
 
     fn create_ipc_server_pipe(pipe_name: &str) -> Result<OwnedPipe> {
@@ -1071,7 +1139,9 @@ mod platform {
 
         match slot.lock() {
             Ok(guard) => {
-                if let Some(sender) = guard.as_ref() {
+                let sender = guard.clone();
+                drop(guard);
+                if let Some(sender) = sender {
                     let _ = sender.send(event);
                 }
             }
@@ -1108,12 +1178,15 @@ mod platform {
             return unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) };
         };
 
-        let Ok(guard) = slot.lock() else {
-            warn!("hotkey override lock is poisoned");
-            // SAFETY: See the forwarding note above.
-            return unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) };
+        let state = match slot.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => {
+                warn!("hotkey override lock is poisoned");
+                // SAFETY: See the forwarding note above.
+                return unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) };
+            }
         };
-        let Some(state) = guard.as_ref() else {
+        let Some(state) = state else {
             // SAFETY: See the forwarding note above.
             return unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) };
         };
@@ -1181,36 +1254,84 @@ mod platform {
             // SAFETY: See the forwarding note above.
             return unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) };
         };
-        let Ok(mut guard) = slot.lock() else {
-            warn!("modifier drag lock is poisoned");
-            // SAFETY: See the forwarding note above.
-            return unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) };
-        };
-        let Some(state) = guard.as_mut() else {
-            // SAFETY: See the forwarding note above.
-            return unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) };
-        };
 
         match message {
             WM_LBUTTONDOWN => {
-                if !modifiers_match(current_modifier_state(), state.options.modifiers) {
+                let options = match slot.lock() {
+                    Ok(guard) => guard.as_ref().map(|state| state.options.clone()),
+                    Err(_) => {
+                        warn!("modifier drag lock is poisoned");
+                        // SAFETY: See the forwarding note above.
+                        return unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) };
+                    }
+                };
+                let Some(options) = options else {
+                    // SAFETY: See the forwarding note above.
+                    return unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) };
+                };
+
+                if !modifiers_match(current_modifier_state(), options.modifiers) {
+                    if let Some(window) = native_titlebar_drag_window_at(cursor, &options) {
+                        let now = Instant::now();
+                        let sender = match slot.lock() {
+                            Ok(mut guard) => guard.as_mut().map(|state| {
+                                state.active_titlebar_drag = Some(ActiveMouseDrag {
+                                    window,
+                                    last_cursor: cursor,
+                                    last_sent_move_at: now,
+                                    sent_move: false,
+                                });
+                                state.sender.clone()
+                            }),
+                            Err(_) => {
+                                warn!("modifier drag lock is poisoned");
+                                // SAFETY: See the forwarding note above.
+                                return unsafe {
+                                    CallNextHookEx(HHOOK::default(), code, wparam, lparam)
+                                };
+                            }
+                        };
+                        if let Some(sender) = sender {
+                            let _ = sender.send(MouseDragEvent {
+                                kind: MouseDragEventKind::TitlebarStarted,
+                                window,
+                                cursor,
+                            });
+                        }
+                    }
                     // SAFETY: See the forwarding note above.
                     return unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) };
                 }
 
-                let Some(window) = modifier_drag_window_at(cursor, &state.options) else {
+                let Some(window) = modifier_drag_window_at(cursor, &options) else {
                     // SAFETY: See the forwarding note above.
                     return unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) };
                 };
 
                 let now = Instant::now();
-                state.active_drag = Some(ActiveMouseDrag {
-                    window,
-                    last_cursor: cursor,
-                    last_sent_move_at: now,
-                    sent_move: false,
-                });
-                let _ = state.sender.send(MouseDragEvent {
+                let sender = match slot.lock() {
+                    Ok(mut guard) => {
+                        let Some(state) = guard.as_mut() else {
+                            // SAFETY: See the forwarding note above.
+                            return unsafe {
+                                CallNextHookEx(HHOOK::default(), code, wparam, lparam)
+                            };
+                        };
+                        state.active_drag = Some(ActiveMouseDrag {
+                            window,
+                            last_cursor: cursor,
+                            last_sent_move_at: now,
+                            sent_move: false,
+                        });
+                        state.sender.clone()
+                    }
+                    Err(_) => {
+                        warn!("modifier drag lock is poisoned");
+                        // SAFETY: See the forwarding note above.
+                        return unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) };
+                    }
+                };
+                let _ = sender.send(MouseDragEvent {
                     kind: MouseDragEventKind::Started,
                     window,
                     cursor,
@@ -1218,34 +1339,109 @@ mod platform {
                 LRESULT(1)
             }
             WM_MOUSEMOVE => {
-                if let Some(drag) = state.active_drag.as_mut() {
-                    drag.last_cursor = cursor;
-                    let now = Instant::now();
-                    if !drag.sent_move
-                        || now.duration_since(drag.last_sent_move_at) >= MODIFIER_DRAG_MOVE_INTERVAL
-                    {
-                        drag.last_sent_move_at = now;
-                        drag.sent_move = true;
-                        let _ = state.sender.send(MouseDragEvent {
-                            kind: MouseDragEventKind::Moved,
-                            window: drag.window,
-                            cursor,
-                        });
+                let event = match slot.lock() {
+                    Ok(mut guard) => {
+                        let Some(state) = guard.as_mut() else {
+                            // SAFETY: See the forwarding note above.
+                            return unsafe {
+                                CallNextHookEx(HHOOK::default(), code, wparam, lparam)
+                            };
+                        };
+                        let sender = state.sender.clone();
+                        if let Some(drag) = state.active_drag.as_mut() {
+                            drag_mouse_move_event(
+                                drag,
+                                sender,
+                                MouseDragEventKind::Moved,
+                                cursor,
+                                MODIFIER_DRAG_MOVE_INTERVAL,
+                            )
+                        } else if let Some(drag) = state.active_titlebar_drag.as_mut() {
+                            drag_mouse_move_event(
+                                drag,
+                                sender,
+                                MouseDragEventKind::TitlebarMoved,
+                                cursor,
+                                TITLEBAR_DRAG_MOVE_INTERVAL,
+                            )
+                        } else {
+                            // SAFETY: See the forwarding note above.
+                            return unsafe {
+                                CallNextHookEx(HHOOK::default(), code, wparam, lparam)
+                            };
+                        }
                     }
+                    Err(_) => {
+                        warn!("modifier drag lock is poisoned");
+                        // SAFETY: See the forwarding note above.
+                        return unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) };
+                    }
+                };
+                let suppress = event
+                    .as_ref()
+                    .is_some_and(|(_, event)| event.kind == MouseDragEventKind::Moved);
+                if let Some((sender, event)) = event {
+                    let _ = sender.send(event);
+                }
+                if suppress {
                     LRESULT(1)
                 } else {
-                    // SAFETY: See the forwarding note above.
+                    // SAFETY: Titlebar tracking observes native dragging
+                    // without suppressing Explorer/Windows' own move handling.
                     unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) }
                 }
             }
             WM_LBUTTONUP => {
-                if let Some(drag) = state.active_drag.take() {
-                    let _ = state.sender.send(MouseDragEvent {
-                        kind: MouseDragEventKind::Ended,
-                        window: drag.window,
-                        cursor: drag.last_cursor,
-                    });
-                    LRESULT(1)
+                let (event, suppress) = match slot.lock() {
+                    Ok(mut guard) => {
+                        let Some(state) = guard.as_mut() else {
+                            // SAFETY: See the forwarding note above.
+                            return unsafe {
+                                CallNextHookEx(HHOOK::default(), code, wparam, lparam)
+                            };
+                        };
+                        if let Some(drag) = state.active_drag.take() {
+                            (
+                                Some((
+                                    state.sender.clone(),
+                                    MouseDragEvent {
+                                        kind: MouseDragEventKind::Ended,
+                                        window: drag.window,
+                                        cursor: drag.last_cursor,
+                                    },
+                                )),
+                                true,
+                            )
+                        } else if let Some(drag) = state.active_titlebar_drag.take() {
+                            (
+                                Some((
+                                    state.sender.clone(),
+                                    MouseDragEvent {
+                                        kind: MouseDragEventKind::TitlebarEnded,
+                                        window: drag.window,
+                                        cursor: drag.last_cursor,
+                                    },
+                                )),
+                                false,
+                            )
+                        } else {
+                            (None, false)
+                        }
+                    }
+                    Err(_) => {
+                        warn!("modifier drag lock is poisoned");
+                        // SAFETY: See the forwarding note above.
+                        return unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) };
+                    }
+                };
+                if let Some((sender, event)) = event {
+                    let _ = sender.send(event);
+                    if suppress {
+                        LRESULT(1)
+                    } else {
+                        // SAFETY: See the forwarding note above.
+                        unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) }
+                    }
                 } else {
                     // SAFETY: See the forwarding note above.
                     unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) }
@@ -1255,6 +1451,31 @@ mod platform {
                 // SAFETY: See the forwarding note above.
                 unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) }
             }
+        }
+    }
+
+    fn drag_mouse_move_event(
+        drag: &mut ActiveMouseDrag,
+        sender: Sender<MouseDragEvent>,
+        kind: MouseDragEventKind,
+        cursor: Point,
+        min_interval: Duration,
+    ) -> Option<(Sender<MouseDragEvent>, MouseDragEvent)> {
+        drag.last_cursor = cursor;
+        let now = Instant::now();
+        if !drag.sent_move || now.duration_since(drag.last_sent_move_at) >= min_interval {
+            drag.last_sent_move_at = now;
+            drag.sent_move = true;
+            Some((
+                sender,
+                MouseDragEvent {
+                    kind,
+                    window: drag.window,
+                    cursor,
+                },
+            ))
+        } else {
+            None
         }
     }
 
@@ -1303,8 +1524,10 @@ mod platform {
 
         match slot.lock() {
             Ok(guard) => {
-                if let Some(state) = guard.as_ref() {
-                    let _ = state.sender.send(HotkeyEvent { id: id.into() });
+                let sender = guard.as_ref().map(|state| state.sender.clone());
+                drop(guard);
+                if let Some(sender) = sender {
+                    let _ = sender.send(HotkeyEvent { id: id.into() });
                 }
             }
             Err(_) => warn!("hotkey sender lock is poisoned"),
@@ -1388,30 +1611,78 @@ mod platform {
         cursor: Point,
         options: &ModifierDragOptions,
     ) -> Option<WindowHandle> {
-        let point = POINT {
-            x: cursor.x,
-            y: cursor.y,
-        };
+        drag_candidate_window_at(cursor, options).map(|candidate| handle_from_hwnd(candidate.root))
+    }
+
+    fn native_titlebar_drag_window_at(
+        cursor: Point,
+        options: &ModifierDragOptions,
+    ) -> Option<WindowHandle> {
+        let candidate = drag_candidate_window_at(cursor, options)?;
+        let hit_target_is_titlebar = titlebar_hit_test(candidate.hit_target, cursor)
+            || candidate.hit_target != candidate.root && titlebar_hit_test(candidate.root, cursor);
+        hit_target_is_titlebar.then_some(handle_from_hwnd(candidate.root))
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct DragCandidateWindow {
+        root: HWND,
+        hit_target: HWND,
+    }
+
+    fn drag_candidate_window_at(
+        cursor: Point,
+        options: &ModifierDragOptions,
+    ) -> Option<DragCandidateWindow> {
+        let point = point_from_core(cursor);
         // SAFETY: WindowFromPoint only reads the window at the supplied screen
         // coordinate and does not retain pointers.
-        let mut hwnd = unsafe { WindowFromPoint(point) };
-        if hwnd.0.is_null() {
+        let hit_target = unsafe { WindowFromPoint(point) };
+        if hit_target.0.is_null() {
             return None;
         }
 
-        // SAFETY: hwnd came from WindowFromPoint. GA_ROOT asks Windows for the
-        // owning top-level window without mutating application state.
-        hwnd = unsafe { GetAncestor(hwnd, GA_ROOT) };
-        if hwnd.0.is_null() || !is_modifier_drag_candidate(hwnd) {
+        // SAFETY: hit_target came from WindowFromPoint. GA_ROOT asks Windows
+        // for the owning top-level window without mutating application state.
+        let root = unsafe { GetAncestor(hit_target, GA_ROOT) };
+        if root.0.is_null() || !is_modifier_drag_candidate(root) {
             return None;
         }
 
-        let context = hotkey_context_for_window(hwnd, options.bypass.needs_process_metadata())?;
-        if options.bypass.matches(&context) {
-            return None;
-        }
+        let context = hotkey_context_for_window(root, options.bypass.needs_process_metadata())?;
+        (!options.bypass.matches(&context)).then_some(DragCandidateWindow { root, hit_target })
+    }
 
-        Some(handle_from_hwnd(hwnd))
+    fn titlebar_hit_test(hwnd: HWND, cursor: Point) -> bool {
+        let mut result = 0usize;
+        let lparam = hit_test_lparam(cursor);
+        // SAFETY: hwnd is either the window under the cursor or its top-level
+        // owner. WM_NCHITTEST is a documented synchronous query; the timeout
+        // prevents a hung target process from stalling the low-level mouse hook.
+        let timeout_result = unsafe {
+            SendMessageTimeoutW(
+                hwnd,
+                WM_NCHITTEST,
+                WPARAM(0),
+                lparam,
+                SMTO_ABORTIFHUNG,
+                MINMAXINFO_TIMEOUT_MS,
+                Some(&mut result),
+            )
+        };
+
+        timeout_result.0 != 0 && matches!(result as u32, HTCAPTION | HTSYSMENU)
+    }
+
+    fn point_from_core(point: Point) -> POINT {
+        POINT {
+            x: point.x,
+            y: point.y,
+        }
+    }
+
+    fn hit_test_lparam(point: Point) -> LPARAM {
+        LPARAM((((point.y as u16 as u32) << 16) | point.x as u16 as u32) as isize)
     }
 
     fn is_modifier_drag_candidate(hwnd: HWND) -> bool {
@@ -1504,6 +1775,13 @@ mod platform {
                     continue;
                 }
 
+                if !update.visible {
+                    if let Some(overlay) = self.overlays.get_mut(&update.window) {
+                        overlay.hide();
+                    }
+                    continue;
+                }
+
                 if let std::collections::btree_map::Entry::Vacant(entry) =
                     self.overlays.entry(update.window)
                 {
@@ -1526,6 +1804,12 @@ mod platform {
         }
 
         fn clear(&mut self) {
+            for overlay in self.overlays.values_mut() {
+                overlay.hide();
+            }
+        }
+
+        fn destroy_all(&mut self) {
             let windows: Vec<_> = self.overlays.keys().copied().collect();
             for window in windows {
                 self.remove(window);
@@ -1546,6 +1830,7 @@ mod platform {
         rect: Option<Rect>,
         width: i32,
         color: crate::BorderColor,
+        visible: bool,
     }
 
     impl BorderOverlay {
@@ -1563,6 +1848,7 @@ mod platform {
                 rect: None,
                 width: 0,
                 color: crate::BorderColor::default(),
+                visible: false,
             })
         }
 
@@ -1576,7 +1862,7 @@ mod platform {
                 debug!(window = %self.window, ?color, "updated border focus state");
             }
 
-            if self.rect != Some(rect) || self.width != width {
+            if self.rect != Some(rect) || self.width != width || !self.visible {
                 let side_rects = border_side_rects(rect, width);
                 for (hwnd, side_rect) in self.sides.into_iter().zip(side_rects) {
                     position_border_side(hwnd, hwnd_from_handle(self.window), side_rect);
@@ -1584,7 +1870,23 @@ mod platform {
                 debug!(window = %self.window, rect = %rect, width, "repositioned border overlay");
                 self.rect = Some(rect);
                 self.width = width;
+                self.visible = true;
             }
+        }
+
+        fn hide(&mut self) {
+            if !self.visible {
+                return;
+            }
+
+            for side in self.sides {
+                // SAFETY: side is an HWND created by create_border_side_window
+                // and owned by this BorderOverlay.
+                unsafe {
+                    let _ = ShowWindow(side, SW_HIDE);
+                }
+            }
+            self.visible = false;
         }
 
         fn destroy(self) {
@@ -1654,8 +1956,26 @@ mod platform {
             source,
         })?;
 
+        disable_border_side_nonclient_rendering(hwnd);
         set_border_side_color(hwnd, crate::BorderColor::default());
         Ok(hwnd)
+    }
+
+    fn disable_border_side_nonclient_rendering(hwnd: HWND) {
+        let policy = DWMNCRP_DISABLED;
+        // SAFETY: hwnd is the border side HWND just created by Winland. The
+        // attribute pointer references a stack value for the duration of the
+        // synchronous DwmSetWindowAttribute call.
+        if let Err(error) = unsafe {
+            DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_NCRENDERING_POLICY,
+                &policy as *const _ as *const c_void,
+                size_of::<DWMNCRENDERINGPOLICY>() as u32,
+            )
+        } {
+            debug!(%error, "failed to disable DWM non-client rendering for border side");
+        }
     }
 
     fn set_border_side_color(hwnd: HWND, color: crate::BorderColor) {
@@ -2233,6 +2553,10 @@ mod platform {
         Err(Win32Error::UnsupportedPlatform)
     }
 
+    pub fn left_mouse_button_is_down() -> bool {
+        false
+    }
+
     pub fn focus_window(_handle: WindowHandle) -> Result<()> {
         Err(Win32Error::UnsupportedPlatform)
     }
@@ -2338,6 +2662,7 @@ pub use platform::foreground_window;
 pub use platform::hide_window;
 pub use platform::install_hotkey_override;
 pub use platform::install_modifier_drag;
+pub use platform::left_mouse_button_is_down;
 pub use platform::move_resize_window;
 pub use platform::raise_window_no_activate;
 pub use platform::register_hotkeys;
@@ -2684,6 +3009,9 @@ pub enum MouseDragEventKind {
     Started,
     Moved,
     Ended,
+    TitlebarStarted,
+    TitlebarMoved,
+    TitlebarEnded,
 }
 
 #[derive(Debug)]
@@ -2731,6 +3059,7 @@ pub struct BorderUpdate {
     pub window: WindowHandle,
     pub rect: Rect,
     pub color: BorderColor,
+    pub visible: bool,
 }
 
 #[derive(Debug, thiserror::Error)]

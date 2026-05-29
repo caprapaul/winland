@@ -935,7 +935,7 @@ fn format_state_snapshot(snapshot: &DaemonStateSnapshot) -> String {
         .map(|handle| format!("0x{handle:X}"))
         .unwrap_or_else(|| "-".to_owned());
     let mut output = format!(
-        "Winland daemon is running (IPC protocol v{}).\nConfig: v{} from {} loaded at {}\nWindows: {} total, {} manageable, {} floating, {} temporary floating\nWorkspace: active {}\nForeground: {}",
+        "Winland daemon is running (IPC protocol v{}).\nConfig: v{} from {} loaded at {}\nWindows: {} total, {} manageable, {} floating, {} temporary floating\nWorkspace: active {}\nForeground: {}\nPerformance: {} relayouts, {} skipped, last {} ms / {} moves, {} borders, game mode {}, {} config reloads",
         winland_ipc::PROTOCOL_VERSION,
         snapshot.config_version,
         snapshot.config_path.as_deref().unwrap_or("<defaults>"),
@@ -945,7 +945,14 @@ fn format_state_snapshot(snapshot: &DaemonStateSnapshot) -> String {
         snapshot.floating_windows,
         snapshot.temporary_floating_windows,
         snapshot.active_workspace,
-        foreground
+        foreground,
+        snapshot.performance.relayout_count,
+        snapshot.performance.skipped_relayout_count,
+        snapshot.performance.last_relayout_duration_ms,
+        snapshot.performance.last_relayout_move_count,
+        snapshot.performance.border_window_count,
+        yes_no(snapshot.performance.game_mode_active),
+        snapshot.performance.config_reload_count
     );
 
     if !snapshot.monitors.is_empty() {
@@ -1050,6 +1057,7 @@ mod tests {
                 constrained: true,
                 visible_on_active_workspace: true,
             }],
+            performance: test_performance(),
         };
 
         let output = format_state_snapshot(&snapshot);
@@ -1082,6 +1090,7 @@ mod tests {
                 foreground_window: None,
                 monitors: Vec::new(),
                 windows: Vec::new(),
+                performance: test_performance(),
             },
         };
 
@@ -1091,5 +1100,18 @@ mod tests {
         assert!(output.contains("v2 from <defaults>"));
         assert!(output.contains("hotkeys, window-rules"));
         assert!(output.contains("3 total, 2 manageable"));
+    }
+
+    fn test_performance() -> winland_ipc::DaemonPerformanceSnapshot {
+        winland_ipc::DaemonPerformanceSnapshot {
+            relayout_count: 0,
+            skipped_relayout_count: 0,
+            last_relayout_duration_ms: 0,
+            last_relayout_move_count: 0,
+            managed_window_count: 0,
+            border_window_count: 0,
+            game_mode_active: false,
+            config_reload_count: 0,
+        }
     }
 }

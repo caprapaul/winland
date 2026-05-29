@@ -17,7 +17,7 @@ pub const SUPPORTED_LAYOUTS: &[&str] = &[
     "horizontal-stack",
 ];
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub general: GeneralConfig,
@@ -134,7 +134,7 @@ fn merge_layout_override(base: LayoutConfig, override_config: &LayoutOverride) -
     .normalized()
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct GeneralConfig {
     pub log_level: String,
@@ -148,7 +148,7 @@ impl Default for GeneralConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct HotkeysConfig {
     pub mode: HotkeyMode,
@@ -232,7 +232,7 @@ impl HotkeyBindingConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct LayoutSection {
     pub default: String,
@@ -260,7 +260,7 @@ impl Default for LayoutSection {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct LayoutOverride {
     pub layout: Option<String>,
@@ -271,7 +271,7 @@ pub struct LayoutOverride {
     pub preserve_split: Option<bool>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct WorkspacesConfig {
     pub count: u16,
@@ -299,7 +299,7 @@ pub enum WorkspaceStartup {
     First,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct BehaviorConfig {
     pub startup_retile: bool,
@@ -395,7 +395,7 @@ pub enum OverflowFocusPolicy {
     FloatFocused,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WindowRuleConfig {
     pub name: Option<String>,
@@ -417,7 +417,7 @@ impl WindowRuleConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct WindowRuleMatchConfig {
     pub class: Option<TextMatcherConfig>,
@@ -460,7 +460,7 @@ impl WindowRuleMatchConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct WindowRuleActionConfig {
     pub manage: Option<bool>,

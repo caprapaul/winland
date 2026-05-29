@@ -715,6 +715,20 @@ impl WorkspaceManager {
         self.workspaces.iter().copied()
     }
 
+    pub fn set_workspace_count(&mut self, workspace_count: u16) {
+        let workspace_count = workspace_count.max(1);
+        self.workspaces = (1..=workspace_count).map(WorkspaceId).collect();
+        self.active = clamp_workspace_to_set(self.active, &self.workspaces);
+
+        for workspace in self.active_by_monitor.values_mut() {
+            *workspace = clamp_workspace_to_set(*workspace, &self.workspaces);
+        }
+
+        for state in self.windows.values_mut() {
+            state.workspace = clamp_workspace_to_set(state.workspace, &self.workspaces);
+        }
+    }
+
     pub fn window_state(&self, window: WindowHandle) -> Option<WorkspaceWindowState> {
         self.windows.get(&window).copied()
     }
@@ -974,6 +988,21 @@ impl WorkspaceManager {
     fn ensure_workspace(&mut self, workspace: WorkspaceId) {
         self.workspaces.insert(workspace);
     }
+}
+
+fn clamp_workspace_to_set(
+    workspace: WorkspaceId,
+    workspaces: &BTreeSet<WorkspaceId>,
+) -> WorkspaceId {
+    if workspaces.contains(&workspace) {
+        return workspace;
+    }
+
+    workspaces
+        .iter()
+        .next_back()
+        .copied()
+        .unwrap_or(WorkspaceId(1))
 }
 
 pub fn tile_windows(work_area: Rect, windows: &[WindowHandle]) -> Vec<TileAssignment> {
@@ -3810,6 +3839,47 @@ mod tests {
         assert_eq!(
             workspaces.active_workspace_for_monitor(MonitorId(2)),
             WorkspaceId(3)
+        );
+    }
+
+    #[test]
+    fn workspace_count_reconfiguration_clamps_active_and_window_state() {
+        let mut workspaces = WorkspaceManager::new(4);
+        workspaces.track_window_on_workspace(
+            WindowHandle(1),
+            WorkspaceId(4),
+            Rect::from_size(0, 0, 100, 100),
+        );
+        workspaces.switch_to(WorkspaceId(4));
+        workspaces.sync_monitors([MonitorId(1)]);
+        workspaces.switch_monitor_to(MonitorId(1), WorkspaceId(4));
+
+        workspaces.set_workspace_count(2);
+
+        assert_eq!(workspaces.active_workspace(), WorkspaceId(2));
+        assert_eq!(
+            workspaces.active_workspace_for_monitor(MonitorId(1)),
+            WorkspaceId(2)
+        );
+        assert_eq!(
+            workspaces.window_state(WindowHandle(1)).unwrap().workspace,
+            WorkspaceId(2)
+        );
+        assert_eq!(
+            workspaces.workspaces().collect::<Vec<_>>(),
+            vec![WorkspaceId(1), WorkspaceId(2)]
+        );
+    }
+
+    #[test]
+    fn workspace_count_reconfiguration_never_drops_to_zero() {
+        let mut workspaces = WorkspaceManager::new(4);
+
+        workspaces.set_workspace_count(0);
+
+        assert_eq!(
+            workspaces.workspaces().collect::<Vec<_>>(),
+            vec![WorkspaceId(1)]
         );
     }
 

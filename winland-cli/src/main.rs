@@ -9,8 +9,8 @@ use winland_core::{
     detect_game_mode, tile_windows_with_config,
 };
 use winland_ipc::{
-    DaemonStateSnapshot, IpcRequest, IpcResponseResult, WindowParticipationSnapshot,
-    decode_response, encode_request,
+    DaemonStateSnapshot, IpcRequest, IpcResponseResult, ReloadConfigReport,
+    WindowParticipationSnapshot, decode_response, encode_request,
 };
 
 #[derive(Debug, Parser)]
@@ -25,6 +25,8 @@ struct Cli {
 enum Command {
     /// Inspect the running daemon through local IPC.
     State(StateArgs),
+    /// Reload the running daemon's config through local IPC.
+    ReloadConfig(ReloadConfigArgs),
     /// List discovered desktop windows and explain Winland's conservative filter.
     Windows(WindowsArgs),
     /// List discovered monitors and their stable Winland IDs.
@@ -42,6 +44,13 @@ enum Command {
 #[derive(Debug, Args)]
 struct StateArgs {
     /// Print the daemon state snapshot as JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct ReloadConfigArgs {
+    /// Print the reload report as JSON.
     #[arg(long)]
     json: bool,
 }
@@ -166,6 +175,7 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::State(args) => daemon_state(args),
+        Command::ReloadConfig(args) => reload_config(args),
         Command::Windows(args) => list_windows(args),
         Command::Monitors => list_monitors(),
         Command::DiagnoseWindow(args) => diagnose_window(args),
@@ -599,6 +609,45 @@ fn daemon_state(args: StateArgs) -> Result<()> {
         IpcResponseResult::Error(error) => {
             return Err(anyhow::anyhow!("daemon IPC error: {}", error.message));
         }
+        IpcResponseResult::ReloadConfig(_) => {
+            return Err(anyhow::anyhow!(
+                "daemon returned reload-config response to state request"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn reload_config(args: ReloadConfigArgs) -> Result<()> {
+    let request = encode_request(&IpcRequest::reload_config())?;
+    let response =
+        match winland_win32::send_ipc_request(winland_win32::DEFAULT_IPC_PIPE_NAME, &request) {
+            Ok(response) => response,
+            Err(winland_win32::Win32Error::DaemonNotRunning { .. }) => {
+                eprintln!(
+                    "Winland daemon is not running. Start winland-daemon before using IPC commands."
+                );
+                std::process::exit(2);
+            }
+            Err(error) => return Err(error.into()),
+        };
+
+    match decode_response(&response)?.result {
+        IpcResponseResult::ReloadConfig(report) if args.json => {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        IpcResponseResult::ReloadConfig(report) => {
+            println!("{}", format_reload_config_report(&report));
+        }
+        IpcResponseResult::Error(error) => {
+            return Err(anyhow::anyhow!("daemon IPC error: {}", error.message));
+        }
+        IpcResponseResult::State(_) => {
+            return Err(anyhow::anyhow!(
+                "daemon returned state response to reload-config request"
+            ));
+        }
     }
 
     Ok(())
@@ -886,8 +935,11 @@ fn format_state_snapshot(snapshot: &DaemonStateSnapshot) -> String {
         .map(|handle| format!("0x{handle:X}"))
         .unwrap_or_else(|| "-".to_owned());
     let mut output = format!(
-        "Winland daemon is running (IPC protocol v{}).\nWindows: {} total, {} manageable, {} floating, {} temporary floating\nWorkspace: active {}\nForeground: {}",
+        "Winland daemon is running (IPC protocol v{}).\nConfig: v{} from {} loaded at {}\nWindows: {} total, {} manageable, {} floating, {} temporary floating\nWorkspace: active {}\nForeground: {}",
         winland_ipc::PROTOCOL_VERSION,
+        snapshot.config_version,
+        snapshot.config_path.as_deref().unwrap_or("<defaults>"),
+        snapshot.config_loaded_at_unix_ms,
         snapshot.total_windows,
         snapshot.manageable_windows,
         snapshot.floating_windows,
@@ -941,6 +993,19 @@ fn format_state_snapshot(snapshot: &DaemonStateSnapshot) -> String {
     output
 }
 
+fn format_reload_config_report(report: &ReloadConfigReport) -> String {
+    format!(
+        "Config reloaded successfully.\nConfig: v{} from {} loaded at {}\nChanged: {}\nWindows: {} total, {} manageable\nWorkspace: active {}",
+        report.config_version,
+        report.config_path.as_deref().unwrap_or("<defaults>"),
+        report.reloaded_at_unix_ms,
+        report.changed_sections.join(", "),
+        report.state.total_windows,
+        report.state.manageable_windows,
+        report.state.active_workspace,
+    )
+}
+
 fn format_hwnd_like(value: u64) -> String {
     format!("0x{value:X}")
 }
@@ -961,6 +1026,9 @@ mod tests {
     #[test]
     fn state_snapshot_format_is_human_readable() {
         let snapshot = DaemonStateSnapshot {
+            config_path: Some(r"C:\winland.toml".to_owned()),
+            config_version: 5,
+            config_loaded_at_unix_ms: 1000,
             total_windows: 3,
             manageable_windows: 2,
             floating_windows: 1,
@@ -987,10 +1055,41 @@ mod tests {
         let output = format_state_snapshot(&snapshot);
 
         assert!(output.contains("IPC protocol v1"));
+        assert!(output.contains("Config: v5 from C:\\winland.toml loaded at 1000"));
         assert!(output.contains("3 total, 2 manageable"));
         assert!(output.contains("Workspace: active 4"));
         assert!(output.contains("Foreground: 0xCAFE"));
         assert!(output.contains("0x1 workspace 4 focused"));
         assert!(output.contains("0xCAFE ws 4 mon 0x1 floating constrained visible"));
+    }
+
+    #[test]
+    fn reload_config_report_format_is_human_readable() {
+        let report = ReloadConfigReport {
+            config_path: None,
+            config_version: 2,
+            reloaded_at_unix_ms: 42,
+            changed_sections: vec!["hotkeys".to_owned(), "window-rules".to_owned()],
+            state: DaemonStateSnapshot {
+                config_path: None,
+                config_version: 2,
+                config_loaded_at_unix_ms: 42,
+                total_windows: 3,
+                manageable_windows: 2,
+                floating_windows: 0,
+                temporary_floating_windows: 0,
+                active_workspace: 1,
+                foreground_window: None,
+                monitors: Vec::new(),
+                windows: Vec::new(),
+            },
+        };
+
+        let output = format_reload_config_report(&report);
+
+        assert!(output.contains("Config reloaded successfully"));
+        assert!(output.contains("v2 from <defaults>"));
+        assert!(output.contains("hotkeys, window-rules"));
+        assert!(output.contains("3 total, 2 manageable"));
     }
 }

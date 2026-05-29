@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 use tracing::{debug, info, warn};
@@ -26,7 +26,8 @@ use winland_core::{
 };
 use winland_ipc::{
     DaemonStateSnapshot, IpcCommand, IpcRequest, IpcResponse, MonitorStateSnapshot,
-    WindowParticipationSnapshot, WindowStateSnapshot, decode_request, encode_response,
+    ReloadConfigReport, WindowParticipationSnapshot, WindowStateSnapshot, decode_request,
+    encode_response,
 };
 use winland_win32::{
     BorderColor, BorderManager, BorderUpdate, HotkeyBinding, HotkeyBypassRules, HotkeyEvent,
@@ -64,7 +65,7 @@ fn main() -> Result<()> {
     let hotkey_backend = install_hotkey_backend(
         &loaded_config.config,
         hotkey_bindings.clone(),
-        hotkey_sender,
+        hotkey_sender.clone(),
     )?;
     debug!(
         backend = hotkey_backend.name(),
@@ -73,13 +74,20 @@ fn main() -> Result<()> {
     let hotkey_bridge = spawn_hotkey_bridge(hotkey_receiver, daemon_sender.clone())
         .context("spawn hotkey bridge")?;
     let (mouse_drag_sender, mouse_drag_receiver) = mpsc::channel();
-    let modifier_drag = install_modifier_drag(&loaded_config.config, mouse_drag_sender)?;
+    let modifier_drag = install_modifier_drag(&loaded_config.config, mouse_drag_sender.clone())?;
     let mouse_drag_bridge = spawn_mouse_drag_bridge(mouse_drag_receiver, daemon_sender.clone())
         .context("spawn modifier drag bridge")?;
     drop(daemon_sender);
 
     let mut state = DaemonState::discover(runtime_config, hotkey_commands)
         .context("build initial window snapshot")?;
+    state.source_config = loaded_config.config.clone();
+    state.config_path = loaded_config.path.clone();
+    state.config_loaded_at = SystemTime::now();
+    state.hotkey_backend = Some(hotkey_backend);
+    state.hotkey_sender = Some(hotkey_sender);
+    state.modifier_drag = modifier_drag;
+    state.mouse_drag_sender = Some(mouse_drag_sender);
     state.border_manager = Some(BorderManager::new().context("start border overlay manager")?);
     state.apply_startup_retile()?;
     state.sync_borders("startup border sync")?;
@@ -92,8 +100,6 @@ fn main() -> Result<()> {
     let message_loop_result =
         winland_win32::run_message_loop().context("run Win32 daemon message loop");
 
-    drop(hotkey_backend);
-    drop(modifier_drag);
     drop(subscription);
     join_bridge(window_bridge, "window event bridge")?;
     join_bridge(hotkey_bridge, "hotkey bridge")?;
@@ -488,7 +494,7 @@ fn process_daemon_events(receiver: Receiver<DaemonEvent>, mut state: DaemonState
                     state.reconcile_after_events(&batch)?;
                 }
             }
-            DaemonEvent::Hotkey(event) => state.handle_hotkey(event)?,
+            DaemonEvent::Hotkey(event) => state.handle_hotkey_event(event),
             DaemonEvent::MouseDrag(event) => state.handle_mouse_drag(event)?,
             DaemonEvent::Ipc(request) => state.handle_ipc(request),
         }
@@ -518,7 +524,7 @@ fn receive_window_batch(
     while batch.len() < MAX_BATCH_SIZE {
         match receiver.recv_timeout(RECONCILE_DEBOUNCE) {
             Ok(DaemonEvent::Window(event)) => batch.push(event),
-            Ok(DaemonEvent::Hotkey(event)) => state.handle_hotkey(event)?,
+            Ok(DaemonEvent::Hotkey(event)) => state.handle_hotkey_event(event),
             Ok(DaemonEvent::MouseDrag(event)) => state.handle_mouse_drag(event)?,
             Ok(DaemonEvent::Ipc(request)) => state.handle_ipc(request),
             Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
@@ -536,7 +542,6 @@ enum DaemonEvent {
     Ipc(IpcTransportRequest),
 }
 
-#[derive(Debug)]
 struct DaemonState {
     windows: BTreeMap<WindowHandle, WindowInfo>,
     foreground: Option<WindowHandle>,
@@ -552,7 +557,15 @@ struct DaemonState {
     active_interactive_drag: Option<WindowHandle>,
     suppressed_modifier_drag_events: BTreeSet<WindowHandle>,
     config: RuntimeConfig,
+    source_config: Config,
+    config_path: Option<PathBuf>,
+    config_version: u64,
+    config_loaded_at: SystemTime,
     hotkey_commands: HotkeyCommandMap,
+    hotkey_backend: Option<HotkeyBackend>,
+    hotkey_sender: Option<Sender<HotkeyEvent>>,
+    modifier_drag: Option<winland_win32::ModifierDragRegistration>,
+    mouse_drag_sender: Option<Sender<MouseDragEvent>>,
     border_manager: Option<BorderManager>,
     game_mode: GameModeRuntimeState,
 }
@@ -630,7 +643,15 @@ impl DaemonState {
             active_interactive_drag: None,
             suppressed_modifier_drag_events: BTreeSet::new(),
             config,
+            source_config: Config::default(),
+            config_path: None,
+            config_version: 1,
+            config_loaded_at: UNIX_EPOCH,
             hotkey_commands,
+            hotkey_backend: None,
+            hotkey_sender: None,
+            modifier_drag: None,
+            mouse_drag_sender: None,
             border_manager: None,
             game_mode: GameModeRuntimeState::default(),
         };
@@ -836,9 +857,21 @@ impl DaemonState {
         let diff = self.diff(&refreshed, &monitors);
         self.preserve_keyboard_state(&mut refreshed, &monitors);
         refreshed.game_mode = self.game_mode.clone();
+        refreshed.source_config = self.source_config.clone();
+        refreshed.config_path = self.config_path.clone();
+        refreshed.config_version = self.config_version;
+        refreshed.config_loaded_at = self.config_loaded_at;
         let border_manager = self.border_manager.take();
+        let hotkey_backend = self.hotkey_backend.take();
+        let hotkey_sender = self.hotkey_sender.clone();
+        let modifier_drag = self.modifier_drag.take();
+        let mouse_drag_sender = self.mouse_drag_sender.clone();
         *self = refreshed;
         self.border_manager = border_manager;
+        self.hotkey_backend = hotkey_backend;
+        self.hotkey_sender = hotkey_sender;
+        self.modifier_drag = modifier_drag;
+        self.mouse_drag_sender = mouse_drag_sender;
         let transition = self.update_game_mode(&monitors, "event reconciliation")?;
         let mut event_plan = self.plan_after_window_events(batch, &diff, &monitors);
         if transition.deactivated && self.config.dynamic_retile {
@@ -904,6 +937,12 @@ impl DaemonState {
 
         info!(?command, "routing daemon hotkey command");
         self.execute_command(command)
+    }
+
+    fn handle_hotkey_event(&mut self, event: HotkeyEvent) {
+        if let Err(error) = self.handle_hotkey(event) {
+            warn!(%error, "daemon hotkey command failed");
+        }
     }
 
     fn should_ignore_modifier_drag_window_event(&self, event: WindowEvent) -> bool {
@@ -1300,9 +1339,16 @@ impl DaemonState {
         }
     }
 
-    fn handle_ipc_request(&self, request: IpcRequest) -> IpcResponse {
+    fn handle_ipc_request(&mut self, request: IpcRequest) -> IpcResponse {
         match request.command {
             IpcCommand::State => IpcResponse::state(self.state_snapshot()),
+            IpcCommand::ReloadConfig => match self.reload_config("ipc reload-config") {
+                Ok(report) => IpcResponse::reload_config(report),
+                Err(error) => {
+                    warn!(%error, "config reload failed");
+                    IpcResponse::error(error.to_string())
+                }
+            },
         }
     }
 
@@ -1313,6 +1359,12 @@ impl DaemonState {
 
     fn state_snapshot_with_monitors(&self, monitors: &[MonitorInfo]) -> DaemonStateSnapshot {
         DaemonStateSnapshot {
+            config_path: self
+                .config_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            config_version: self.config_version,
+            config_loaded_at_unix_ms: system_time_unix_ms(self.config_loaded_at),
             total_windows: self.windows.len(),
             manageable_windows: self.manageable_window_count(),
             floating_windows: self.floating_window_count(),
@@ -1380,6 +1432,133 @@ impl DaemonState {
         }
     }
 
+    fn reload_config(&mut self, operation: &'static str) -> Result<ReloadConfigReport> {
+        let loaded_config =
+            winland_config::load_or_default(None).context("reload Winland config from disk")?;
+        loaded_config
+            .config
+            .validate()
+            .context("validate reloaded Winland config")?;
+        let runtime_config =
+            RuntimeConfig::from_config(&loaded_config.config).context("prepare runtime config")?;
+        let (new_hotkey_bindings, new_hotkey_commands) =
+            hotkey_bindings_from_config(&loaded_config.config)
+                .context("prepare hotkey bindings for reloaded config")?;
+        let diff = ConfigDiff::between(&self.source_config, &loaded_config.config);
+
+        let mut refreshed = Self::discover(runtime_config, new_hotkey_commands.clone())
+            .context("build reloaded daemon window snapshot")?;
+        let monitors = winland_win32::enumerate_monitors()
+            .context("enumerate monitors while reloading daemon state")?;
+        self.preserve_keyboard_state(&mut refreshed, &monitors);
+        refreshed.dwindle_splits.clear();
+        refreshed
+            .workspaces
+            .set_workspace_count(refreshed.config.workspace_count);
+        refreshed.sync_workspace_state(&monitors);
+
+        let previous_visibility = self.window_visibility_map(&monitors);
+
+        self.replace_hotkey_backend_for_reload(&loaded_config.config, new_hotkey_bindings)
+            .context("activate reloaded hotkeys")?;
+        if let Err(error) = self.replace_modifier_drag_for_reload(&loaded_config.config) {
+            let old_config = self.source_config.clone();
+            if let Ok((old_bindings, _)) = hotkey_bindings_from_config(&old_config)
+                && let Err(restore_error) =
+                    self.replace_hotkey_backend_for_reload(&old_config, old_bindings)
+            {
+                warn!(
+                    %restore_error,
+                    "failed to restore previous hotkeys after modifier-drag reload failure"
+                );
+            }
+            return Err(error).context("activate reloaded modifier-drag settings");
+        }
+
+        let border_manager = self.border_manager.take();
+        let hotkey_backend = self.hotkey_backend.take();
+        let hotkey_sender = self.hotkey_sender.clone();
+        let modifier_drag = self.modifier_drag.take();
+        let mouse_drag_sender = self.mouse_drag_sender.clone();
+
+        refreshed.source_config = loaded_config.config.clone();
+        refreshed.config_path = loaded_config.path.clone();
+        refreshed.config_version = self.config_version.saturating_add(1);
+        refreshed.config_loaded_at = SystemTime::now();
+        refreshed.border_manager = border_manager;
+        refreshed.hotkey_backend = hotkey_backend;
+        refreshed.hotkey_sender = hotkey_sender;
+        refreshed.modifier_drag = modifier_drag;
+        refreshed.mouse_drag_sender = mouse_drag_sender;
+        refreshed.game_mode = self.game_mode.clone();
+
+        *self = refreshed;
+        let rule_stats = self.reapply_window_rules_after_reload(&monitors);
+        let visibility_changes =
+            self.visibility_changes_after_reload(previous_visibility, &monitors);
+        let transition = self.update_game_mode(&monitors, operation)?;
+
+        for window in &visibility_changes.hide {
+            if let Err(error) = winland_win32::hide_window(*window) {
+                warn!(window = %window, %error, "failed to hide window after config reload");
+            }
+        }
+        for change in &visibility_changes.show {
+            if let Some(rect) = change.restore_rect
+                && let Err(error) = winland_win32::move_resize_window(change.window, rect)
+            {
+                warn!(
+                    window = %change.window,
+                    rect = %rect,
+                    %error,
+                    "failed to restore window placement after config reload"
+                );
+            }
+            if let Err(error) = winland_win32::show_window_without_activate(change.window) {
+                warn!(window = %change.window, %error, "failed to show window after config reload");
+            }
+        }
+
+        if !self.game_mode_pauses_layouts() {
+            let assignments = self.tile_assignments(&monitors);
+            self.apply_tile_assignments_with_feedback(&assignments, &monitors, operation);
+        }
+        if let Err(error) = self.sync_borders_with_monitors(&monitors, "reload-config borders") {
+            warn!(%error, "config reload applied but border sync failed");
+        }
+
+        self.log_snapshot("reloaded daemon config");
+        info!(
+            version = self.config_version,
+            path = self
+                .config_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<defaults>".to_owned()),
+            changed_sections = ?diff.changed_sections,
+            rules_added = rule_stats.added_to_tile_order,
+            rules_removed = rule_stats.removed_from_tile_order,
+            rules_floated = rule_stats.set_floating,
+            rules_tiled = rule_stats.set_tiled,
+            hidden = visibility_changes.hide.len(),
+            shown = visibility_changes.show.len(),
+            game_mode_activated = transition.activated,
+            game_mode_deactivated = transition.deactivated,
+            "config reload applied"
+        );
+
+        Ok(ReloadConfigReport {
+            config_path: self
+                .config_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            config_version: self.config_version,
+            reloaded_at_unix_ms: system_time_unix_ms(self.config_loaded_at),
+            changed_sections: diff.changed_sections,
+            state: self.state_snapshot_with_monitors(&monitors),
+        })
+    }
+
     fn execute_command(&mut self, command: DaemonCommand) -> Result<()> {
         if let DaemonCommand::Launch(command_line) = &command {
             winland_win32::launch_app(command_line)
@@ -1388,22 +1567,7 @@ impl DaemonState {
         }
 
         if command == DaemonCommand::Reload {
-            let loaded_config =
-                winland_config::load_or_default(None).context("reload Winland config")?;
-            log_loaded_config(&loaded_config);
-            let runtime_config = RuntimeConfig::from_config(&loaded_config.config)?;
-            let mut refreshed = Self::discover(runtime_config, self.hotkey_commands.clone())
-                .context("reload daemon window snapshot")?;
-            let monitors = winland_win32::enumerate_monitors()
-                .context("enumerate monitors while reloading daemon state")?;
-            self.preserve_keyboard_state(&mut refreshed, &monitors);
-            refreshed.dwindle_splits.clear();
-            let border_manager = self.border_manager.take();
-            *self = refreshed;
-            self.border_manager = border_manager;
-            self.update_game_mode(&monitors, "reload")?;
-            self.log_snapshot("reloaded daemon state");
-            self.sync_borders_with_monitors(&monitors, "reload borders")?;
+            self.reload_config("hotkey reload")?;
             return Ok(());
         }
 
@@ -2891,6 +3055,9 @@ impl DaemonState {
 
     fn preserve_keyboard_state(&self, refreshed: &mut Self, monitors: &[MonitorInfo]) {
         refreshed.workspaces = self.workspaces.clone();
+        refreshed
+            .workspaces
+            .set_workspace_count(refreshed.config.workspace_count);
         refreshed.sync_workspace_state(monitors);
 
         let known_workspace_windows: BTreeSet<_> = refreshed
@@ -2956,6 +3123,193 @@ impl DaemonState {
             .copied()
             .filter(|handle| refreshed.windows.contains_key(handle))
             .collect();
+    }
+
+    fn window_visibility_map(&self, monitors: &[MonitorInfo]) -> BTreeMap<WindowHandle, bool> {
+        self.windows
+            .keys()
+            .copied()
+            .map(|handle| {
+                (
+                    handle,
+                    self.is_window_visible_on_owned_monitor(handle, monitors),
+                )
+            })
+            .collect()
+    }
+
+    fn visibility_changes_after_reload(
+        &self,
+        previous_visibility: BTreeMap<WindowHandle, bool>,
+        monitors: &[MonitorInfo],
+    ) -> ReloadVisibilityChanges {
+        let mut changes = ReloadVisibilityChanges::default();
+
+        for handle in self.windows.keys().copied() {
+            let was_visible = previous_visibility.get(&handle).copied().unwrap_or(false);
+            let is_visible = self.is_window_visible_on_owned_monitor(handle, monitors);
+            if was_visible && !is_visible && self.should_hide_for_workspace(handle, monitors) {
+                changes.hide.push(handle);
+            } else if !was_visible && is_visible {
+                changes.show.push(WorkspaceVisibilityChange {
+                    window: handle,
+                    restore_rect: self
+                        .workspaces
+                        .window_state(handle)
+                        .and_then(|state| state.last_rect),
+                });
+            }
+        }
+
+        changes
+    }
+
+    fn reapply_window_rules_after_reload(&mut self, monitors: &[MonitorInfo]) -> RuleReloadStats {
+        let mut stats = RuleReloadStats::default();
+        let windows: Vec<_> = self
+            .windows
+            .iter()
+            .map(|(handle, window)| (*handle, window.clone()))
+            .collect();
+
+        for (handle, window) in windows {
+            let decision = self.rule_decision(&window);
+            let manageable = self.is_workspace_manageable_by_rules(&window, &decision)
+                && !is_fullscreen_window(
+                    &window,
+                    monitors,
+                    self.config.game_mode.policy.fullscreen_tolerance_px,
+                );
+
+            if !manageable {
+                if self.workspaces.remove_window(handle) {
+                    stats.untracked += 1;
+                }
+                if self.participation.remove(&handle).is_some() {
+                    stats.set_tiled += 1;
+                }
+                self.overflow_floating.remove(&handle);
+                continue;
+            }
+
+            if self.workspaces.window_state(handle).is_none() {
+                if let Some(workspace) = decision.target_workspace {
+                    self.workspaces
+                        .track_window_on_workspace(handle, workspace, window.rect);
+                } else if let Some(monitor) = self.window_owner_monitor(handle, monitors) {
+                    self.workspaces.track_window_on_workspace(
+                        handle,
+                        self.workspaces.active_workspace_for_monitor(monitor),
+                        window.rect,
+                    );
+                } else {
+                    self.workspaces.track_window(handle, window.rect);
+                }
+            }
+
+            if let Some(workspace) = decision.target_workspace {
+                self.workspaces.move_window_to_workspace(handle, workspace);
+            }
+            if let Some(always_on_workspace) = decision.always_on_workspace {
+                self.workspaces
+                    .set_visible_on_all_workspaces(handle, always_on_workspace);
+            }
+            match decision.float {
+                Some(true) => {
+                    self.set_window_participation(handle, WindowParticipation::Floating);
+                    stats.set_floating += 1;
+                }
+                Some(false) => {
+                    self.set_window_participation(handle, WindowParticipation::Tiled);
+                    stats.set_tiled += 1;
+                }
+                None => {}
+            }
+        }
+
+        let before = self.tile_order.clone();
+        let manageable: BTreeSet<_> = self.manageable_handles_sorted().into_iter().collect();
+        self.tile_order.retain(|handle| manageable.contains(handle));
+        stats.removed_from_tile_order = before.len().saturating_sub(self.tile_order.len());
+
+        for handle in manageable {
+            if !self.tile_order.contains(&handle) {
+                self.tile_order.push(handle);
+                stats.added_to_tile_order += 1;
+            }
+        }
+
+        stats
+    }
+
+    fn replace_hotkey_backend_for_reload(
+        &mut self,
+        config: &Config,
+        bindings: Vec<HotkeyBinding>,
+    ) -> Result<()> {
+        let Some(sender) = self.hotkey_sender.clone() else {
+            return Ok(());
+        };
+        let old_config = self.source_config.clone();
+        let old_backend = self.hotkey_backend.take();
+        drop(old_backend);
+
+        match install_hotkey_backend_strict(config, bindings, sender.clone()) {
+            Ok(backend) => {
+                debug!(backend = backend.name(), "reloaded daemon hotkey backend");
+                self.hotkey_backend = Some(backend);
+                Ok(())
+            }
+            Err(error) => {
+                let restore_result = hotkey_bindings_from_config(&old_config)
+                    .context("rebuild previous hotkeys after reload failure")
+                    .and_then(|(old_bindings, _)| {
+                        install_hotkey_backend(&old_config, old_bindings, sender)
+                            .context("restore previous hotkeys after reload failure")
+                    });
+                match restore_result {
+                    Ok(backend) => {
+                        self.hotkey_backend = Some(backend);
+                        Err(error)
+                            .context("new hotkey registration failed; previous hotkeys restored")
+                    }
+                    Err(restore_error) => Err(anyhow!(
+                        "new hotkey registration failed ({error}); previous hotkeys could not be restored: {restore_error}"
+                    )),
+                }
+            }
+        }
+    }
+
+    fn replace_modifier_drag_for_reload(&mut self, config: &Config) -> Result<()> {
+        let Some(sender) = self.mouse_drag_sender.clone() else {
+            return Ok(());
+        };
+        let old_config = self.source_config.clone();
+        let old_registration = self.modifier_drag.take();
+        drop(old_registration);
+
+        match install_modifier_drag(config, sender.clone()) {
+            Ok(registration) => {
+                self.modifier_drag = registration;
+                Ok(())
+            }
+            Err(error) => {
+                let restore_result = install_modifier_drag(&old_config, sender)
+                    .context("restore previous modifier drag settings after reload failure");
+                match restore_result {
+                    Ok(registration) => {
+                        self.modifier_drag = registration;
+                        Err(error).context(
+                            "new modifier drag settings failed; previous settings restored",
+                        )
+                    }
+                    Err(restore_error) => Err(anyhow!(
+                        "new modifier drag settings failed ({error}); previous settings could not be restored: {restore_error}"
+                    )),
+                }
+            }
+        }
     }
 
     fn diff(&self, refreshed: &Self, monitors: &[MonitorInfo]) -> SnapshotDiff {
@@ -3413,6 +3767,71 @@ struct CommandPlan {
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
+struct ReloadVisibilityChanges {
+    hide: Vec<WindowHandle>,
+    show: Vec<WorkspaceVisibilityChange>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RuleReloadStats {
+    untracked: usize,
+    added_to_tile_order: usize,
+    removed_from_tile_order: usize,
+    set_floating: usize,
+    set_tiled: usize,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ConfigDiff {
+    changed_sections: Vec<String>,
+}
+
+impl ConfigDiff {
+    fn between(old: &Config, new: &Config) -> Self {
+        let mut changed_sections = Vec::new();
+
+        if old.hotkeys != new.hotkeys {
+            changed_sections.push("hotkeys".to_owned());
+        }
+        if old.layout.default != new.layout.default
+            || old.layout.master_ratio_percent != new.layout.master_ratio_percent
+            || old.layout.smart_split != new.layout.smart_split
+            || old.layout.preserve_split != new.layout.preserve_split
+            || old.layout.per_monitor != new.layout.per_monitor
+            || old.layout.per_workspace != new.layout.per_workspace
+        {
+            changed_sections.push("layout".to_owned());
+        }
+        if old.layout.gap != new.layout.gap || old.layout.border != new.layout.border {
+            changed_sections.push("gaps".to_owned());
+        }
+        if old.borders != new.borders {
+            changed_sections.push("borders".to_owned());
+        }
+        if old.window_rules != new.window_rules {
+            changed_sections.push("window-rules".to_owned());
+        }
+        if old.behavior != new.behavior {
+            changed_sections.push("behavior".to_owned());
+        }
+        if old.game_mode != new.game_mode {
+            changed_sections.push("game-mode".to_owned());
+        }
+        if old.workspaces != new.workspaces {
+            changed_sections.push("workspaces".to_owned());
+        }
+        if old.general != new.general {
+            changed_sections.push("general".to_owned());
+        }
+        if changed_sections.is_empty() {
+            changed_sections.push("none".to_owned());
+        }
+
+        Self { changed_sections }
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
 struct WorkspaceCommandPlan {
     focus: Option<WindowHandle>,
     hide: Vec<WindowHandle>,
@@ -3434,6 +3853,13 @@ struct BorderCandidate {
 
 fn count_events(batch: &[WindowEvent], kind: WindowEventKind) -> usize {
     batch.iter().filter(|event| event.kind == kind).count()
+}
+
+fn system_time_unix_ms(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
 }
 
 fn offset_rect_by_cursor_delta(rect: Rect, start: Point, current: Point) -> Rect {
@@ -3505,6 +3931,38 @@ fn install_hotkey_backend(
     }
 }
 
+fn install_hotkey_backend_strict(
+    config: &Config,
+    hotkey_bindings: Vec<HotkeyBinding>,
+    hotkey_sender: Sender<HotkeyEvent>,
+) -> Result<HotkeyBackend> {
+    match config.hotkeys.mode {
+        HotkeyMode::Normal => {
+            let registration =
+                winland_win32::register_hotkeys(hotkey_bindings.clone(), hotkey_sender)
+                    .context("register documented Win32 daemon hotkeys")?;
+            log_hotkey_registration(&hotkey_bindings, &registration);
+            if !registration.failures().is_empty() {
+                let failures = format_hotkey_registration_failures(registration.failures());
+                return Err(anyhow!("failed to register reloaded hotkeys: {failures}"));
+            }
+            Ok(HotkeyBackend::Registered {
+                _registration: registration,
+            })
+        }
+        HotkeyMode::AdvancedInterception => {
+            let options = hotkey_override_options_from_config(config)?;
+            log_hotkey_override_bindings(&hotkey_bindings, &options);
+            let registration =
+                winland_win32::install_hotkey_override(hotkey_bindings, options, hotkey_sender)
+                    .context("install documented low-level keyboard hook for hotkey override")?;
+            Ok(HotkeyBackend::Override {
+                _registration: registration,
+            })
+        }
+    }
+}
+
 fn install_modifier_drag(
     config: &Config,
     mouse_drag_sender: Sender<MouseDragEvent>,
@@ -3527,6 +3985,21 @@ fn install_modifier_drag(
         "installed modifier drag hook"
     );
     Ok(Some(registration))
+}
+
+fn format_hotkey_registration_failures(
+    failures: &[winland_win32::HotkeyRegistrationFailure],
+) -> String {
+    failures
+        .iter()
+        .map(|failure| {
+            format!(
+                "{} (id {}): {}",
+                failure.description, failure.id.0, failure.error
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn hotkey_bindings_from_config(config: &Config) -> Result<(Vec<HotkeyBinding>, HotkeyCommandMap)> {
@@ -5688,6 +6161,103 @@ mod tests {
     }
 
     #[test]
+    fn config_diff_reports_reload_sections() {
+        let old = Config::default();
+        let mut new = old.clone();
+        new.layout.gap = 8;
+        new.borders.enabled = true;
+        new.game_mode.game_exes.push("game.exe".to_owned());
+
+        let diff = ConfigDiff::between(&old, &new);
+
+        assert_eq!(diff.changed_sections, vec!["gaps", "borders", "game-mode"]);
+    }
+
+    #[test]
+    fn rule_reload_updates_workspace_and_respects_explicit_float_state() {
+        let mut state = daemon_state([
+            window(1, "Editor", Rect::from_size(0, 0, 100, 100)),
+            window(2, "Settings", Rect::from_size(200, 0, 100, 100)),
+        ]);
+        state.set_window_participation(WindowHandle(2), WindowParticipation::Floating);
+        state.config.window_rules = vec![WindowRule {
+            name: "settings to workspace two".to_owned(),
+            matcher: winland_core::WindowRuleMatch {
+                title: Some(winland_core::TextMatcher::Exact("Settings".to_owned())),
+                ..winland_core::WindowRuleMatch::default()
+            },
+            action: winland_core::WindowRuleAction {
+                target_workspace: Some(WorkspaceId(2)),
+                ..winland_core::WindowRuleAction::default()
+            },
+        }];
+
+        state.reapply_window_rules_after_reload(&[primary_test_monitor()]);
+
+        assert_eq!(
+            state
+                .workspaces
+                .window_state(WindowHandle(2))
+                .unwrap()
+                .workspace,
+            WorkspaceId(2)
+        );
+        assert_eq!(
+            state.window_participation(WindowHandle(2)),
+            WindowParticipation::Floating
+        );
+    }
+
+    #[test]
+    fn rule_reload_only_tiles_floating_window_when_rule_says_so() {
+        let mut state = daemon_state([window(1, "Settings", Rect::from_size(0, 0, 100, 100))]);
+        state.set_window_participation(WindowHandle(1), WindowParticipation::Floating);
+        state.config.window_rules = vec![WindowRule {
+            name: "force settings tiled".to_owned(),
+            matcher: winland_core::WindowRuleMatch {
+                title: Some(winland_core::TextMatcher::Exact("Settings".to_owned())),
+                ..winland_core::WindowRuleMatch::default()
+            },
+            action: winland_core::WindowRuleAction {
+                float: Some(false),
+                ..winland_core::WindowRuleAction::default()
+            },
+        }];
+
+        state.reapply_window_rules_after_reload(&[primary_test_monitor()]);
+
+        assert_eq!(
+            state.window_participation(WindowHandle(1)),
+            WindowParticipation::Tiled
+        );
+    }
+
+    #[test]
+    fn rule_reload_removes_ignored_windows_from_tiling_order() {
+        let mut state = daemon_state([
+            window(1, "Editor", Rect::from_size(0, 0, 100, 100)),
+            window(2, "Tool", Rect::from_size(200, 0, 100, 100)),
+        ]);
+        state.config.window_rules = vec![WindowRule {
+            name: "ignore tool".to_owned(),
+            matcher: winland_core::WindowRuleMatch {
+                title: Some(winland_core::TextMatcher::Exact("Tool".to_owned())),
+                ..winland_core::WindowRuleMatch::default()
+            },
+            action: winland_core::WindowRuleAction {
+                manage: Some(false),
+                ..winland_core::WindowRuleAction::default()
+            },
+        }];
+
+        let stats = state.reapply_window_rules_after_reload(&[primary_test_monitor()]);
+
+        assert_eq!(stats.removed_from_tile_order, 1);
+        assert_eq!(state.tile_order, vec![WindowHandle(1)]);
+        assert!(state.workspaces.window_state(WindowHandle(2)).is_none());
+    }
+
+    #[test]
     fn border_candidates_use_focus_inactive_and_floating_colors() {
         let mut state = daemon_state([
             window(1, "One", Rect::from_size(0, 0, 100, 100)),
@@ -5884,7 +6454,15 @@ mod tests {
             active_interactive_drag: None,
             suppressed_modifier_drag_events: BTreeSet::new(),
             config: RuntimeConfig::default(),
+            source_config: Config::default(),
+            config_path: None,
+            config_version: 1,
+            config_loaded_at: UNIX_EPOCH,
             hotkey_commands: HotkeyCommandMap::default(),
+            hotkey_backend: None,
+            hotkey_sender: None,
+            modifier_drag: None,
+            mouse_drag_sender: None,
             border_manager: None,
             game_mode: GameModeRuntimeState::default(),
         };

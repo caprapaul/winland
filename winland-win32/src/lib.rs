@@ -736,6 +736,19 @@ mod platform {
         hook: HHOOK,
     }
 
+    // SAFETY: These registration wrappers own opaque Win32 hook handles. They
+    // do not expose borrowed Rust data, and Drop only asks Win32 to unregister
+    // the owned handle or hotkey IDs at most once.
+    unsafe impl Send for HotkeyRegistration {}
+
+    // SAFETY: See HotkeyRegistration. The low-level keyboard hook handle is
+    // process-owned and removed by handle during Drop.
+    unsafe impl Send for HotkeyOverrideRegistration {}
+
+    // SAFETY: See HotkeyRegistration. The low-level mouse hook handle
+    // is process-owned and removed by handle during Drop.
+    unsafe impl Send for ModifierDragRegistration {}
+
     pub struct IpcServer {
         _handle: JoinHandle<()>,
     }

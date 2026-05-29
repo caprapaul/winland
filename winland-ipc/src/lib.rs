@@ -15,12 +15,20 @@ impl IpcRequest {
             command: IpcCommand::State,
         }
     }
+
+    pub fn reload_config() -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            command: IpcCommand::ReloadConfig,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", tag = "type")]
 pub enum IpcCommand {
     State,
+    ReloadConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,6 +42,13 @@ impl IpcResponse {
         Self {
             protocol_version: PROTOCOL_VERSION,
             result: IpcResponseResult::State(snapshot),
+        }
+    }
+
+    pub fn reload_config(report: ReloadConfigReport) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            result: IpcResponseResult::ReloadConfig(report),
         }
     }
 
@@ -51,6 +66,7 @@ impl IpcResponse {
 #[serde(rename_all = "kebab-case", tag = "type")]
 pub enum IpcResponseResult {
     State(DaemonStateSnapshot),
+    ReloadConfig(ReloadConfigReport),
     Error(IpcError),
 }
 
@@ -61,6 +77,9 @@ pub struct IpcError {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonStateSnapshot {
+    pub config_path: Option<String>,
+    pub config_version: u64,
+    pub config_loaded_at_unix_ms: u64,
     pub total_windows: usize,
     pub manageable_windows: usize,
     pub floating_windows: usize,
@@ -69,6 +88,15 @@ pub struct DaemonStateSnapshot {
     pub foreground_window: Option<u64>,
     pub monitors: Vec<MonitorStateSnapshot>,
     pub windows: Vec<WindowStateSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReloadConfigReport {
+    pub config_path: Option<String>,
+    pub config_version: u64,
+    pub reloaded_at_unix_ms: u64,
+    pub changed_sections: Vec<String>,
+    pub state: DaemonStateSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,6 +194,9 @@ mod tests {
     #[test]
     fn state_response_round_trips() {
         let snapshot = DaemonStateSnapshot {
+            config_path: Some(r"C:\Users\me\.config\winland\winland.toml".to_owned()),
+            config_version: 3,
+            config_loaded_at_unix_ms: 1234,
             total_windows: 4,
             manageable_windows: 3,
             floating_windows: 1,
@@ -193,6 +224,40 @@ mod tests {
         let decoded = decode_response(&encoded).unwrap();
 
         assert_eq!(decoded, IpcResponse::state(snapshot));
+    }
+
+    #[test]
+    fn reload_config_request_and_response_round_trip() {
+        let encoded = encode_request(&IpcRequest::reload_config()).unwrap();
+        let decoded = decode_request(&encoded).unwrap();
+
+        assert_eq!(decoded, IpcRequest::reload_config());
+
+        let snapshot = DaemonStateSnapshot {
+            config_path: None,
+            config_version: 2,
+            config_loaded_at_unix_ms: 42,
+            total_windows: 0,
+            manageable_windows: 0,
+            floating_windows: 0,
+            temporary_floating_windows: 0,
+            active_workspace: 1,
+            foreground_window: None,
+            monitors: Vec::new(),
+            windows: Vec::new(),
+        };
+        let report = ReloadConfigReport {
+            config_path: None,
+            config_version: 2,
+            reloaded_at_unix_ms: 42,
+            changed_sections: vec!["hotkeys".to_owned(), "layout".to_owned()],
+            state: snapshot,
+        };
+
+        let encoded = encode_response(&IpcResponse::reload_config(report.clone())).unwrap();
+        let decoded = decode_response(&encoded).unwrap();
+
+        assert_eq!(decoded, IpcResponse::reload_config(report));
     }
 
     #[test]

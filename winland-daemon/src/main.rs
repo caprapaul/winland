@@ -27,9 +27,10 @@ use winland_ipc::{
     DaemonStateSnapshot, IpcCommand, IpcRequest, IpcResponse, decode_request, encode_response,
 };
 use winland_win32::{
-    HotkeyBinding, HotkeyBypassRules, HotkeyEvent, HotkeyId, HotkeyLowLevelEvent,
-    HotkeyModifierSet, HotkeyOverrideOptions, IpcTransportRequest, ModifierDragOptions,
-    MouseDragEvent, MouseDragEventKind, VirtualKey, WindowEvent, WindowEventKind,
+    BorderColor, BorderManager, BorderUpdate, HotkeyBinding, HotkeyBypassRules, HotkeyEvent,
+    HotkeyId, HotkeyLowLevelEvent, HotkeyModifierSet, HotkeyOverrideOptions, IpcTransportRequest,
+    ModifierDragOptions, MouseDragEvent, MouseDragEventKind, VirtualKey, WindowEvent,
+    WindowEventKind,
 };
 
 const RECONCILE_DEBOUNCE: Duration = Duration::from_millis(50);
@@ -77,7 +78,9 @@ fn main() -> Result<()> {
 
     let mut state = DaemonState::discover(runtime_config, hotkey_commands)
         .context("build initial window snapshot")?;
+    state.border_manager = Some(BorderManager::new().context("start border overlay manager")?);
     state.apply_startup_retile()?;
+    state.sync_borders("startup border sync")?;
     let processor = thread::Builder::new()
         .name("winland-daemon-events".to_owned())
         .spawn(move || process_daemon_events(daemon_receiver, state))
@@ -217,6 +220,7 @@ struct RuntimeConfig {
     drag_to_float: bool,
     retile_on_drag_end: bool,
     overflow_focus_policy: OverflowFocusPolicy,
+    borders: RuntimeBorderConfig,
 }
 
 impl RuntimeConfig {
@@ -232,6 +236,7 @@ impl RuntimeConfig {
             drag_to_float: config.behavior.drag_to_float,
             retile_on_drag_end: config.behavior.retile_on_drag_end,
             overflow_focus_policy: config.behavior.overflow_focus_policy,
+            borders: RuntimeBorderConfig::from_config(&config.borders)?,
         })
     }
 
@@ -244,6 +249,48 @@ impl RuntimeConfig {
             workspace,
         )
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RuntimeBorderConfig {
+    enabled: bool,
+    width: i32,
+    active_color: BorderColor,
+    inactive_color: BorderColor,
+    floating_color: BorderColor,
+    show_inactive: bool,
+    disable_when_fullscreen: bool,
+}
+
+impl RuntimeBorderConfig {
+    fn from_config(config: &winland_config::BordersConfig) -> Result<Self> {
+        Ok(Self {
+            enabled: config.enabled,
+            width: i32::from(config.width),
+            active_color: parse_border_color(&config.active_color)
+                .context("parse borders.active_color")?,
+            inactive_color: parse_border_color(&config.inactive_color)
+                .context("parse borders.inactive_color")?,
+            floating_color: parse_border_color(&config.floating_color)
+                .context("parse borders.floating_color")?,
+            show_inactive: config.show_inactive,
+            disable_when_fullscreen: config.disable_when_fullscreen,
+        })
+    }
+}
+
+fn parse_border_color(input: &str) -> Result<BorderColor> {
+    let hex = input
+        .strip_prefix('#')
+        .ok_or_else(|| anyhow!("border color must use #RRGGBB syntax"))?;
+    if hex.len() != 6 {
+        return Err(anyhow!("border color must use #RRGGBB syntax"));
+    }
+
+    let red = u8::from_str_radix(&hex[0..2], 16)?;
+    let green = u8::from_str_radix(&hex[2..4], 16)?;
+    let blue = u8::from_str_radix(&hex[4..6], 16)?;
+    Ok(BorderColor::new(red, green, blue))
 }
 
 impl Default for RuntimeConfig {
@@ -405,8 +452,12 @@ fn process_daemon_events(receiver: Receiver<DaemonEvent>, mut state: DaemonState
     while let Ok(event) = receiver.recv() {
         match event {
             DaemonEvent::Window(first_event) => {
-                let batch = receive_window_batch(&receiver, &mut state, first_event)?;
-                state.reconcile_after_events(&batch)?;
+                if should_process_window_event_immediately(first_event) {
+                    state.reconcile_after_events(&[first_event])?;
+                } else {
+                    let batch = receive_window_batch(&receiver, &mut state, first_event)?;
+                    state.reconcile_after_events(&batch)?;
+                }
             }
             DaemonEvent::Hotkey(event) => state.handle_hotkey(event)?,
             DaemonEvent::MouseDrag(event) => state.handle_mouse_drag(event)?,
@@ -416,6 +467,16 @@ fn process_daemon_events(receiver: Receiver<DaemonEvent>, mut state: DaemonState
 
     info!("daemon event channel closed; event processor stopping");
     Ok(())
+}
+
+fn should_process_window_event_immediately(event: WindowEvent) -> bool {
+    matches!(
+        event.kind,
+        WindowEventKind::Moved
+            | WindowEventKind::MoveSizeStart
+            | WindowEventKind::MoveSizeEnd
+            | WindowEventKind::ForegroundChanged
+    )
 }
 
 fn receive_window_batch(
@@ -462,6 +523,7 @@ struct DaemonState {
     suppressed_modifier_drag_events: BTreeSet<WindowHandle>,
     config: RuntimeConfig,
     hotkey_commands: HotkeyCommandMap,
+    border_manager: Option<BorderManager>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -506,6 +568,7 @@ impl DaemonState {
             suppressed_modifier_drag_events: BTreeSet::new(),
             config,
             hotkey_commands,
+            border_manager: None,
         };
         state.tile_order = state.manageable_handles_sorted();
         state.sync_workspace_state(&monitors);
@@ -558,15 +621,22 @@ impl DaemonState {
         }
         let batch = filtered_batch.as_slice();
 
+        if self.reconcile_low_latency_window_events(batch)? {
+            return Ok(());
+        }
+
         let mut refreshed = Self::discover(self.config.clone(), self.hotkey_commands.clone())
             .context("refresh window snapshot after event batch")?;
         let monitors = winland_win32::enumerate_monitors()
             .context("enumerate monitors while preserving daemon state")?;
         let diff = self.diff(&refreshed, &monitors);
         self.preserve_keyboard_state(&mut refreshed, &monitors);
+        let border_manager = self.border_manager.take();
         *self = refreshed;
+        self.border_manager = border_manager;
         let event_plan = self.plan_after_window_events(batch, &diff, &monitors);
         self.apply_tile_assignments_with_feedback(&event_plan.moves, &monitors, "dynamic retile");
+        self.sync_borders_with_monitors(&monitors, "event reconciliation borders")?;
 
         debug!(
             event_count = batch.len(),
@@ -634,6 +704,129 @@ impl DaemonState {
             || self.suppressed_modifier_drag_events.contains(&event.window))
     }
 
+    fn reconcile_low_latency_window_events(&mut self, batch: &[WindowEvent]) -> Result<bool> {
+        if batch.is_empty() {
+            return Ok(true);
+        }
+
+        if batch
+            .iter()
+            .all(|event| event.kind == WindowEventKind::Moved)
+        {
+            return self.reconcile_moved_window_events(batch);
+        }
+
+        if batch.len() != 1 {
+            return Ok(false);
+        }
+
+        match batch[0].kind {
+            WindowEventKind::MoveSizeStart | WindowEventKind::MoveSizeEnd => {
+                self.reconcile_movesize_event(batch[0])
+            }
+            WindowEventKind::ForegroundChanged => {
+                self.foreground =
+                    winland_win32::foreground_window().context("read foreground window")?;
+                self.sync_borders("foreground border update")?;
+                debug!(
+                    foreground = ?self.foreground,
+                    "updated foreground state without full snapshot rebuild"
+                );
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn reconcile_moved_window_events(&mut self, batch: &[WindowEvent]) -> Result<bool> {
+        let mut handles = BTreeSet::new();
+        for event in batch {
+            if !self.windows.contains_key(&event.window) {
+                return Ok(false);
+            }
+            handles.insert(event.window);
+        }
+
+        let monitors = winland_win32::enumerate_monitors()
+            .context("enumerate monitors for low-latency move event")?;
+        let mut moved_between_monitors = false;
+        let mut updated = 0usize;
+
+        for window in handles {
+            let Some(old_rect) = self.windows.get(&window).map(|info| info.rect) else {
+                return Ok(false);
+            };
+            let old_monitor = monitor_for_rect(old_rect, &monitors);
+            let rect = winland_win32::window_rect_for_handle(window)
+                .with_context(|| format!("read moved window rect for {window}"))?;
+            let new_monitor = monitor_for_rect(rect, &monitors);
+
+            if old_rect != rect {
+                if let Some(info) = self.windows.get_mut(&window) {
+                    info.rect = rect;
+                }
+                self.workspaces.update_window_rect(window, rect);
+                updated += 1;
+            }
+
+            if old_monitor.is_some() && new_monitor.is_some() && old_monitor != new_monitor {
+                moved_between_monitors = true;
+            }
+        }
+
+        if moved_between_monitors && self.config.dynamic_retile {
+            let assignments = self.tile_assignments(&monitors);
+            self.apply_tile_assignments_with_feedback(
+                &assignments,
+                &monitors,
+                "low-latency monitor move retile",
+            );
+            debug!(
+                updated_windows = updated,
+                retile_moves = assignments.len(),
+                "handled moved window events with monitor retile"
+            );
+        } else {
+            debug!(
+                updated_windows = updated,
+                moved_between_monitors, "handled moved window events without full snapshot rebuild"
+            );
+        }
+
+        self.sync_borders_with_monitors(&monitors, "low-latency moved borders")?;
+        Ok(true)
+    }
+
+    fn reconcile_movesize_event(&mut self, event: WindowEvent) -> Result<bool> {
+        if !self.windows.contains_key(&event.window) {
+            return Ok(false);
+        }
+
+        if let Ok(rect) = winland_win32::window_rect_for_handle(event.window) {
+            if let Some(info) = self.windows.get_mut(&event.window) {
+                info.rect = rect;
+            }
+            self.workspaces.update_window_rect(event.window, rect);
+        }
+
+        let monitors = winland_win32::enumerate_monitors()
+            .context("enumerate monitors for low-latency movesize event")?;
+        let plan = self.plan_after_window_events(&[event], &SnapshotDiff::default(), &monitors);
+        self.apply_tile_assignments_with_feedback(
+            &plan.moves,
+            &monitors,
+            "low-latency movesize retile",
+        );
+        self.sync_borders_with_monitors(&monitors, "low-latency movesize borders")?;
+        debug!(
+            kind = ?event.kind,
+            window = %event.window,
+            retile_moves = plan.moves.len(),
+            "handled movesize event without full snapshot rebuild"
+        );
+        Ok(true)
+    }
+
     fn handle_mouse_drag(&mut self, event: MouseDragEvent) -> Result<()> {
         match event.kind {
             MouseDragEventKind::Started => self.start_modifier_drag(event),
@@ -666,6 +859,9 @@ impl DaemonState {
             move_count: 0,
             started_temporary_float,
         });
+        if let Err(error) = self.sync_borders("modifier drag start borders") {
+            debug!(%error, "failed to sync borders after modifier drag start");
+        }
 
         if started_temporary_float && self.config.dynamic_retile {
             let monitors = winland_win32::enumerate_monitors()
@@ -792,6 +988,9 @@ impl DaemonState {
             info.rect = accepted_rect;
         }
         self.workspaces.update_window_rect(window, accepted_rect);
+        if let Err(error) = self.sync_borders("modifier drag final borders") {
+            debug!(%error, "failed to sync borders after modifier drag final rect");
+        }
         accepted_rect
     }
 
@@ -808,6 +1007,9 @@ impl DaemonState {
             info.rect = rect;
         }
         self.workspaces.update_window_rect(window, rect);
+        if let Err(error) = self.sync_borders("modifier drag move borders") {
+            debug!(%error, "failed to sync borders after modifier drag move");
+        }
     }
 
     fn handle_ipc(&mut self, transport: IpcTransportRequest) {
@@ -868,8 +1070,11 @@ impl DaemonState {
                 .context("enumerate monitors while reloading daemon state")?;
             self.preserve_keyboard_state(&mut refreshed, &monitors);
             refreshed.dwindle_splits.clear();
+            let border_manager = self.border_manager.take();
             *self = refreshed;
+            self.border_manager = border_manager;
             self.log_snapshot("reloaded daemon state");
+            self.sync_borders_with_monitors(&monitors, "reload borders")?;
             return Ok(());
         }
 
@@ -914,6 +1119,7 @@ impl DaemonState {
         }
 
         self.apply_tile_assignments_with_feedback(&plan.moves, &monitors, "hotkey command");
+        self.sync_borders("hotkey command borders")?;
 
         if plan.quit {
             winland_win32::request_message_loop_stop()
@@ -1963,6 +2169,94 @@ impl DaemonState {
         window.is_workspace_manageable() && decision.manage != Some(false)
     }
 
+    fn sync_borders(&mut self, operation: &'static str) -> Result<()> {
+        let monitors =
+            winland_win32::enumerate_monitors().context("enumerate monitors for border sync")?;
+        self.sync_borders_with_monitors(&monitors, operation)
+    }
+
+    fn sync_borders_with_monitors(
+        &mut self,
+        monitors: &[MonitorInfo],
+        operation: &'static str,
+    ) -> Result<()> {
+        let Some(manager) = &self.border_manager else {
+            return Ok(());
+        };
+
+        let candidates = self.border_candidates(monitors);
+        if candidates.is_empty() {
+            manager.clear().context("clear border overlays")?;
+            debug!(operation, "cleared border overlays");
+            return Ok(());
+        }
+
+        let updates: Vec<_> = candidates
+            .into_iter()
+            .map(|candidate| {
+                let rect = winland_win32::window_rect_for_handle(candidate.window)
+                    .unwrap_or(candidate.rect);
+                BorderUpdate {
+                    window: candidate.window,
+                    rect,
+                    color: candidate.color,
+                }
+            })
+            .collect();
+        manager
+            .sync(updates, self.config.borders.width)
+            .context("sync border overlays")?;
+        debug!(operation, "synced border overlays");
+        Ok(())
+    }
+
+    fn border_candidates(&self, monitors: &[MonitorInfo]) -> Vec<BorderCandidate> {
+        let config = self.config.borders;
+        if !config.enabled {
+            return Vec::new();
+        }
+
+        if config.disable_when_fullscreen
+            && self.foreground.is_some_and(|window| {
+                self.windows.get(&window).is_some_and(|info| {
+                    is_fullscreen_window(info, monitors)
+                        || !self.is_manageable_by_rules(info, &self.rule_decision(info))
+                })
+            })
+        {
+            return Vec::new();
+        }
+
+        self.windows
+            .iter()
+            .filter(|(handle, window)| {
+                self.is_manageable_window(**handle) && !is_fullscreen_window(window, monitors)
+            })
+            .filter_map(|(handle, window)| {
+                let participation = self.window_participation(*handle);
+                let focused = self.foreground == Some(*handle);
+                let floating =
+                    participation.is_floating() || self.overflow_floating.contains(handle);
+
+                let color = if focused {
+                    config.active_color
+                } else if floating {
+                    config.floating_color
+                } else if config.show_inactive {
+                    config.inactive_color
+                } else {
+                    return None;
+                };
+
+                Some(BorderCandidate {
+                    window: *handle,
+                    rect: window.rect,
+                    color,
+                })
+            })
+            .collect()
+    }
+
     fn log_snapshot(&self, message: &'static str) {
         info!(
             total_windows = self.windows.len(),
@@ -2039,6 +2333,13 @@ struct WorkspaceCommandPlan {
 struct MonitorOverflowPlan {
     tiled_windows: Vec<WindowHandle>,
     overflow_windows: Vec<WindowHandle>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BorderCandidate {
+    window: WindowHandle,
+    rect: Rect,
+    color: BorderColor,
 }
 
 fn count_events(batch: &[WindowEvent], kind: WindowEventKind) -> usize {
@@ -3575,6 +3876,30 @@ mod tests {
     }
 
     #[test]
+    fn pointer_speed_window_events_bypass_batch_debounce() {
+        assert!(should_process_window_event_immediately(event(
+            WindowEventKind::Moved,
+            1
+        )));
+        assert!(should_process_window_event_immediately(event(
+            WindowEventKind::MoveSizeStart,
+            1
+        )));
+        assert!(should_process_window_event_immediately(event(
+            WindowEventKind::MoveSizeEnd,
+            1
+        )));
+        assert!(should_process_window_event_immediately(event(
+            WindowEventKind::ForegroundChanged,
+            1
+        )));
+        assert!(!should_process_window_event_immediately(event(
+            WindowEventKind::Created,
+            1
+        )));
+    }
+
+    #[test]
     fn ipc_state_snapshot_reports_observable_daemon_counts() {
         let mut state = daemon_state([
             window(1, "One", Rect::from_size(0, 0, 100, 100)),
@@ -3599,6 +3924,70 @@ mod tests {
         );
     }
 
+    #[test]
+    fn border_candidates_use_focus_inactive_and_floating_colors() {
+        let mut state = daemon_state([
+            window(1, "One", Rect::from_size(0, 0, 100, 100)),
+            window(2, "Two", Rect::from_size(200, 0, 100, 100)),
+            window(3, "Three", Rect::from_size(400, 0, 100, 100)),
+        ]);
+        state.config.borders.enabled = true;
+        state.config.borders.active_color = BorderColor::new(1, 2, 3);
+        state.config.borders.inactive_color = BorderColor::new(4, 5, 6);
+        state.config.borders.floating_color = BorderColor::new(7, 8, 9);
+        state.foreground = Some(WindowHandle(2));
+        state.set_window_participation(WindowHandle(3), WindowParticipation::Floating);
+
+        let candidates = state.border_candidates(&[primary_test_monitor()]);
+
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| (candidate.window, candidate.color))
+                .collect::<Vec<_>>(),
+            vec![
+                (WindowHandle(1), BorderColor::new(4, 5, 6)),
+                (WindowHandle(2), BorderColor::new(1, 2, 3)),
+                (WindowHandle(3), BorderColor::new(7, 8, 9)),
+            ]
+        );
+    }
+
+    #[test]
+    fn border_candidates_hide_inactive_when_configured() {
+        let mut state = daemon_state([
+            window(1, "One", Rect::from_size(0, 0, 100, 100)),
+            window(2, "Two", Rect::from_size(200, 0, 100, 100)),
+        ]);
+        state.config.borders.enabled = true;
+        state.config.borders.show_inactive = false;
+        state.foreground = Some(WindowHandle(2));
+
+        let candidates = state.border_candidates(&[primary_test_monitor()]);
+
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.window)
+                .collect::<Vec<_>>(),
+            vec![WindowHandle(2)]
+        );
+    }
+
+    #[test]
+    fn border_candidates_hide_all_for_focused_fullscreen_window() {
+        let mut state = daemon_state([
+            window(1, "Fullscreen", primary_test_monitor().rect),
+            window(2, "Two", Rect::from_size(200, 0, 100, 100)),
+        ]);
+        state.config.borders.enabled = true;
+        state.foreground = Some(WindowHandle(1));
+
+        let candidates = state.border_candidates(&[primary_test_monitor()]);
+
+        assert!(candidates.is_empty());
+    }
+
     fn daemon_state<const N: usize>(windows: [WindowInfo; N]) -> DaemonState {
         let windows: BTreeMap<_, _> = windows
             .into_iter()
@@ -3619,6 +4008,7 @@ mod tests {
             suppressed_modifier_drag_events: BTreeSet::new(),
             config: RuntimeConfig::default(),
             hotkey_commands: HotkeyCommandMap::default(),
+            border_manager: None,
         };
         state.tile_order = state.manageable_handles_sorted();
         state.sync_workspace_state(&[primary_test_monitor()]);

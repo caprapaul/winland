@@ -25,6 +25,7 @@ pub struct Config {
     pub layout: LayoutSection,
     pub workspaces: WorkspacesConfig,
     pub behavior: BehaviorConfig,
+    pub borders: BordersConfig,
     #[serde(rename = "window_rules")]
     pub window_rules: Vec<WindowRuleConfig>,
 }
@@ -37,6 +38,7 @@ impl Config {
         validate_layout(&self.layout, &mut errors);
         validate_workspaces(&self.workspaces, &mut errors);
         validate_hotkeys(&self.hotkeys, self.workspaces.count, &mut errors);
+        validate_borders(&self.borders, &mut errors);
         validate_window_rules(
             &self.window_rules,
             self.workspaces.count,
@@ -311,6 +313,32 @@ impl Default for BehaviorConfig {
             restore_previous_placement: true,
             manage_minimized_windows: false,
             avoid_fullscreen_windows: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct BordersConfig {
+    pub enabled: bool,
+    pub width: u16,
+    pub active_color: String,
+    pub inactive_color: String,
+    pub floating_color: String,
+    pub show_inactive: bool,
+    pub disable_when_fullscreen: bool,
+}
+
+impl Default for BordersConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            width: 3,
+            active_color: "#5AA9FF".to_owned(),
+            inactive_color: "#3A3A3A".to_owned(),
+            floating_color: "#FFB454".to_owned(),
+            show_inactive: true,
+            disable_when_fullscreen: true,
         }
     }
 }
@@ -783,6 +811,30 @@ fn validate_layout(layout: &LayoutSection, errors: &mut Vec<String>) {
     }
 }
 
+fn validate_borders(borders: &BordersConfig, errors: &mut Vec<String>) {
+    if borders.width == 0 {
+        errors.push("borders.width must be greater than 0".to_owned());
+    }
+    if borders.width > 64 {
+        errors.push("borders.width must be <= 64".to_owned());
+    }
+
+    validate_hex_color("borders.active_color", &borders.active_color, errors);
+    validate_hex_color("borders.inactive_color", &borders.inactive_color, errors);
+    validate_hex_color("borders.floating_color", &borders.floating_color, errors);
+}
+
+fn validate_hex_color(context: &str, value: &str, errors: &mut Vec<String>) {
+    let Some(hex) = value.strip_prefix('#') else {
+        errors.push(format!("{context} must use #RRGGBB syntax"));
+        return;
+    };
+
+    if hex.len() != 6 || !hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        errors.push(format!("{context} must use #RRGGBB syntax"));
+    }
+}
+
 fn validate_layout_override(
     context: &str,
     default_layout: &str,
@@ -1186,6 +1238,13 @@ mod tests {
         assert!(config.hotkeys.modifier_drag.enabled);
         assert_eq!(config.hotkeys.modifier_drag.modifiers, "Win");
         assert_eq!(config.hotkeys.bindings.len(), 31);
+        assert!(!config.borders.enabled);
+        assert_eq!(config.borders.width, 3);
+        assert_eq!(config.borders.active_color, "#5AA9FF");
+        assert_eq!(config.borders.inactive_color, "#3A3A3A");
+        assert_eq!(config.borders.floating_color, "#FFB454");
+        assert!(config.borders.show_inactive);
+        assert!(config.borders.disable_when_fullscreen);
         assert_eq!(config.hotkeys.bindings[0].keys, "Win+T");
         assert_eq!(config.hotkeys.bindings[0].launch.as_deref(), Some("wt.exe"));
         assert!(config.hotkeys.bindings[0].override_app);
@@ -1209,7 +1268,7 @@ mod tests {
     #[test]
     fn parses_toml_for_hotkeys_layout_workspaces_behavior_and_rules() {
         let config = parse_toml(
-            r#"
+            r##"
             [general]
             log_level = "debug"
 
@@ -1244,6 +1303,15 @@ mod tests {
             retile_on_drag_end = false
             overflow_focus_policy = "float-focused"
 
+            [borders]
+            enabled = true
+            width = 4
+            active_color = "#112233"
+            inactive_color = "#445566"
+            floating_color = "#778899"
+            show_inactive = false
+            disable_when_fullscreen = true
+
             [[window_rules]]
             name = "float settings"
             [window_rules.match]
@@ -1253,7 +1321,7 @@ mod tests {
             float = true
             workspace = 2
             always_on_workspace = true
-            "#,
+            "##,
         )
         .unwrap();
 
@@ -1277,18 +1345,28 @@ mod tests {
             config.behavior.overflow_focus_policy,
             OverflowFocusPolicy::FloatFocused
         );
+        assert!(config.borders.enabled);
+        assert_eq!(config.borders.width, 4);
+        assert_eq!(config.borders.active_color, "#112233");
+        assert_eq!(config.borders.inactive_color, "#445566");
+        assert_eq!(config.borders.floating_color, "#778899");
+        assert!(!config.borders.show_inactive);
         assert_eq!(config.window_rules().unwrap().len(), 1);
     }
 
     #[test]
     fn validation_reports_multiple_errors() {
         let error = parse_toml(
-            r#"
+            r##"
             [general]
             log_level = "chatty"
 
             [layout]
             master_ratio_percent = 95
+
+            [borders]
+            width = 0
+            active_color = "blue"
 
             [workspaces]
             count = 1
@@ -1305,7 +1383,7 @@ mod tests {
             title = { exact = "" }
             [window_rules.action]
             workspace = 3
-            "#,
+            "##,
         )
         .unwrap_err();
 
@@ -1316,6 +1394,8 @@ mod tests {
 
         assert!(output.contains("general.log_level"));
         assert!(output.contains("layout.master_ratio_percent"));
+        assert!(output.contains("borders.width"));
+        assert!(output.contains("borders.active_color"));
         assert!(output.contains("duplicate hotkey modifier"));
         assert!(output.contains("hotkeys.modifier_drag.modifiers"));
         assert!(output.contains("switch-workspace-2"));

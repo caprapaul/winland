@@ -1,17 +1,18 @@
 #[cfg(windows)]
 mod platform {
+    use std::collections::BTreeMap;
     use std::ffi::OsString;
     use std::ffi::c_void;
     use std::mem::size_of;
     use std::os::windows::ffi::OsStringExt;
-    use std::sync::mpsc::{self, Sender};
+    use std::sync::mpsc::{self, Receiver, Sender};
     use std::sync::{Mutex, OnceLock};
     use std::thread::{self, JoinHandle};
     use std::time::{Duration, Instant};
 
     use tracing::{debug, warn};
     use windows::Win32::Foundation::{
-        BOOL, CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
+        BOOL, COLORREF, CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
         GENERIC_READ, GENERIC_WRITE, HANDLE, HMODULE, HWND, LPARAM, LRESULT, POINT, RECT, TRUE,
         WPARAM,
     };
@@ -19,12 +20,14 @@ mod platform {
         DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute,
     };
     use windows::Win32::Graphics::Gdi::{
-        EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
+        BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, EnumDisplayMonitors, FillRect,
+        GetMonitorInfoW, HDC, HMONITOR, InvalidateRect, MONITORINFO, PAINTSTRUCT,
     };
     use windows::Win32::Storage::FileSystem::{
         CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_MODE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
         ReadFile, WriteFile,
     };
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_MESSAGE,
         PIPE_TYPE_MESSAGE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
@@ -39,21 +42,24 @@ mod platform {
         MOD_WIN, RegisterHotKey, SetFocus, UnregisterHotKey,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        BringWindowToTop, CallNextHookEx, DispatchMessageW, EVENT_OBJECT_CLOAKED,
-        EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE,
-        EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_SHOW, EVENT_OBJECT_STATECHANGE,
-        EVENT_OBJECT_UNCLOAKED, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND,
-        EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZESTART,
-        EnumWindows, GA_ROOT, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetAncestor, GetClassNameW,
-        GetCursorPos, GetForegroundWindow, GetMessageW, GetWindow, GetWindowLongPtrW,
-        GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HC_ACTION,
-        HHOOK, IsIconic, IsWindowVisible, KBDLLHOOKSTRUCT, MINMAXINFO, MONITORINFOF_PRIMARY, MSG,
-        MSLLHOOKSTRUCT, OBJID_WINDOW, PostThreadMessageW, SMTO_ABORTIFHUNG, SW_HIDE,
-        SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER, SendMessageTimeoutW,
-        SetForegroundWindow, SetWindowPos, SetWindowsHookExW, ShowWindow, TranslateMessage,
-        UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WINEVENT_OUTOFCONTEXT, WM_GETMINMAXINFO,
-        WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_QUIT, WM_SYSKEYDOWN,
-        WS_CAPTION, WS_EX_TOOLWINDOW, WS_THICKFRAME, WindowFromPoint,
+        BringWindowToTop, CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow,
+        DispatchMessageW, EVENT_OBJECT_CLOAKED, EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY,
+        EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_SHOW,
+        EVENT_OBJECT_STATECHANGE, EVENT_OBJECT_UNCLOAKED, EVENT_SYSTEM_FOREGROUND,
+        EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND,
+        EVENT_SYSTEM_MOVESIZESTART, EnumWindows, GA_ROOT, GW_OWNER, GWL_EXSTYLE, GWL_STYLE,
+        GWLP_USERDATA, GetAncestor, GetClassNameW, GetCursorPos, GetForegroundWindow, GetMessageW,
+        GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
+        GetWindowThreadProcessId, HC_ACTION, HHOOK, HTTRANSPARENT, IsIconic, IsWindowVisible,
+        KBDLLHOOKSTRUCT, MINMAXINFO, MONITORINFOF_PRIMARY, MSG, MSLLHOOKSTRUCT, OBJID_WINDOW,
+        PM_NOREMOVE, PeekMessageW, PostThreadMessageW, RegisterClassW, SMTO_ABORTIFHUNG, SW_HIDE,
+        SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER, SWP_SHOWWINDOW,
+        SendMessageTimeoutW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
+        SetWindowsHookExW, ShowWindow, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL,
+        WH_MOUSE_LL, WINEVENT_OUTOFCONTEXT, WM_APP, WM_GETMINMAXINFO, WM_HOTKEY, WM_KEYDOWN,
+        WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WM_QUIT, WM_SYSKEYDOWN,
+        WNDCLASSW, WS_CAPTION, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
+        WS_THICKFRAME, WindowFromPoint,
     };
     use windows::core::{PCWSTR, PWSTR};
     use winland_core::{
@@ -62,7 +68,7 @@ mod platform {
     };
 
     use crate::{
-        HotkeyBinding, HotkeyEvent, HotkeyInterceptionDecision, HotkeyLowLevelEvent,
+        BorderUpdate, HotkeyBinding, HotkeyEvent, HotkeyInterceptionDecision, HotkeyLowLevelEvent,
         HotkeyModifierSet, HotkeyOverrideOptions, HotkeyRegistrationFailure, HotkeyWindowContext,
         IPC_BUFFER_SIZE, IpcTransportRequest, ModifierDragOptions, MouseDragEvent,
         MouseDragEventKind, Result, VirtualKey, Win32Error, WindowEvent, WindowEventKind,
@@ -73,6 +79,8 @@ mod platform {
     static HOTKEY_SENDER: OnceLock<Mutex<Option<HotkeySenderState>>> = OnceLock::new();
     static HOTKEY_OVERRIDE: OnceLock<Mutex<Option<HotkeyOverrideState>>> = OnceLock::new();
     static MOUSE_DRAG: OnceLock<Mutex<Option<MouseDragState>>> = OnceLock::new();
+    const BORDER_CLASS_NAME: &str = "WinlandBorderOverlay";
+    const BORDER_COMMAND_MESSAGE: u32 = WM_APP + 0x57;
     const MINMAXINFO_TIMEOUT_MS: u32 = 50;
     const GEOMETRY_CORRECTION_PASSES: usize = 3;
     const MODIFIER_DRAG_MOVE_INTERVAL: Duration = Duration::from_millis(16);
@@ -287,6 +295,135 @@ mod platform {
         }
 
         Ok(())
+    }
+
+    #[derive(Debug)]
+    pub struct BorderManager {
+        sender: Sender<BorderCommand>,
+        worker: Option<JoinHandle<()>>,
+        thread_id: u32,
+    }
+
+    impl BorderManager {
+        pub fn new() -> Result<Self> {
+            let (command_sender, command_receiver) = mpsc::channel();
+            let (ready_sender, ready_receiver) = mpsc::channel();
+            let worker = thread::Builder::new()
+                .name("winland-border-overlays".to_owned())
+                .spawn(move || border_worker(command_receiver, ready_sender))
+                .map_err(|error| Win32Error::ThreadSpawn {
+                    name: "winland-border-overlays",
+                    message: error.to_string(),
+                })?;
+            let thread_id = ready_receiver
+                .recv()
+                .map_err(|_| Win32Error::BorderOverlayWorkerStopped)?;
+
+            Ok(Self {
+                sender: command_sender,
+                worker: Some(worker),
+                thread_id,
+            })
+        }
+
+        pub fn sync(&self, updates: Vec<BorderUpdate>, width: i32) -> Result<()> {
+            self.sender
+                .send(BorderCommand::Sync { updates, width })
+                .map_err(|_| Win32Error::BorderOverlayWorkerStopped)?;
+            self.post_command_message()
+        }
+
+        pub fn clear(&self) -> Result<()> {
+            self.sender
+                .send(BorderCommand::Clear)
+                .map_err(|_| Win32Error::BorderOverlayWorkerStopped)?;
+            self.post_command_message()
+        }
+
+        fn post_command_message(&self) -> Result<()> {
+            // SAFETY: thread_id belongs to the overlay worker thread, which
+            // creates a message queue before reporting readiness.
+            unsafe {
+                PostThreadMessageW(self.thread_id, BORDER_COMMAND_MESSAGE, WPARAM(0), LPARAM(0))
+                    .map_err(|source| Win32Error::Windows {
+                        context: "PostThreadMessageW(border command)",
+                        source,
+                    })
+            }
+        }
+    }
+
+    impl Drop for BorderManager {
+        fn drop(&mut self) {
+            let _ = self.sender.send(BorderCommand::Shutdown);
+            let _ = self.post_command_message();
+            if let Some(worker) = self.worker.take()
+                && worker.join().is_err()
+            {
+                warn!("border overlay worker thread panicked while stopping");
+            }
+        }
+    }
+
+    fn border_worker(receiver: Receiver<BorderCommand>, ready: Sender<u32>) {
+        // SAFETY: GetCurrentThreadId reads the id of this worker thread.
+        let thread_id = unsafe { GetCurrentThreadId() };
+        let mut bootstrap_message = MSG::default();
+        // SAFETY: PeekMessageW with PM_NOREMOVE forces creation of this
+        // thread's message queue before other threads post commands to it.
+        unsafe {
+            let _ = PeekMessageW(&mut bootstrap_message, HWND::default(), 0, 0, PM_NOREMOVE);
+        }
+        if let Err(error) = register_border_window_class() {
+            warn!(%error, "failed to register border overlay window class");
+            return;
+        }
+        let _ = ready.send(thread_id);
+
+        let mut state = BorderOverlayState::default();
+        let mut message = MSG::default();
+
+        loop {
+            // SAFETY: message points to valid writable storage. This worker owns
+            // the border overlay HWNDs and pumps only its thread message queue.
+            let result = unsafe { GetMessageW(&mut message, HWND::default(), 0, 0) };
+            match result.0 {
+                -1 => {
+                    let error = Win32Error::last_error("GetMessageW(border worker)");
+                    warn!(%error, "border worker message loop failed");
+                    break;
+                }
+                0 => break,
+                _ if message.message == BORDER_COMMAND_MESSAGE => {
+                    let mut shutdown = false;
+                    while let Ok(command) = receiver.try_recv() {
+                        match command {
+                            BorderCommand::Sync { updates, width } => {
+                                state.sync(updates, width);
+                            }
+                            BorderCommand::Clear => state.clear(),
+                            BorderCommand::Shutdown => {
+                                state.clear();
+                                shutdown = true;
+                            }
+                        }
+                    }
+                    if shutdown {
+                        break;
+                    }
+                }
+                _ => {
+                    // SAFETY: message was just filled by GetMessageW.
+                    unsafe {
+                        let _ = TranslateMessage(&message);
+                        DispatchMessageW(&message);
+                    }
+                }
+            }
+        }
+
+        state.clear();
+        debug!("border overlay worker stopped");
     }
 
     pub fn subscribe_window_events(sender: Sender<WindowEvent>) -> Result<WindowEventSubscription> {
@@ -859,6 +996,10 @@ mod platform {
         // and the callback is invoked synchronously during that call.
         let state = unsafe { &mut *(lparam.0 as *mut EnumState<'_>) };
 
+        if is_border_overlay_window(hwnd) {
+            return TRUE;
+        }
+
         match window_info(hwnd) {
             Ok(info) => state.windows.push(info),
             Err(error) => debug!(?hwnd, %error, "skipping window after metadata read failure"),
@@ -1272,6 +1413,287 @@ mod platform {
         value
     }
 
+    #[derive(Debug)]
+    enum BorderCommand {
+        Sync {
+            updates: Vec<crate::BorderUpdate>,
+            width: i32,
+        },
+        Clear,
+        Shutdown,
+    }
+
+    #[derive(Default)]
+    struct BorderOverlayState {
+        overlays: BTreeMap<WindowHandle, BorderOverlay>,
+    }
+
+    impl BorderOverlayState {
+        fn sync(&mut self, updates: Vec<crate::BorderUpdate>, width: i32) {
+            let width = width.max(1);
+            let retained: std::collections::BTreeSet<_> =
+                updates.iter().map(|update| update.window).collect();
+            let stale: Vec<_> = self
+                .overlays
+                .keys()
+                .copied()
+                .filter(|window| !retained.contains(window))
+                .collect();
+
+            for window in stale {
+                self.remove(window);
+            }
+
+            for update in updates {
+                if update.rect.is_empty() {
+                    self.remove(update.window);
+                    continue;
+                }
+
+                if let std::collections::btree_map::Entry::Vacant(entry) =
+                    self.overlays.entry(update.window)
+                {
+                    match BorderOverlay::create(update.window) {
+                        Ok(overlay) => {
+                            entry.insert(overlay);
+                            debug!(window = %update.window, "created border overlay");
+                        }
+                        Err(error) => {
+                            warn!(window = %update.window, %error, "failed to create border overlay");
+                            continue;
+                        }
+                    }
+                }
+
+                if let Some(overlay) = self.overlays.get_mut(&update.window) {
+                    overlay.update(update.rect, width, update.color);
+                }
+            }
+        }
+
+        fn clear(&mut self) {
+            let windows: Vec<_> = self.overlays.keys().copied().collect();
+            for window in windows {
+                self.remove(window);
+            }
+        }
+
+        fn remove(&mut self, window: WindowHandle) {
+            if let Some(overlay) = self.overlays.remove(&window) {
+                overlay.destroy();
+                debug!(window = %window, "removed border overlay");
+            }
+        }
+    }
+
+    struct BorderOverlay {
+        window: WindowHandle,
+        sides: [HWND; 4],
+        rect: Option<Rect>,
+        width: i32,
+        color: crate::BorderColor,
+    }
+
+    impl BorderOverlay {
+        fn create(window: WindowHandle) -> Result<Self> {
+            let sides = [
+                create_border_side_window()?,
+                create_border_side_window()?,
+                create_border_side_window()?,
+                create_border_side_window()?,
+            ];
+
+            Ok(Self {
+                window,
+                sides,
+                rect: None,
+                width: 0,
+                color: crate::BorderColor::default(),
+            })
+        }
+
+        fn update(&mut self, rect: Rect, width: i32, color: crate::BorderColor) {
+            let color_changed = self.color != color;
+            if color_changed {
+                self.color = color;
+                for side in self.sides {
+                    set_border_side_color(side, color);
+                }
+                debug!(window = %self.window, ?color, "updated border focus state");
+            }
+
+            if self.rect != Some(rect) || self.width != width {
+                let side_rects = border_side_rects(rect, width);
+                for (hwnd, side_rect) in self.sides.into_iter().zip(side_rects) {
+                    position_border_side(hwnd, hwnd_from_handle(self.window), side_rect);
+                }
+                debug!(window = %self.window, rect = %rect, width, "repositioned border overlay");
+                self.rect = Some(rect);
+                self.width = width;
+            }
+        }
+
+        fn destroy(self) {
+            for side in self.sides {
+                // SAFETY: side is an HWND created by create_border_side_window
+                // and owned by this BorderOverlay.
+                unsafe {
+                    let _ = DestroyWindow(side);
+                }
+            }
+        }
+    }
+
+    fn register_border_window_class() -> Result<()> {
+        let class_name = wide_null(BORDER_CLASS_NAME);
+        // SAFETY: GetModuleHandleW(None) returns the current module handle.
+        let instance = unsafe { GetModuleHandleW(None) }.map_err(|source| Win32Error::Windows {
+            context: "GetModuleHandleW(border class)",
+            source,
+        })?;
+        let class = WNDCLASSW {
+            lpfnWndProc: Some(border_window_proc),
+            hInstance: instance.into(),
+            lpszClassName: PCWSTR(class_name.as_ptr()),
+            ..WNDCLASSW::default()
+        };
+
+        // SAFETY: class points to a valid WNDCLASSW for the duration of the
+        // call. The class name is process-local and static for the worker.
+        let atom = unsafe { RegisterClassW(&class) };
+        if atom == 0 {
+            return Err(Win32Error::last_error("RegisterClassW(border class)"));
+        }
+
+        Ok(())
+    }
+
+    fn create_border_side_window() -> Result<HWND> {
+        let class_name = wide_null(BORDER_CLASS_NAME);
+        let title = wide_null("");
+        // SAFETY: GetModuleHandleW(None) returns the current module handle.
+        let instance = unsafe { GetModuleHandleW(None) }.map_err(|source| Win32Error::Windows {
+            context: "GetModuleHandleW(border window)",
+            source,
+        })?;
+
+        // SAFETY: The registered class has a static window procedure. The
+        // overlay is a no-activate, tool, transparent popup with no parent.
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+                PCWSTR(class_name.as_ptr()),
+                PCWSTR(title.as_ptr()),
+                WS_POPUP,
+                0,
+                0,
+                0,
+                0,
+                HWND::default(),
+                None,
+                instance,
+                None,
+            )
+        }
+        .map_err(|source| Win32Error::Windows {
+            context: "CreateWindowExW(border side)",
+            source,
+        })?;
+
+        set_border_side_color(hwnd, crate::BorderColor::default());
+        Ok(hwnd)
+    }
+
+    fn set_border_side_color(hwnd: HWND, color: crate::BorderColor) {
+        // SAFETY: hwnd is a border side HWND owned by the overlay worker. The
+        // userdata stores a packed COLORREF used by the paint handler.
+        unsafe {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, color.colorref() as isize);
+            let _ = InvalidateRect(hwnd, None, true);
+        }
+    }
+
+    fn position_border_side(hwnd: HWND, target: HWND, rect: Rect) {
+        // SAFETY: hwnd is a border side HWND owned by the overlay worker.
+        // Inserting just behind the target keeps borders from drawing above a
+        // window the user drags across them while still avoiding activation.
+        if let Err(error) = unsafe {
+            SetWindowPos(
+                hwnd,
+                target,
+                rect.left,
+                rect.top,
+                rect.width(),
+                rect.height(),
+                SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW,
+            )
+        } {
+            warn!(%error, rect = %rect, "failed to position border side");
+        }
+    }
+
+    fn border_side_rects(rect: Rect, width: i32) -> [Rect; 4] {
+        let width = width.max(1);
+        [
+            Rect {
+                left: rect.left.saturating_sub(width),
+                top: rect.top.saturating_sub(width),
+                right: rect.right.saturating_add(width),
+                bottom: rect.top,
+            },
+            Rect {
+                left: rect.left.saturating_sub(width),
+                top: rect.bottom,
+                right: rect.right.saturating_add(width),
+                bottom: rect.bottom.saturating_add(width),
+            },
+            Rect {
+                left: rect.left.saturating_sub(width),
+                top: rect.top,
+                right: rect.left,
+                bottom: rect.bottom,
+            },
+            Rect {
+                left: rect.right,
+                top: rect.top,
+                right: rect.right.saturating_add(width),
+                bottom: rect.bottom,
+            },
+        ]
+    }
+
+    unsafe extern "system" fn border_window_proc(
+        hwnd: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        match message {
+            WM_NCHITTEST => LRESULT(HTTRANSPARENT as isize),
+            WM_PAINT => {
+                let mut paint = PAINTSTRUCT::default();
+                // SAFETY: paint points to valid storage for the WM_PAINT cycle.
+                let hdc = unsafe { BeginPaint(hwnd, &mut paint) };
+                // SAFETY: The userdata is written by set_border_side_color.
+                let color = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as u32;
+                // SAFETY: CreateSolidBrush creates a GDI brush for this paint.
+                let brush = unsafe { CreateSolidBrush(COLORREF(color)) };
+                // SAFETY: hdc and paint.rcPaint are valid for the paint cycle.
+                unsafe {
+                    FillRect(hdc, &paint.rcPaint, brush);
+                    let _ = DeleteObject(brush);
+                    let _ = EndPaint(hwnd, &paint);
+                }
+                LRESULT(0)
+            }
+            _ => {
+                // SAFETY: Delegating unhandled messages to DefWindowProcW
+                // preserves the documented window procedure contract.
+                unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+            }
+        }
+    }
+
     struct MonitorEnumState<'a> {
         monitors: &'a mut Vec<CoreMonitorInfo>,
     }
@@ -1376,6 +1798,9 @@ mod platform {
         if hwnd.0.is_null() || id_object != OBJID_WINDOW.0 || id_child != 0 {
             return None;
         }
+        if is_border_overlay_window(hwnd) {
+            return None;
+        }
 
         let kind = match event {
             EVENT_OBJECT_CREATE => WindowEventKind::Created,
@@ -1469,6 +1894,10 @@ mod platform {
         }
 
         Ok(wide_to_string(&buffer[..copied as usize]))
+    }
+
+    fn is_border_overlay_window(hwnd: HWND) -> bool {
+        class_name(hwnd).is_ok_and(|class_name| class_name == BORDER_CLASS_NAME)
     }
 
     fn executable_path(process_id: u32) -> Option<String> {
@@ -1758,6 +2187,23 @@ mod platform {
         Err(Win32Error::UnsupportedPlatform)
     }
 
+    #[derive(Debug)]
+    pub struct BorderManager;
+
+    impl BorderManager {
+        pub fn new() -> Result<Self> {
+            Err(Win32Error::UnsupportedPlatform)
+        }
+
+        pub fn sync(&self, _updates: Vec<crate::BorderUpdate>, _width: i32) -> Result<()> {
+            Err(Win32Error::UnsupportedPlatform)
+        }
+
+        pub fn clear(&self) -> Result<()> {
+            Err(Win32Error::UnsupportedPlatform)
+        }
+    }
+
     pub fn subscribe_window_events(
         _sender: Sender<WindowEvent>,
     ) -> Result<WindowEventSubscription> {
@@ -1818,6 +2264,7 @@ mod platform {
     }
 }
 
+pub use platform::BorderManager;
 pub use platform::HotkeyOverrideRegistration;
 pub use platform::HotkeyRegistration;
 pub use platform::IpcServer;
@@ -2200,6 +2647,30 @@ pub enum WindowEventKind {
 
 pub type Result<T> = std::result::Result<T, Win32Error>;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BorderColor {
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+}
+
+impl BorderColor {
+    pub const fn new(red: u8, green: u8, blue: u8) -> Self {
+        Self { red, green, blue }
+    }
+
+    pub fn colorref(self) -> u32 {
+        u32::from(self.red) | (u32::from(self.green) << 8) | (u32::from(self.blue) << 16)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BorderUpdate {
+    pub window: WindowHandle,
+    pub rect: Rect,
+    pub color: BorderColor,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Win32Error {
     #[cfg(windows)]
@@ -2242,6 +2713,8 @@ pub enum Win32Error {
     },
     #[error("hotkey sender lock is poisoned")]
     HotkeySenderLockPoisoned,
+    #[error("border overlay worker is not running")]
+    BorderOverlayWorkerStopped,
     #[error("Winland daemon is not running on {pipe_name}")]
     DaemonNotRunning { pipe_name: String },
     #[error("{context} failed with Win32 error {code}")]

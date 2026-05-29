@@ -168,3 +168,14 @@ manage_minimized_windows = false
 
 # Fullscreen windows are avoided by default.
 avoid_fullscreen_windows = true
+
+[borders]
+# Lightweight Win32 overlay borders. Disabled by default while tiling behavior
+# is still stabilizing; set enabled = true for focus/floating feedback.
+enabled = false
+width = 3
+active_color = "#5AA9FF"
+inactive_color = "#3A3A3A"
+floating_color = "#FFB454"
+show_inactive = true
+disable_when_fullscreen = true

@@ -1,7 +1,8 @@
 # Winland configuration.
 #
-# This file is the built-in default config with commented examples for every
-# supported Phase 7 section. Uncomment and edit examples as needed, then run:
+# This file is an annotated sample config for the current implementation.
+# Winland also has built-in defaults used when no config file is found.
+# Uncomment and edit examples as needed, then run:
 #   cargo run -p winland-cli -- config validate --path winland.toml
 
 # Window rules are evaluated in order. Later matching rules override earlier

@@ -671,6 +671,8 @@ impl WorkspaceSwitchPlan {
 pub struct WorkspaceManager {
     workspaces: BTreeSet<WorkspaceId>,
     active: WorkspaceId,
+    focused_monitor: Option<MonitorId>,
+    active_by_monitor: BTreeMap<MonitorId, WorkspaceId>,
     windows: BTreeMap<WindowHandle, WorkspaceWindowState>,
 }
 
@@ -682,6 +684,8 @@ impl WorkspaceManager {
         Self {
             workspaces,
             active: WorkspaceId(1),
+            focused_monitor: None,
+            active_by_monitor: BTreeMap::new(),
             windows: BTreeMap::new(),
         }
     }
@@ -690,12 +694,33 @@ impl WorkspaceManager {
         self.active
     }
 
+    pub fn focused_monitor(&self) -> Option<MonitorId> {
+        self.focused_monitor
+    }
+
+    pub fn active_workspace_for_monitor(&self, monitor: MonitorId) -> WorkspaceId {
+        self.active_by_monitor
+            .get(&monitor)
+            .copied()
+            .unwrap_or(self.active)
+    }
+
+    pub fn monitor_active_workspaces(&self) -> impl Iterator<Item = (MonitorId, WorkspaceId)> + '_ {
+        self.active_by_monitor
+            .iter()
+            .map(|(monitor, workspace)| (*monitor, *workspace))
+    }
+
     pub fn workspaces(&self) -> impl Iterator<Item = WorkspaceId> + '_ {
         self.workspaces.iter().copied()
     }
 
     pub fn window_state(&self, window: WindowHandle) -> Option<WorkspaceWindowState> {
         self.windows.get(&window).copied()
+    }
+
+    pub fn window_states(&self) -> impl Iterator<Item = (WindowHandle, WorkspaceWindowState)> + '_ {
+        self.windows.iter().map(|(window, state)| (*window, *state))
     }
 
     pub fn track_window(&mut self, window: WindowHandle, rect: Rect) -> bool {
@@ -782,6 +807,13 @@ impl WorkspaceManager {
             .is_some_and(|state| state.visible_on_all_workspaces || state.workspace == self.active)
     }
 
+    pub fn is_window_on_monitor_workspace(&self, window: WindowHandle, monitor: MonitorId) -> bool {
+        self.windows.get(&window).is_some_and(|state| {
+            state.visible_on_all_workspaces
+                || state.workspace == self.active_workspace_for_monitor(monitor)
+        })
+    }
+
     pub fn visible_windows(&self) -> impl Iterator<Item = WindowHandle> + '_ {
         self.windows
             .iter()
@@ -789,7 +821,58 @@ impl WorkspaceManager {
             .map(|(window, _)| *window)
     }
 
+    pub fn visible_windows_for_monitor(
+        &self,
+        monitor: MonitorId,
+    ) -> impl Iterator<Item = WindowHandle> + '_ {
+        let active = self.active_workspace_for_monitor(monitor);
+        self.windows
+            .iter()
+            .filter(move |(_, state)| state.visible_on_all_workspaces || state.workspace == active)
+            .map(|(window, _)| *window)
+    }
+
+    pub fn sync_monitors<I>(&mut self, monitors: I)
+    where
+        I: IntoIterator<Item = MonitorId>,
+    {
+        let monitors: BTreeSet<_> = monitors.into_iter().collect();
+        self.active_by_monitor
+            .retain(|monitor, _| monitors.contains(monitor));
+
+        for monitor in &monitors {
+            self.ensure_monitor(*monitor);
+        }
+
+        if self
+            .focused_monitor
+            .is_some_and(|monitor| !monitors.contains(&monitor))
+        {
+            self.focused_monitor = None;
+        }
+
+        if self.focused_monitor.is_none() {
+            self.focused_monitor = monitors.first().copied();
+        }
+
+        if let Some(monitor) = self.focused_monitor {
+            self.active = self.active_workspace_for_monitor(monitor);
+        }
+    }
+
+    pub fn focus_monitor(&mut self, monitor: MonitorId) -> bool {
+        self.ensure_monitor(monitor);
+        let changed = self.focused_monitor != Some(monitor);
+        self.focused_monitor = Some(monitor);
+        self.active = self.active_workspace_for_monitor(monitor);
+        changed
+    }
+
     pub fn switch_to(&mut self, target: WorkspaceId) -> WorkspaceSwitchPlan {
+        if let Some(monitor) = self.focused_monitor {
+            return self.switch_monitor_to(monitor, target);
+        }
+
         self.ensure_workspace(target);
 
         let from = self.active;
@@ -821,6 +904,71 @@ impl WorkspaceManager {
 
         self.active = target;
         plan
+    }
+
+    pub fn switch_monitor_to(
+        &mut self,
+        monitor: MonitorId,
+        target: WorkspaceId,
+    ) -> WorkspaceSwitchPlan {
+        self.ensure_monitor(monitor);
+        self.ensure_workspace(target);
+        self.focused_monitor = Some(monitor);
+
+        let from = self.active_workspace_for_monitor(monitor);
+        let mut plan = WorkspaceSwitchPlan {
+            from,
+            to: target,
+            hide: Vec::new(),
+            show: Vec::new(),
+        };
+
+        if from == target {
+            self.active = target;
+            return plan;
+        }
+
+        for (window, state) in &self.windows {
+            if state.visible_on_all_workspaces {
+                continue;
+            }
+
+            if state.workspace == from {
+                plan.hide.push(*window);
+            } else if state.workspace == target {
+                plan.show.push(WorkspaceVisibilityChange {
+                    window: *window,
+                    restore_rect: state.last_rect,
+                });
+            }
+        }
+
+        self.active_by_monitor.insert(monitor, target);
+        self.active = target;
+        plan
+    }
+
+    fn ensure_monitor(&mut self, monitor: MonitorId) {
+        if self.active_by_monitor.contains_key(&monitor) {
+            return;
+        }
+
+        let workspace = self
+            .workspaces
+            .iter()
+            .copied()
+            .find(|workspace| {
+                !self
+                    .active_by_monitor
+                    .values()
+                    .any(|active| active == workspace)
+            })
+            .unwrap_or(self.active);
+        self.active_by_monitor.insert(monitor, workspace);
+        if self.focused_monitor.is_none() {
+            self.focused_monitor = Some(monitor);
+            self.active = workspace;
+        }
     }
 
     fn ensure_workspace(&mut self, workspace: WorkspaceId) {
@@ -3631,6 +3779,59 @@ mod tests {
                 window: WindowHandle(2),
                 restore_rect: Some(Rect::from_size(200, 0, 100, 100)),
             }]
+        );
+    }
+
+    #[test]
+    fn workspaces_track_active_workspace_per_monitor() {
+        let mut workspaces = WorkspaceManager::new(3);
+        workspaces.sync_monitors([MonitorId(2), MonitorId(1)]);
+
+        assert_eq!(workspaces.focused_monitor(), Some(MonitorId(1)));
+        assert_eq!(
+            workspaces.active_workspace_for_monitor(MonitorId(1)),
+            WorkspaceId(1)
+        );
+        assert_eq!(
+            workspaces.active_workspace_for_monitor(MonitorId(2)),
+            WorkspaceId(2)
+        );
+
+        let plan = workspaces.switch_monitor_to(MonitorId(2), WorkspaceId(3));
+
+        assert_eq!(plan.from, WorkspaceId(2));
+        assert_eq!(plan.to, WorkspaceId(3));
+        assert_eq!(workspaces.focused_monitor(), Some(MonitorId(2)));
+        assert_eq!(workspaces.active_workspace(), WorkspaceId(3));
+        assert_eq!(
+            workspaces.active_workspace_for_monitor(MonitorId(1)),
+            WorkspaceId(1)
+        );
+        assert_eq!(
+            workspaces.active_workspace_for_monitor(MonitorId(2)),
+            WorkspaceId(3)
+        );
+    }
+
+    #[test]
+    fn monitor_workspace_visibility_uses_that_monitor_active_workspace() {
+        let mut workspaces = WorkspaceManager::new(3);
+        workspaces.sync_monitors([MonitorId(1), MonitorId(2)]);
+        workspaces.track_window(WindowHandle(1), Rect::from_size(0, 0, 100, 100));
+        workspaces.track_window_on_workspace(
+            WindowHandle(2),
+            WorkspaceId(2),
+            Rect::from_size(200, 0, 100, 100),
+        );
+
+        assert!(workspaces.is_window_on_monitor_workspace(WindowHandle(1), MonitorId(1)));
+        assert!(!workspaces.is_window_on_monitor_workspace(WindowHandle(2), MonitorId(1)));
+        assert!(workspaces.is_window_on_monitor_workspace(WindowHandle(2), MonitorId(2)));
+        assert_eq!(
+            workspaces
+                .visible_windows_for_monitor(MonitorId(2))
+                .collect::<Vec<_>>(),
+            vec![WindowHandle(2)]
         );
     }
 

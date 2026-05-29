@@ -25,7 +25,8 @@ use winland_core::{
     tile_layout_windows_with_config, tile_layout_windows_with_state,
 };
 use winland_ipc::{
-    DaemonStateSnapshot, IpcCommand, IpcRequest, IpcResponse, decode_request, encode_response,
+    DaemonStateSnapshot, IpcCommand, IpcRequest, IpcResponse, MonitorStateSnapshot,
+    WindowParticipationSnapshot, WindowStateSnapshot, decode_request, encode_response,
 };
 use winland_win32::{
     BorderColor, BorderManager, BorderUpdate, HotkeyBinding, HotkeyBypassRules, HotkeyEvent,
@@ -548,6 +549,7 @@ struct DaemonState {
     overflow_floating: BTreeSet<WindowHandle>,
     workspaces: WorkspaceManager,
     active_modifier_drag: Option<ActiveModifierDrag>,
+    active_interactive_drag: Option<WindowHandle>,
     suppressed_modifier_drag_events: BTreeSet<WindowHandle>,
     config: RuntimeConfig,
     hotkey_commands: HotkeyCommandMap,
@@ -625,6 +627,7 @@ impl DaemonState {
             overflow_floating: BTreeSet::new(),
             workspaces: WorkspaceManager::new(config.workspace_count),
             active_modifier_drag: None,
+            active_interactive_drag: None,
             suppressed_modifier_drag_events: BTreeSet::new(),
             config,
             hotkey_commands,
@@ -664,6 +667,7 @@ impl DaemonState {
         monitors: &[MonitorInfo],
         operation: &'static str,
     ) -> Result<GameModeTransition> {
+        self.sync_workspace_state(monitors);
         let detection = self.current_game_mode_detection(monitors);
         let previous = self.game_mode.active.clone();
         let next = self.activation_from_detection(detection, monitors);
@@ -937,6 +941,9 @@ impl DaemonState {
                     winland_win32::foreground_window().context("read foreground window")?;
                 let monitors = winland_win32::enumerate_monitors()
                     .context("enumerate monitors for foreground game-mode update")?;
+                if let Some(window) = self.foreground {
+                    self.focus_monitor_for_window(window, &monitors);
+                }
                 let transition = self.update_game_mode(&monitors, "foreground update")?;
                 if transition.deactivated && self.config.dynamic_retile {
                     let assignments = self.tile_assignments(&monitors);
@@ -990,6 +997,9 @@ impl DaemonState {
 
             if old_monitor.is_some() && new_monitor.is_some() && old_monitor != new_monitor {
                 moved_between_monitors = true;
+                if let Some(monitor) = new_monitor {
+                    self.window_monitor_overrides.insert(window, monitor);
+                }
             }
         }
 
@@ -1035,15 +1045,18 @@ impl DaemonState {
             return Ok(false);
         }
 
+        let monitors = winland_win32::enumerate_monitors()
+            .context("enumerate monitors for low-latency movesize event")?;
         if let Ok(rect) = winland_win32::window_rect_for_handle(event.window) {
             if let Some(info) = self.windows.get_mut(&event.window) {
                 info.rect = rect;
             }
             self.workspaces.update_window_rect(event.window, rect);
+            if let Some(monitor) = monitor_for_rect(rect, &monitors) {
+                self.window_monitor_overrides.insert(event.window, monitor);
+            }
         }
 
-        let monitors = winland_win32::enumerate_monitors()
-            .context("enumerate monitors for low-latency movesize event")?;
         let transition = self.update_game_mode(&monitors, "low-latency movesize update")?;
         let plan = self.plan_after_window_events(&[event], &SnapshotDiff::default(), &monitors);
         let moves = if transition.deactivated && self.config.dynamic_retile {
@@ -1095,7 +1108,9 @@ impl DaemonState {
             winland_win32::window_rect_for_handle(event.window).with_context(|| {
                 format!("read window rect before modifier drag for {}", event.window)
             })?;
-        let started_temporary_float = self.handle_movesize_start(event.window);
+        let monitors = winland_win32::enumerate_monitors()
+            .context("enumerate monitors before modifier drag start")?;
+        let started_temporary_float = self.handle_movesize_start(event.window, &monitors);
 
         self.active_modifier_drag = Some(ActiveModifierDrag {
             window: event.window,
@@ -1110,8 +1125,6 @@ impl DaemonState {
         }
 
         if started_temporary_float && self.config.dynamic_retile {
-            let monitors = winland_win32::enumerate_monitors()
-                .context("enumerate monitors after modifier drag start")?;
             let assignments = self.tile_assignments(&monitors);
             self.apply_tile_assignments_with_feedback(
                 &assignments,
@@ -1195,6 +1208,7 @@ impl DaemonState {
                 );
             }
         }
+        self.finish_interactive_drag(event.window);
         Ok(())
     }
 
@@ -1234,6 +1248,11 @@ impl DaemonState {
             info.rect = accepted_rect;
         }
         self.workspaces.update_window_rect(window, accepted_rect);
+        if let Ok(monitors) = winland_win32::enumerate_monitors()
+            && let Some(monitor) = monitor_for_rect(accepted_rect, &monitors)
+        {
+            self.window_monitor_overrides.insert(window, monitor);
+        }
         if let Err(error) = self.sync_borders("modifier drag final borders") {
             debug!(%error, "failed to sync borders after modifier drag final rect");
         }
@@ -1288,6 +1307,11 @@ impl DaemonState {
     }
 
     fn state_snapshot(&self) -> DaemonStateSnapshot {
+        let monitors = winland_win32::enumerate_monitors().unwrap_or_default();
+        self.state_snapshot_with_monitors(&monitors)
+    }
+
+    fn state_snapshot_with_monitors(&self, monitors: &[MonitorInfo]) -> DaemonStateSnapshot {
         DaemonStateSnapshot {
             total_windows: self.windows.len(),
             manageable_windows: self.manageable_window_count(),
@@ -1295,6 +1319,64 @@ impl DaemonState {
             temporary_floating_windows: self.temporary_floating_window_count(),
             active_workspace: self.workspaces.active_workspace().0,
             foreground_window: self.foreground.map(|handle| handle.0),
+            monitors: self.monitor_snapshots(monitors),
+            windows: self.window_snapshots(monitors),
+        }
+    }
+
+    fn monitor_snapshots(&self, monitors: &[MonitorInfo]) -> Vec<MonitorStateSnapshot> {
+        monitors
+            .iter()
+            .map(|monitor| MonitorStateSnapshot {
+                monitor_id: monitor.id.0,
+                workspace_id: self.workspaces.active_workspace_for_monitor(monitor.id).0,
+                focused: self.workspaces.focused_monitor() == Some(monitor.id),
+            })
+            .collect()
+    }
+
+    fn window_snapshots(&self, monitors: &[MonitorInfo]) -> Vec<WindowStateSnapshot> {
+        self.windows
+            .iter()
+            .map(|(handle, window)| {
+                let monitor = self.window_owner_monitor(*handle, monitors);
+                let workspace = self
+                    .workspaces
+                    .window_state(*handle)
+                    .map(|state| state.workspace);
+                WindowStateSnapshot {
+                    handle: handle.0,
+                    title: window.title.clone(),
+                    monitor_id: monitor.map(|monitor| monitor.0),
+                    workspace_id: workspace.map(|workspace| workspace.0),
+                    focused: self.foreground == Some(*handle),
+                    participation: self.window_snapshot_participation(*handle),
+                    constrained: !merge_size_constraints(
+                        window.size_constraints,
+                        self.learned_size_constraints
+                            .get(handle)
+                            .copied()
+                            .unwrap_or_default(),
+                    )
+                    .is_unconstrained(),
+                    visible_on_active_workspace: self
+                        .is_window_visible_on_owned_monitor(*handle, monitors),
+                }
+            })
+            .collect()
+    }
+
+    fn window_snapshot_participation(&self, window: WindowHandle) -> WindowParticipationSnapshot {
+        if self.overflow_floating.contains(&window) {
+            return WindowParticipationSnapshot::OverflowFloating;
+        }
+
+        match self.window_participation(window) {
+            WindowParticipation::Tiled => WindowParticipationSnapshot::Tiled,
+            WindowParticipation::Floating => WindowParticipationSnapshot::Floating,
+            WindowParticipation::TemporarilyFloating => {
+                WindowParticipationSnapshot::TemporarilyFloating
+            }
         }
     }
 
@@ -1330,18 +1412,12 @@ impl DaemonState {
             return Ok(());
         }
 
-        let monitors = if command.needs_layout() {
+        let monitors = if command.needs_monitors() {
             winland_win32::enumerate_monitors().context("enumerate monitors for daemon command")?
         } else {
             Vec::new()
         };
         let plan = self.plan_command(command, &monitors);
-
-        if let Some(target) = plan.focus
-            && let Err(error) = winland_win32::focus_window(target)
-        {
-            warn!(window = %target, %error, "failed to focus window from hotkey command");
-        }
 
         for window in &plan.hide {
             if let Err(error) = winland_win32::hide_window(*window) {
@@ -1371,6 +1447,13 @@ impl DaemonState {
         }
 
         self.apply_tile_assignments_with_feedback(&plan.moves, &monitors, "hotkey command");
+
+        if let Some(target) = plan.focus
+            && let Err(error) = winland_win32::focus_window(target)
+        {
+            warn!(window = %target, %error, "failed to focus window from hotkey command");
+        }
+
         self.sync_borders("hotkey command borders")?;
 
         if plan.quit {
@@ -1384,9 +1467,10 @@ impl DaemonState {
     fn plan_command(&mut self, command: DaemonCommand, monitors: &[MonitorInfo]) -> CommandPlan {
         match command {
             DaemonCommand::Focus(direction) => {
-                let focus = self.focus_target(direction);
+                let focus = self.focus_target(direction, monitors);
                 if let Some(target) = focus {
                     self.foreground = Some(target);
+                    self.focus_monitor_for_window(target, monitors);
                 }
 
                 CommandPlan {
@@ -1394,8 +1478,15 @@ impl DaemonState {
                     ..CommandPlan::default()
                 }
             }
+            DaemonCommand::FocusMonitor(selector) => {
+                let focus = self.focus_monitor_command(selector, monitors);
+                CommandPlan {
+                    focus,
+                    ..CommandPlan::default()
+                }
+            }
             DaemonCommand::Swap(direction) => {
-                self.swap_focused_with(direction);
+                self.swap_focused_with(direction, monitors);
                 CommandPlan {
                     moves: self.tile_assignments(monitors),
                     ..CommandPlan::default()
@@ -1406,7 +1497,7 @@ impl DaemonState {
                 ..CommandPlan::default()
             },
             DaemonCommand::ToggleFloat => {
-                self.toggle_focused_float();
+                self.toggle_focused_float(monitors);
                 CommandPlan {
                     moves: self.tile_assignments(monitors),
                     ..CommandPlan::default()
@@ -1414,7 +1505,33 @@ impl DaemonState {
             }
             DaemonCommand::SwitchWorkspace(workspace) => {
                 let workspace_plan = self.switch_workspace(workspace, monitors);
+                let focus = workspace_plan
+                    .focus
+                    .or_else(|| self.focus_candidate_for_focused_monitor(monitors));
+                self.foreground = focus;
                 CommandPlan {
+                    focus,
+                    hide: workspace_plan.hide,
+                    show: workspace_plan.show,
+                    moves: self.tile_assignments(monitors),
+                    ..CommandPlan::default()
+                }
+            }
+            DaemonCommand::SwitchWorkspaceRelative(direction) => {
+                self.sync_workspace_state(monitors);
+                let reference_monitor = self
+                    .active_drag_window()
+                    .filter(|window| self.is_command_movable_window(*window, monitors))
+                    .and_then(|window| self.window_owner_monitor(window, monitors))
+                    .or_else(|| self.command_monitor(monitors));
+                let workspace = self.relative_workspace_for_monitor(direction, reference_monitor);
+                let workspace_plan = self.switch_workspace(workspace, monitors);
+                let focus = workspace_plan
+                    .focus
+                    .or_else(|| self.focus_candidate_for_focused_monitor(monitors));
+                self.foreground = focus;
+                CommandPlan {
+                    focus,
                     hide: workspace_plan.hide,
                     show: workspace_plan.show,
                     moves: self.tile_assignments(monitors),
@@ -1422,12 +1539,16 @@ impl DaemonState {
                 }
             }
             DaemonCommand::MoveFocusedToWorkspace(workspace) => {
-                let hide = self.move_focused_to_workspace(workspace, monitors);
-                CommandPlan {
-                    hide,
-                    moves: self.tile_assignments(monitors),
-                    ..CommandPlan::default()
-                }
+                self.move_focused_to_workspace(workspace, false, monitors)
+            }
+            DaemonCommand::MoveFocusedToWorkspaceAndFollow(workspace) => {
+                self.move_focused_to_workspace(workspace, true, monitors)
+            }
+            DaemonCommand::MoveFocusedToMonitor(selector) => {
+                self.move_focused_to_monitor(selector, monitors)
+            }
+            DaemonCommand::SendWorkspaceToMonitor { workspace, monitor } => {
+                self.send_workspace_to_monitor(workspace, monitor, monitors)
             }
             DaemonCommand::Quit => CommandPlan {
                 quit: true,
@@ -1441,14 +1562,18 @@ impl DaemonState {
         }
     }
 
-    fn focus_target(&self, direction: FocusDirection) -> Option<WindowHandle> {
+    fn focus_target(
+        &self,
+        direction: FocusDirection,
+        monitors: &[MonitorInfo],
+    ) -> Option<WindowHandle> {
         let current = self
             .foreground
-            .filter(|handle| self.is_manageable_window(*handle))
-            .or_else(|| self.focusable_handles().into_iter().next())?;
+            .filter(|handle| self.is_manageable_window(*handle, monitors))
+            .or_else(|| self.focusable_handles(monitors).into_iter().next())?;
 
         let current_center = self.windows.get(&current)?.rect.center();
-        self.focusable_handles()
+        self.focusable_handles(monitors)
             .into_iter()
             .filter(|handle| *handle != current)
             .filter_map(|handle| {
@@ -1477,15 +1602,16 @@ impl DaemonState {
             })
             .min_by_key(|(key, _)| *key)
             .map(|(_, handle)| handle)
-            .or_else(|| self.wrapping_focus_target(current, direction))
+            .or_else(|| self.wrapping_focus_target(current, direction, monitors))
     }
 
     fn wrapping_focus_target(
         &self,
         current: WindowHandle,
         direction: FocusDirection,
+        monitors: &[MonitorInfo],
     ) -> Option<WindowHandle> {
-        let handles = self.focusable_handles();
+        let handles = self.focusable_handles(monitors);
         if handles.is_empty() {
             return None;
         }
@@ -1508,14 +1634,14 @@ impl DaemonState {
         Some(handles[next_index])
     }
 
-    fn swap_focused_with(&mut self, direction: FocusDirection) {
+    fn swap_focused_with(&mut self, direction: FocusDirection, monitors: &[MonitorInfo]) {
         let Some(current) = self
             .foreground
-            .filter(|handle| self.is_manageable_window(*handle))
+            .filter(|handle| self.is_manageable_window(*handle, monitors))
         else {
             return;
         };
-        let Some(target) = self.focus_target(direction) else {
+        let Some(target) = self.focus_target(direction, monitors) else {
             return;
         };
 
@@ -1526,10 +1652,10 @@ impl DaemonState {
         }
     }
 
-    fn toggle_focused_float(&mut self) {
+    fn toggle_focused_float(&mut self, monitors: &[MonitorInfo]) {
         let Some(current) = self
             .foreground
-            .filter(|handle| self.is_manageable_window(*handle))
+            .filter(|handle| self.is_manageable_window(*handle, monitors))
         else {
             return;
         };
@@ -1552,23 +1678,21 @@ impl DaemonState {
     ) -> CommandPlan {
         let mut should_retile = self.should_retile_after_events(batch, diff);
 
-        if self.config.drag_to_float {
-            for event in batch {
-                match event.kind {
-                    WindowEventKind::MoveSizeStart => {
-                        if self.handle_movesize_start(event.window) {
-                            should_retile = should_retile || self.config.dynamic_retile;
-                        }
+        for event in batch {
+            match event.kind {
+                WindowEventKind::MoveSizeStart => {
+                    if self.handle_movesize_start(event.window, monitors) {
+                        should_retile = should_retile || self.config.dynamic_retile;
                     }
-                    WindowEventKind::MoveSizeEnd => {
-                        if self.handle_movesize_end(event.window, monitors, None)
-                            && self.config.retile_on_drag_end
-                        {
-                            should_retile = true;
-                        }
-                    }
-                    _ => {}
                 }
+                WindowEventKind::MoveSizeEnd => {
+                    if self.handle_movesize_end(event.window, monitors, None)
+                        && self.config.retile_on_drag_end
+                    {
+                        should_retile = true;
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -1607,13 +1731,10 @@ impl DaemonState {
         }) || diff.moved_between_monitors > 0
     }
 
-    fn handle_movesize_start(&mut self, window: WindowHandle) -> bool {
-        if !self.config.drag_to_float {
-            return false;
-        }
-
+    fn handle_movesize_start(&mut self, window: WindowHandle, monitors: &[MonitorInfo]) -> bool {
         self.forget_learned_size_constraint(window);
-        self.start_temporary_float(window)
+        self.start_interactive_drag(window, monitors);
+        self.config.drag_to_float && self.start_temporary_float(window, monitors)
     }
 
     fn handle_movesize_end(
@@ -1622,6 +1743,8 @@ impl DaemonState {
         monitors: &[MonitorInfo],
         drop_context: Option<DropContext>,
     ) -> bool {
+        self.finish_interactive_drag(window);
+
         if !self.config.drag_to_float {
             return false;
         }
@@ -1642,9 +1765,31 @@ impl DaemonState {
         self.clear_temporary_float(window)
     }
 
-    fn start_temporary_float(&mut self, window: WindowHandle) -> bool {
+    fn start_interactive_drag(&mut self, window: WindowHandle, monitors: &[MonitorInfo]) {
+        if !self.is_command_movable_window(window, monitors) {
+            return;
+        }
+
+        self.active_interactive_drag = Some(window);
+    }
+
+    fn finish_interactive_drag(&mut self, window: WindowHandle) {
+        if self.active_interactive_drag == Some(window) {
+            self.active_interactive_drag = None;
+        }
+    }
+
+    fn active_drag_window(&self) -> Option<WindowHandle> {
+        self.active_modifier_drag
+            .map(|drag| drag.window)
+            .or(self.active_interactive_drag)
+    }
+
+    fn start_temporary_float(&mut self, window: WindowHandle, monitors: &[MonitorInfo]) -> bool {
         if self.window_participation(window) == WindowParticipation::Floating
-            || !self.is_tilable_window(window)
+            || !self
+                .window_owner_monitor(window, monitors)
+                .is_some_and(|monitor| self.is_tilable_window_on_monitor(window, monitor))
         {
             return false;
         }
@@ -1700,7 +1845,7 @@ impl DaemonState {
             .filter(|handle| self.window_participation(*handle).is_tiled())
             .filter(|handle| {
                 self.windows.get(handle).is_some_and(|candidate| {
-                    self.is_tilable_window(*handle)
+                    self.is_tilable_window_on_monitor(*handle, monitor.id)
                         && self.monitor_owns_window_rect(
                             *handle,
                             monitor,
@@ -1710,9 +1855,10 @@ impl DaemonState {
                 })
             })
             .collect();
-        let layout = self
-            .config
-            .layout_for_monitor(monitor, self.workspaces.active_workspace());
+        let layout = self.config.layout_for_monitor(
+            monitor,
+            self.workspaces.active_workspace_for_monitor(monitor.id),
+        );
 
         if layout.kind == LayoutKind::Dwindle
             && self.retarget_dwindle_drop(
@@ -1744,7 +1890,7 @@ impl DaemonState {
         layout: LayoutConfig,
     ) -> bool {
         let drop_point = cursor_position.unwrap_or_else(|| dropped_rect.center());
-        let workspace = self.workspaces.active_workspace();
+        let workspace = self.workspaces.active_workspace_for_monitor(monitor.id);
         let split_key = (workspace, monitor.id);
         let mut preview_splits = self
             .dwindle_splits
@@ -1795,9 +1941,10 @@ impl DaemonState {
             .filter_map(|index| {
                 let mut handles = target_handles.to_vec();
                 handles.insert(index, window);
-                let layout = self
-                    .config
-                    .layout_for_monitor(monitor, self.workspaces.active_workspace());
+                let layout = self.config.layout_for_monitor(
+                    monitor,
+                    self.workspaces.active_workspace_for_monitor(monitor.id),
+                );
                 let layout_windows = self.layout_windows_for_handles(&handles);
                 let assignment =
                     tile_layout_windows_with_config(monitor.work_area, &layout_windows, layout)
@@ -1860,33 +2007,112 @@ impl DaemonState {
         monitors: &[MonitorInfo],
     ) -> WorkspaceCommandPlan {
         self.sync_workspace_state(monitors);
-        let mut plan = self.workspaces.switch_to(workspace);
-        plan.hide
-            .retain(|window| self.should_hide_for_workspace(*window, monitors));
+        let drag_monitor = self
+            .active_drag_window()
+            .filter(|window| self.is_command_movable_window(*window, monitors))
+            .and_then(|window| self.window_owner_monitor(window, monitors));
+        let monitor = drag_monitor
+            .or_else(|| self.command_monitor(monitors))
+            .or_else(|| monitors.first().map(|monitor| monitor.id));
+        let dragged_window = self.workspace_switch_drag_window(monitor, monitors);
+        let dragged_window_moved = dragged_window.and_then(|window| {
+            if let Some(info) = self.windows.get(&window) {
+                self.workspaces.update_window_rect(window, info.rect);
+            }
+
+            self.workspaces
+                .move_window_to_workspace(window, workspace)
+                .then_some(window)
+        });
+
+        let mut plan = match monitor {
+            Some(monitor) => self.workspaces.switch_monitor_to(monitor, workspace),
+            None => self.workspaces.switch_to(workspace),
+        };
+        plan.hide.retain(|window| {
+            dragged_window_moved != Some(*window)
+                && self.should_hide_for_workspace(*window, monitors)
+                && monitor.is_none_or(|monitor| {
+                    self.window_belongs_to_monitor(*window, monitor, monitors)
+                })
+        });
+
+        let mut show: Vec<_> = plan
+            .show
+            .into_iter()
+            .filter(|change| {
+                monitor.is_none_or(|monitor| {
+                    self.window_belongs_to_monitor(change.window, monitor, monitors)
+                })
+            })
+            .collect();
+        if let Some(window) = dragged_window_moved
+            && !show.iter().any(|change| change.window == window)
+            && monitor
+                .is_none_or(|monitor| self.window_belongs_to_monitor(window, monitor, monitors))
+        {
+            show.push(WorkspaceVisibilityChange {
+                window,
+                restore_rect: self
+                    .workspaces
+                    .window_state(window)
+                    .and_then(|state| state.last_rect),
+            });
+        }
 
         if self
             .foreground
-            .is_some_and(|window| !self.workspaces.is_window_on_active_workspace(window))
+            .is_some_and(|window| !self.is_window_visible_on_owned_monitor(window, monitors))
         {
             self.foreground = None;
         }
 
+        info!(
+            workspace = %workspace,
+            monitor = ?monitor,
+            dragged_window = ?dragged_window_moved,
+            hide_count = plan.hide.len(),
+            show_count = show.len(),
+            "switched workspace"
+        );
+
         WorkspaceCommandPlan {
+            focus: dragged_window_moved,
             hide: plan.hide,
-            show: plan.show,
+            show,
         }
+    }
+
+    fn workspace_switch_drag_window(
+        &self,
+        target_monitor: Option<MonitorId>,
+        monitors: &[MonitorInfo],
+    ) -> Option<WindowHandle> {
+        let window = self.active_drag_window()?;
+        if !self.is_command_movable_window(window, monitors) {
+            return None;
+        }
+
+        if let Some(monitor) = target_monitor
+            && !self.window_belongs_to_monitor(window, monitor, monitors)
+        {
+            return None;
+        }
+
+        Some(window)
     }
 
     fn move_focused_to_workspace(
         &mut self,
         workspace: WorkspaceId,
+        follow: bool,
         monitors: &[MonitorInfo],
-    ) -> Vec<WindowHandle> {
+    ) -> CommandPlan {
         let Some(current) = self
             .foreground
-            .filter(|handle| self.is_manageable_window(*handle))
+            .filter(|handle| self.is_command_movable_window(*handle, monitors))
         else {
-            return Vec::new();
+            return CommandPlan::default();
         };
 
         self.sync_workspace_state(monitors);
@@ -1894,20 +2120,77 @@ impl DaemonState {
             self.workspaces.update_window_rect(current, window.rect);
         }
 
-        let was_active = self.workspaces.is_window_on_active_workspace(current);
+        let owner_monitor = self
+            .window_owner_monitor(current, monitors)
+            .or_else(|| self.command_monitor(monitors));
+        let was_visible = self.is_window_visible_on_owned_monitor(current, monitors);
         if !self.workspaces.move_window_to_workspace(current, workspace) {
-            return Vec::new();
+            return CommandPlan::default();
         }
 
-        if was_active && workspace != self.workspaces.active_workspace() {
-            self.set_window_participation(current, WindowParticipation::Tiled);
+        info!(
+            window = %current,
+            workspace = %workspace,
+            follow,
+            monitor = ?owner_monitor,
+            participation = ?self.window_participation(current),
+            "moved window to workspace"
+        );
+
+        if follow {
+            let workspace_plan = if let Some(monitor) = owner_monitor {
+                self.workspaces.switch_monitor_to(monitor, workspace)
+            } else {
+                self.workspaces.switch_to(workspace)
+            };
+            let hide = workspace_plan
+                .hide
+                .into_iter()
+                .filter(|window| *window != current)
+                .filter(|window| {
+                    self.should_hide_for_workspace(*window, monitors)
+                        && owner_monitor.is_none_or(|monitor| {
+                            self.window_belongs_to_monitor(*window, monitor, monitors)
+                        })
+                })
+                .collect();
+            let show = workspace_plan
+                .show
+                .into_iter()
+                .filter(|change| {
+                    owner_monitor.is_none_or(|monitor| {
+                        self.window_belongs_to_monitor(change.window, monitor, monitors)
+                    })
+                })
+                .collect();
+            self.foreground = Some(current);
+            return CommandPlan {
+                focus: Some(current),
+                hide,
+                show,
+                moves: self.tile_assignments(monitors),
+                ..CommandPlan::default()
+            };
+        }
+
+        let mut hide = Vec::new();
+        if was_visible && !self.is_window_visible_on_owned_monitor(current, monitors) {
             self.foreground = None;
             if self.should_hide_for_workspace(current, monitors) {
-                return vec![current];
+                hide.push(current);
             }
         }
 
-        Vec::new()
+        let focus =
+            owner_monitor.and_then(|monitor| self.focus_candidate_for_monitor(monitor, monitors));
+        self.foreground = focus;
+
+        CommandPlan {
+            hide,
+            focus,
+            moves: self.tile_assignments(monitors),
+            ..CommandPlan::default()
+        }
     }
 
     fn tile_assignments(&mut self, monitors: &[MonitorInfo]) -> Vec<TileAssignment> {
@@ -1916,11 +2199,11 @@ impl DaemonState {
         }
 
         let cursor_position = winland_win32::cursor_position().ok();
-        let active_workspace = self.workspaces.active_workspace();
         let mut assignments = Vec::new();
         let mut next_overflow_floating = BTreeSet::new();
 
         for monitor in monitors {
+            let active_workspace = self.workspaces.active_workspace_for_monitor(monitor.id);
             if self.game_mode_pauses_monitor(monitor.id) {
                 debug!(
                     monitor = %monitor.id,
@@ -2010,7 +2293,10 @@ impl DaemonState {
         if layout.kind == LayoutKind::Dwindle {
             let mut splits = self
                 .dwindle_splits
-                .get(&(self.workspaces.active_workspace(), monitor.id))
+                .get(&(
+                    self.workspaces.active_workspace_for_monitor(monitor.id),
+                    monitor.id,
+                ))
                 .cloned()
                 .unwrap_or_default();
             tile_layout_windows_with_state(
@@ -2160,7 +2446,7 @@ impl DaemonState {
             .filter(|handle| self.window_participation(*handle).is_tiled())
             .filter(|handle| {
                 self.windows.get(handle).is_some_and(|window| {
-                    self.is_tilable_window(*handle)
+                    self.is_tilable_window_on_monitor(*handle, monitor.id)
                         && self.monitor_owns_window_rect(
                             *handle,
                             monitor,
@@ -2191,6 +2477,15 @@ impl DaemonState {
     }
 
     fn sync_workspace_state(&mut self, monitors: &[MonitorInfo]) {
+        self.workspaces
+            .sync_monitors(monitors.iter().map(|monitor| monitor.id));
+        if let Some(monitor) = self
+            .foreground
+            .and_then(|window| self.window_owner_monitor(window, monitors))
+        {
+            self.workspaces.focus_monitor(monitor);
+        }
+
         let existing: BTreeSet<_> = self.windows.keys().copied().collect();
         self.workspaces.retain_windows(&existing);
 
@@ -2202,9 +2497,33 @@ impl DaemonState {
 
         for (handle, window) in windows {
             let decision = self.rule_decision(&window);
+            let previous_owner = self.window_owner_monitor(handle, monitors);
+            let rect_monitor = monitor_for_rect(window.rect, monitors);
+            let owner_changed =
+                window.is_visible && rect_monitor.is_some() && previous_owner != rect_monitor;
+            if window.is_visible
+                && let Some(monitor) = rect_monitor
+            {
+                self.window_monitor_overrides.insert(handle, monitor);
+            }
+            let owner_monitor = self.window_owner_monitor(handle, monitors).or(rect_monitor);
+            if let Some(monitor) = owner_monitor {
+                self.window_monitor_overrides
+                    .entry(handle)
+                    .or_insert(monitor);
+            }
             if self.workspaces.window_state(handle).is_some() {
                 if self.is_workspace_manageable_by_rules(&window, &decision) {
                     self.workspaces.update_window_rect(handle, window.rect);
+                    if owner_changed
+                        && let Some(monitor) = owner_monitor
+                        && !self
+                            .workspaces
+                            .is_window_on_monitor_workspace(handle, monitor)
+                    {
+                        let workspace = self.workspaces.active_workspace_for_monitor(monitor);
+                        self.workspaces.move_window_to_workspace(handle, workspace);
+                    }
                 }
             } else if self.is_manageable_by_rules(&window, &decision)
                 && !is_fullscreen_window(
@@ -2216,6 +2535,12 @@ impl DaemonState {
                 if let Some(workspace) = decision.target_workspace {
                     self.workspaces
                         .track_window_on_workspace(handle, workspace, window.rect);
+                } else if let Some(monitor) = owner_monitor {
+                    self.workspaces.track_window_on_workspace(
+                        handle,
+                        self.workspaces.active_workspace_for_monitor(monitor),
+                        window.rect,
+                    );
                 } else {
                     self.workspaces.track_window(handle, window.rect);
                 }
@@ -2241,8 +2566,9 @@ impl DaemonState {
         })
     }
 
-    fn is_tilable_window(&self, handle: WindowHandle) -> bool {
-        self.workspaces.is_window_on_active_workspace(handle)
+    fn is_tilable_window_on_monitor(&self, handle: WindowHandle, monitor: MonitorId) -> bool {
+        self.workspaces
+            .is_window_on_monitor_workspace(handle, monitor)
             && self.windows.get(&handle).is_some_and(|window| {
                 self.is_workspace_manageable_by_rules(window, &self.rule_decision(window))
             })
@@ -2253,6 +2579,314 @@ impl DaemonState {
             .window_state(handle)
             .and_then(|state| state.last_rect)
             .unwrap_or(window.rect)
+    }
+
+    fn window_owner_monitor(
+        &self,
+        handle: WindowHandle,
+        monitors: &[MonitorInfo],
+    ) -> Option<MonitorId> {
+        if let Some(monitor) = self.window_monitor_overrides.get(&handle).copied()
+            && monitors.iter().any(|candidate| candidate.id == monitor)
+        {
+            return Some(monitor);
+        }
+
+        let window = self.windows.get(&handle)?;
+        monitor_for_rect(self.window_layout_rect(handle, window), monitors)
+    }
+
+    fn window_belongs_to_monitor(
+        &self,
+        handle: WindowHandle,
+        monitor: MonitorId,
+        monitors: &[MonitorInfo],
+    ) -> bool {
+        self.window_owner_monitor(handle, monitors) == Some(monitor)
+    }
+
+    fn is_window_visible_on_owned_monitor(
+        &self,
+        handle: WindowHandle,
+        monitors: &[MonitorInfo],
+    ) -> bool {
+        let Some(monitor) = self.window_owner_monitor(handle, monitors) else {
+            return self.workspaces.is_window_on_active_workspace(handle);
+        };
+
+        self.workspaces
+            .is_window_on_monitor_workspace(handle, monitor)
+    }
+
+    fn focus_monitor_for_window(&mut self, window: WindowHandle, monitors: &[MonitorInfo]) {
+        if let Some(monitor) = self.window_owner_monitor(window, monitors) {
+            self.workspaces.focus_monitor(monitor);
+        }
+    }
+
+    fn command_monitor(&self, monitors: &[MonitorInfo]) -> Option<MonitorId> {
+        self.foreground
+            .and_then(|window| self.window_owner_monitor(window, monitors))
+            .or_else(|| {
+                self.workspaces
+                    .focused_monitor()
+                    .filter(|focused| monitors.iter().any(|monitor| monitor.id == *focused))
+            })
+            .or_else(|| sorted_monitor_ids(monitors).into_iter().next())
+    }
+
+    fn focus_candidate_for_focused_monitor(
+        &self,
+        monitors: &[MonitorInfo],
+    ) -> Option<WindowHandle> {
+        let monitor = self.workspaces.focused_monitor()?;
+        self.focus_candidate_for_monitor(monitor, monitors)
+    }
+
+    fn focus_candidate_for_monitor(
+        &self,
+        monitor: MonitorId,
+        monitors: &[MonitorInfo],
+    ) -> Option<WindowHandle> {
+        self.tile_order
+            .iter()
+            .copied()
+            .filter(|handle| self.window_belongs_to_monitor(*handle, monitor, monitors))
+            .find(|handle| self.is_manageable_window(*handle, monitors))
+    }
+
+    fn focus_monitor_command(
+        &mut self,
+        selector: MonitorSelector,
+        monitors: &[MonitorInfo],
+    ) -> Option<WindowHandle> {
+        let monitor = self.resolve_monitor_selector(selector, monitors)?;
+
+        self.workspaces.focus_monitor(monitor);
+        let focus = self.focus_candidate_for_monitor(monitor, monitors);
+        self.foreground = focus;
+        info!(monitor = %monitor, focus = ?focus, "focused monitor");
+        focus
+    }
+
+    fn relative_workspace_for_monitor(
+        &self,
+        direction: CycleDirection,
+        monitor: Option<MonitorId>,
+    ) -> WorkspaceId {
+        let active = monitor
+            .map(|monitor| self.workspaces.active_workspace_for_monitor(monitor))
+            .unwrap_or_else(|| self.workspaces.active_workspace());
+        self.relative_workspace_from(active, direction)
+    }
+
+    fn relative_workspace_from(
+        &self,
+        active: WorkspaceId,
+        direction: CycleDirection,
+    ) -> WorkspaceId {
+        let workspaces: Vec<_> = self.workspaces.workspaces().collect();
+        if workspaces.is_empty() {
+            return WorkspaceId(1);
+        }
+
+        let index = workspaces
+            .iter()
+            .position(|workspace| *workspace == active)
+            .unwrap_or(0);
+        let next = match direction {
+            CycleDirection::Next => (index + 1) % workspaces.len(),
+            CycleDirection::Prev => {
+                if index == 0 {
+                    workspaces.len() - 1
+                } else {
+                    index - 1
+                }
+            }
+        };
+        workspaces[next]
+    }
+
+    fn resolve_monitor_selector(
+        &self,
+        selector: MonitorSelector,
+        monitors: &[MonitorInfo],
+    ) -> Option<MonitorId> {
+        let ordered = sorted_monitor_ids(monitors);
+        if ordered.is_empty() {
+            return None;
+        }
+
+        match selector {
+            MonitorSelector::Id(id) if ordered.contains(&id) => Some(id),
+            MonitorSelector::Id(_) => None,
+            MonitorSelector::Index(index) => index
+                .checked_sub(1)
+                .and_then(|index| ordered.get(index).copied()),
+            MonitorSelector::Next | MonitorSelector::Prev => {
+                let current = self
+                    .command_monitor(monitors)
+                    .and_then(|monitor| ordered.iter().position(|candidate| *candidate == monitor))
+                    .unwrap_or(0);
+                let next = match selector {
+                    MonitorSelector::Next => (current + 1) % ordered.len(),
+                    MonitorSelector::Prev => {
+                        if current == 0 {
+                            ordered.len() - 1
+                        } else {
+                            current - 1
+                        }
+                    }
+                    MonitorSelector::Id(_) | MonitorSelector::Index(_) => unreachable!(),
+                };
+                ordered.get(next).copied()
+            }
+        }
+    }
+
+    fn move_focused_to_monitor(
+        &mut self,
+        selector: MonitorSelector,
+        monitors: &[MonitorInfo],
+    ) -> CommandPlan {
+        let Some(current) = self
+            .foreground
+            .filter(|handle| self.is_command_movable_window(*handle, monitors))
+        else {
+            return CommandPlan::default();
+        };
+        let Some(target_monitor) = self.resolve_monitor_selector(selector, monitors) else {
+            return CommandPlan::default();
+        };
+        let target_workspace = self.workspaces.active_workspace_for_monitor(target_monitor);
+        let source_monitor = self.window_owner_monitor(current, monitors);
+
+        if let Some(window) = self.windows.get(&current) {
+            self.workspaces.update_window_rect(current, window.rect);
+        }
+        self.workspaces
+            .move_window_to_workspace(current, target_workspace);
+        self.window_monitor_overrides
+            .insert(current, target_monitor);
+        self.workspaces.focus_monitor(target_monitor);
+        self.foreground = Some(current);
+
+        let mut moves = self.tile_assignments(monitors);
+        if self.window_participation(current).is_floating()
+            && let Some(rect) =
+                self.translated_window_rect(current, source_monitor, target_monitor, monitors)
+        {
+            moves.push(TileAssignment {
+                window: current,
+                rect,
+            });
+        }
+
+        info!(
+            window = %current,
+            from_monitor = ?source_monitor,
+            to_monitor = %target_monitor,
+            workspace = %target_workspace,
+            participation = ?self.window_participation(current),
+            "moved window to monitor"
+        );
+
+        CommandPlan {
+            focus: Some(current),
+            moves,
+            ..CommandPlan::default()
+        }
+    }
+
+    fn send_workspace_to_monitor(
+        &mut self,
+        workspace: WorkspaceId,
+        selector: MonitorSelector,
+        monitors: &[MonitorInfo],
+    ) -> CommandPlan {
+        let Some(target_monitor) = self.resolve_monitor_selector(selector, monitors) else {
+            return CommandPlan::default();
+        };
+        let windows: Vec<_> = self
+            .workspaces
+            .window_states()
+            .filter_map(|(window, state)| (state.workspace == workspace).then_some(window))
+            .filter(|window| self.is_safe_to_move_window(*window, monitors))
+            .collect();
+        let floating_moves: Vec<_> = windows
+            .iter()
+            .copied()
+            .filter(|window| self.window_participation(*window).is_floating())
+            .filter_map(|window| {
+                let source_monitor = self.window_owner_monitor(window, monitors);
+                self.translated_window_rect(window, source_monitor, target_monitor, monitors)
+                    .map(|rect| TileAssignment { window, rect })
+            })
+            .collect();
+
+        for window in &windows {
+            self.window_monitor_overrides
+                .insert(*window, target_monitor);
+        }
+
+        let mut workspace_plan = self.workspaces.switch_monitor_to(target_monitor, workspace);
+        workspace_plan.hide.retain(|window| {
+            self.should_hide_for_workspace(*window, monitors)
+                && self.window_belongs_to_monitor(*window, target_monitor, monitors)
+        });
+        workspace_plan.show.retain(|change| {
+            self.window_belongs_to_monitor(change.window, target_monitor, monitors)
+        });
+        let mut show = workspace_plan.show;
+        for window in &windows {
+            if show.iter().any(|change| change.window == *window) {
+                continue;
+            }
+            show.push(WorkspaceVisibilityChange {
+                window: *window,
+                restore_rect: self
+                    .workspaces
+                    .window_state(*window)
+                    .and_then(|state| state.last_rect),
+            });
+        }
+
+        let focus = self.focus_candidate_for_monitor(target_monitor, monitors);
+        self.foreground = focus;
+        let mut moves = self.tile_assignments(monitors);
+        moves.extend(floating_moves);
+
+        info!(
+            workspace = %workspace,
+            monitor = %target_monitor,
+            window_count = windows.len(),
+            focus = ?focus,
+            "sent workspace to monitor"
+        );
+
+        CommandPlan {
+            focus,
+            hide: workspace_plan.hide,
+            show,
+            moves,
+            ..CommandPlan::default()
+        }
+    }
+
+    fn translated_window_rect(
+        &self,
+        window: WindowHandle,
+        source_monitor: Option<MonitorId>,
+        target_monitor: MonitorId,
+        monitors: &[MonitorInfo],
+    ) -> Option<Rect> {
+        let window_info = self.windows.get(&window)?;
+        let target = monitors
+            .iter()
+            .find(|monitor| monitor.id == target_monitor)?;
+        let source =
+            source_monitor.and_then(|source| monitors.iter().find(|monitor| monitor.id == source));
+        Some(translate_rect_to_monitor(window_info.rect, source, target))
     }
 
     fn preserve_keyboard_state(&self, refreshed: &mut Self, monitors: &[MonitorInfo]) {
@@ -2313,6 +2947,9 @@ impl DaemonState {
         refreshed.active_modifier_drag = self
             .active_modifier_drag
             .filter(|drag| refreshed.windows.contains_key(&drag.window));
+        refreshed.active_interactive_drag = self
+            .active_interactive_drag
+            .filter(|window| refreshed.windows.contains_key(window));
         refreshed.suppressed_modifier_drag_events = self
             .suppressed_modifier_drag_events
             .iter()
@@ -2410,19 +3047,41 @@ impl DaemonState {
             .collect()
     }
 
-    fn focusable_handles(&self) -> Vec<WindowHandle> {
+    fn focusable_handles(&self, monitors: &[MonitorInfo]) -> Vec<WindowHandle> {
         self.tile_order
             .iter()
             .copied()
-            .filter(|handle| self.is_manageable_window(*handle))
+            .filter(|handle| self.is_manageable_window(*handle, monitors))
             .collect()
     }
 
-    fn is_manageable_window(&self, handle: WindowHandle) -> bool {
-        self.workspaces.is_window_on_active_workspace(handle)
+    fn is_manageable_window(&self, handle: WindowHandle, monitors: &[MonitorInfo]) -> bool {
+        self.is_window_visible_on_owned_monitor(handle, monitors)
             && self.windows.get(&handle).is_some_and(|window| {
                 self.is_manageable_by_rules(window, &self.rule_decision(window))
             })
+    }
+
+    fn is_command_movable_window(&self, handle: WindowHandle, monitors: &[MonitorInfo]) -> bool {
+        self.is_manageable_window(handle, monitors)
+            && self.windows.get(&handle).is_some_and(|window| {
+                !is_fullscreen_window(
+                    window,
+                    monitors,
+                    self.config.game_mode.policy.fullscreen_tolerance_px,
+                )
+            })
+    }
+
+    fn is_safe_to_move_window(&self, handle: WindowHandle, monitors: &[MonitorInfo]) -> bool {
+        self.windows.get(&handle).is_some_and(|window| {
+            self.is_workspace_manageable_by_rules(window, &self.rule_decision(window))
+                && !is_fullscreen_window(
+                    window,
+                    monitors,
+                    self.config.game_mode.policy.fullscreen_tolerance_px,
+                )
+        })
     }
 
     fn rule_decision(&self, window: &WindowInfo) -> WindowRuleDecision {
@@ -2464,6 +3123,8 @@ impl DaemonState {
         monitors: &[MonitorInfo],
         operation: &'static str,
     ) -> Result<()> {
+        self.sync_floating_z_order_with_monitors(monitors, operation);
+
         let Some(manager) = &self.border_manager else {
             return Ok(());
         };
@@ -2494,6 +3155,85 @@ impl DaemonState {
         Ok(())
     }
 
+    fn sync_floating_z_order_with_monitors(
+        &self,
+        monitors: &[MonitorInfo],
+        operation: &'static str,
+    ) {
+        let floating_windows = self.floating_z_order_windows(monitors);
+        if floating_windows.is_empty() {
+            return;
+        }
+
+        for window in &floating_windows {
+            if let Err(error) = winland_win32::raise_window_no_activate(*window) {
+                warn!(
+                    window = %window,
+                    %error,
+                    operation,
+                    "failed to raise floating window above tiled windows"
+                );
+            }
+        }
+
+        debug!(
+            floating_window_count = floating_windows.len(),
+            operation, "synced floating window z-order"
+        );
+    }
+
+    fn floating_z_order_windows(&self, monitors: &[MonitorInfo]) -> Vec<WindowHandle> {
+        if self.game_mode_pauses_layouts() {
+            return Vec::new();
+        }
+
+        let mut windows: Vec<_> = self
+            .tile_order
+            .iter()
+            .copied()
+            .filter(|handle| self.is_floating_z_order_window(*handle, monitors))
+            .collect();
+
+        for handle in self.windows.keys().copied() {
+            if !windows.contains(&handle) && self.is_floating_z_order_window(handle, monitors) {
+                windows.push(handle);
+            }
+        }
+
+        if let Some(foreground) = self.foreground
+            && let Some(index) = windows.iter().position(|window| *window == foreground)
+        {
+            let foreground = windows.remove(index);
+            windows.push(foreground);
+        }
+
+        windows
+    }
+
+    fn is_floating_z_order_window(&self, handle: WindowHandle, monitors: &[MonitorInfo]) -> bool {
+        let participation = self.window_participation(handle);
+        if !participation.is_floating() && !self.overflow_floating.contains(&handle) {
+            return false;
+        }
+
+        let Some(monitor) = self.window_owner_monitor(handle, monitors) else {
+            return false;
+        };
+        if self.game_mode_pauses_monitor(monitor) {
+            return false;
+        }
+
+        self.is_window_visible_on_owned_monitor(handle, monitors)
+            && self.windows.get(&handle).is_some_and(|window| {
+                self.is_workspace_manageable_by_rules(window, &self.rule_decision(window))
+                    && !is_fullscreen_window(
+                        window,
+                        monitors,
+                        self.config.game_mode.policy.fullscreen_tolerance_px,
+                    )
+            })
+    }
+
     fn border_candidates(&self, monitors: &[MonitorInfo]) -> Vec<BorderCandidate> {
         let config = self.config.borders;
         if !config.enabled {
@@ -2521,7 +3261,12 @@ impl DaemonState {
         self.windows
             .iter()
             .filter(|(handle, window)| {
-                self.is_manageable_window(**handle)
+                let Some(monitor) = self.window_owner_monitor(**handle, monitors) else {
+                    return false;
+                };
+
+                self.is_manageable_window(**handle, monitors)
+                    && !self.game_mode_pauses_monitor(monitor)
                     && !is_fullscreen_window(
                         window,
                         monitors,
@@ -2578,25 +3323,42 @@ struct SnapshotDiff {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DaemonCommand {
     Focus(FocusDirection),
+    FocusMonitor(MonitorSelector),
     Swap(FocusDirection),
     Retile,
     ToggleFloat,
     SwitchWorkspace(WorkspaceId),
+    SwitchWorkspaceRelative(CycleDirection),
     MoveFocusedToWorkspace(WorkspaceId),
+    MoveFocusedToWorkspaceAndFollow(WorkspaceId),
+    MoveFocusedToMonitor(MonitorSelector),
+    SendWorkspaceToMonitor {
+        workspace: WorkspaceId,
+        monitor: MonitorSelector,
+    },
     Reload,
     Quit,
     Launch(String),
 }
 
 impl DaemonCommand {
+    fn needs_monitors(&self) -> bool {
+        self.needs_layout() || matches!(self, Self::Focus(_) | Self::FocusMonitor(_))
+    }
+
     fn needs_layout(&self) -> bool {
         matches!(
             self,
-            Self::Swap(_)
+            Self::FocusMonitor(_)
+                | Self::Swap(_)
                 | Self::Retile
                 | Self::ToggleFloat
                 | Self::SwitchWorkspace(_)
+                | Self::SwitchWorkspaceRelative(_)
                 | Self::MoveFocusedToWorkspace(_)
+                | Self::MoveFocusedToWorkspaceAndFollow(_)
+                | Self::MoveFocusedToMonitor(_)
+                | Self::SendWorkspaceToMonitor { .. }
         )
     }
 
@@ -2604,11 +3366,16 @@ impl DaemonCommand {
         matches!(
             self,
             Self::Focus(_)
+                | Self::FocusMonitor(_)
                 | Self::Swap(_)
                 | Self::Retile
                 | Self::ToggleFloat
                 | Self::SwitchWorkspace(_)
+                | Self::SwitchWorkspaceRelative(_)
                 | Self::MoveFocusedToWorkspace(_)
+                | Self::MoveFocusedToWorkspaceAndFollow(_)
+                | Self::MoveFocusedToMonitor(_)
+                | Self::SendWorkspaceToMonitor { .. }
         )
     }
 }
@@ -2619,6 +3386,20 @@ enum FocusDirection {
     Down,
     Up,
     Right,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CycleDirection {
+    Next,
+    Prev,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MonitorSelector {
+    Next,
+    Prev,
+    Index(usize),
+    Id(MonitorId),
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -2633,6 +3414,7 @@ struct CommandPlan {
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct WorkspaceCommandPlan {
+    focus: Option<WindowHandle>,
     hide: Vec<WindowHandle>,
     show: Vec<WorkspaceVisibilityChange>,
 }
@@ -2848,6 +3630,7 @@ fn text_matchers_from_config(
 }
 
 fn daemon_command_from_name(command: &str) -> Option<DaemonCommand> {
+    let command = command.trim();
     if let Some(workspace) = command
         .strip_prefix("switch-workspace-")
         .and_then(|value| value.parse::<u16>().ok())
@@ -2864,6 +3647,10 @@ fn daemon_command_from_name(command: &str) -> Option<DaemonCommand> {
         )));
     }
 
+    if let Some(command) = daemon_command_from_words(command) {
+        return Some(command);
+    }
+
     match command {
         "focus-left" => Some(DaemonCommand::Focus(FocusDirection::Left)),
         "focus-down" => Some(DaemonCommand::Focus(FocusDirection::Down)),
@@ -2878,6 +3665,66 @@ fn daemon_command_from_name(command: &str) -> Option<DaemonCommand> {
         "reload" => Some(DaemonCommand::Reload),
         "quit" => Some(DaemonCommand::Quit),
         _ => None,
+    }
+}
+
+fn daemon_command_from_words(command: &str) -> Option<DaemonCommand> {
+    let words: Vec<_> = command.split_whitespace().collect();
+    match words.as_slice() {
+        ["switch-workspace", "next"] => {
+            Some(DaemonCommand::SwitchWorkspaceRelative(CycleDirection::Next))
+        }
+        ["switch-workspace", "prev" | "previous"] => {
+            Some(DaemonCommand::SwitchWorkspaceRelative(CycleDirection::Prev))
+        }
+        ["switch-workspace", workspace] => parse_workspace(workspace)
+            .map(|workspace| DaemonCommand::SwitchWorkspace(WorkspaceId(workspace))),
+        ["move-window-to-workspace", workspace] => parse_workspace(workspace)
+            .map(|workspace| DaemonCommand::MoveFocusedToWorkspace(WorkspaceId(workspace))),
+        ["move-window-to-workspace-and-follow", workspace] => {
+            parse_workspace(workspace).map(|workspace| {
+                DaemonCommand::MoveFocusedToWorkspaceAndFollow(WorkspaceId(workspace))
+            })
+        }
+        ["focus-monitor", selector] => {
+            parse_monitor_selector(selector).map(DaemonCommand::FocusMonitor)
+        }
+        ["move-window-to-monitor", selector] => {
+            parse_monitor_selector(selector).map(DaemonCommand::MoveFocusedToMonitor)
+        }
+        ["send-workspace-to-monitor", workspace, monitor] => {
+            let workspace = WorkspaceId(parse_workspace(workspace)?);
+            let monitor = parse_monitor_selector(monitor)?;
+            Some(DaemonCommand::SendWorkspaceToMonitor { workspace, monitor })
+        }
+        _ => None,
+    }
+}
+
+fn parse_workspace(input: &str) -> Option<u16> {
+    input.parse::<u16>().ok().filter(|workspace| *workspace > 0)
+}
+
+fn parse_monitor_selector(input: &str) -> Option<MonitorSelector> {
+    match input {
+        "next" => Some(MonitorSelector::Next),
+        "prev" | "previous" => Some(MonitorSelector::Prev),
+        _ => {
+            if let Some(hex) = input
+                .strip_prefix("0x")
+                .or_else(|| input.strip_prefix("0X"))
+            {
+                u64::from_str_radix(hex, 16)
+                    .ok()
+                    .map(|id| MonitorSelector::Id(MonitorId(id)))
+            } else {
+                input
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|index| *index > 0)
+                    .map(MonitorSelector::Index)
+            }
+        }
     }
 }
 
@@ -3135,6 +3982,57 @@ fn monitor_for_rect(rect: Rect, monitors: &[MonitorInfo]) -> Option<winland_core
         })
 }
 
+fn sorted_monitor_ids(monitors: &[MonitorInfo]) -> Vec<MonitorId> {
+    let mut ordered: Vec<_> = monitors
+        .iter()
+        .map(|monitor| (monitor.rect.left, monitor.rect.top, monitor.id))
+        .collect();
+    ordered.sort();
+    ordered.into_iter().map(|(_, _, id)| id).collect()
+}
+
+fn translate_rect_to_monitor(
+    rect: Rect,
+    source: Option<&MonitorInfo>,
+    target: &MonitorInfo,
+) -> Rect {
+    let translated = if let Some(source) = source {
+        let dx = target.work_area.left.saturating_sub(source.work_area.left);
+        let dy = target.work_area.top.saturating_sub(source.work_area.top);
+        Rect {
+            left: rect.left.saturating_add(dx),
+            top: rect.top.saturating_add(dy),
+            right: rect.right.saturating_add(dx),
+            bottom: rect.bottom.saturating_add(dy),
+        }
+    } else {
+        let center = target.work_area.center();
+        Rect::from_size(
+            center.x.saturating_sub(rect.width() / 2),
+            center.y.saturating_sub(rect.height() / 2),
+            rect.width(),
+            rect.height(),
+        )
+    };
+
+    clamp_rect_to_area(translated, target.work_area)
+}
+
+fn clamp_rect_to_area(rect: Rect, area: Rect) -> Rect {
+    let width = rect.width();
+    let height = rect.height();
+    let min_left = area.left;
+    let max_left = area.right.saturating_sub(width).max(min_left);
+    let min_top = area.top;
+    let max_top = area.bottom.saturating_sub(height).max(min_top);
+    Rect::from_size(
+        rect.left.clamp(min_left, max_left),
+        rect.top.clamp(min_top, max_top),
+        width,
+        height,
+    )
+}
+
 fn rect_overlap_area(a: Rect, b: Rect) -> i64 {
     let left = a.left.max(b.left);
     let top = a.top.max(b.top);
@@ -3204,6 +4102,37 @@ mod tests {
         assert_eq!(
             daemon_command_from_name("move-to-workspace-9"),
             Some(DaemonCommand::MoveFocusedToWorkspace(WorkspaceId(9)))
+        );
+        assert_eq!(
+            daemon_command_from_name("switch-workspace next"),
+            Some(DaemonCommand::SwitchWorkspaceRelative(CycleDirection::Next))
+        );
+        assert_eq!(
+            daemon_command_from_name("focus-monitor prev"),
+            Some(DaemonCommand::FocusMonitor(MonitorSelector::Prev))
+        );
+        assert_eq!(
+            daemon_command_from_name("move-window-to-monitor 2"),
+            Some(DaemonCommand::MoveFocusedToMonitor(MonitorSelector::Index(
+                2
+            )))
+        );
+        assert_eq!(
+            daemon_command_from_name("move-window-to-workspace 3"),
+            Some(DaemonCommand::MoveFocusedToWorkspace(WorkspaceId(3)))
+        );
+        assert_eq!(
+            daemon_command_from_name("move-window-to-workspace-and-follow 3"),
+            Some(DaemonCommand::MoveFocusedToWorkspaceAndFollow(WorkspaceId(
+                3
+            )))
+        );
+        assert_eq!(
+            daemon_command_from_name("send-workspace-to-monitor 3 0x2"),
+            Some(DaemonCommand::SendWorkspaceToMonitor {
+                workspace: WorkspaceId(3),
+                monitor: MonitorSelector::Id(MonitorId(2)),
+            })
         );
         assert_eq!(daemon_command_from_name("quit"), Some(DaemonCommand::Quit));
         assert_eq!(daemon_command_from_name("unknown"), None);
@@ -3813,7 +4742,7 @@ mod tests {
             window(2, "Two", Rect::from_size(200, 0, 100, 100)),
         ]);
 
-        assert!(state.handle_movesize_start(WindowHandle(1)));
+        assert!(state.handle_movesize_start(WindowHandle(1), &[primary_test_monitor()]));
 
         assert_eq!(
             state.window_participation(WindowHandle(1)),
@@ -4117,6 +5046,484 @@ mod tests {
     }
 
     #[test]
+    fn switching_workspace_while_dragging_moves_dragged_window_to_target_workspace() {
+        let mut state = daemon_state([
+            window(1, "Dragged", Rect::from_size(0, 0, 100, 100)),
+            window(2, "Stays Behind", Rect::from_size(200, 0, 100, 100)),
+            window(3, "Already There", Rect::from_size(400, 0, 100, 100)),
+        ]);
+        state
+            .workspaces
+            .move_window_to_workspace(WindowHandle(3), WorkspaceId(2));
+
+        assert!(state.handle_movesize_start(WindowHandle(1), &[primary_test_monitor()]));
+
+        let plan = state.plan_command(
+            DaemonCommand::SwitchWorkspace(WorkspaceId(2)),
+            &[primary_test_monitor()],
+        );
+
+        assert_eq!(
+            state
+                .workspaces
+                .window_state(WindowHandle(1))
+                .map(|state| state.workspace),
+            Some(WorkspaceId(2))
+        );
+        assert_eq!(
+            state.window_participation(WindowHandle(1)),
+            WindowParticipation::TemporarilyFloating
+        );
+        assert_eq!(state.foreground, Some(WindowHandle(1)));
+        assert_eq!(plan.focus, Some(WindowHandle(1)));
+        assert_eq!(plan.hide, vec![WindowHandle(2)]);
+        assert_eq!(
+            plan.show,
+            vec![
+                WorkspaceVisibilityChange {
+                    window: WindowHandle(1),
+                    restore_rect: Some(Rect::from_size(0, 0, 100, 100)),
+                },
+                WorkspaceVisibilityChange {
+                    window: WindowHandle(3),
+                    restore_rect: Some(Rect::from_size(400, 0, 100, 100)),
+                },
+            ]
+        );
+        assert_eq!(
+            plan.moves,
+            vec![TileAssignment {
+                window: WindowHandle(3),
+                rect: primary_test_monitor().work_area,
+            }]
+        );
+    }
+
+    #[test]
+    fn switching_workspace_while_dragging_floating_window_preserves_floating_state() {
+        let mut state = daemon_state([
+            window(1, "Floating", Rect::from_size(0, 0, 100, 100)),
+            window(2, "Stays Behind", Rect::from_size(200, 0, 100, 100)),
+        ]);
+        state.set_window_participation(WindowHandle(1), WindowParticipation::Floating);
+
+        assert!(!state.handle_movesize_start(WindowHandle(1), &[primary_test_monitor()]));
+        assert_eq!(state.active_interactive_drag, Some(WindowHandle(1)));
+
+        let plan = state.plan_command(
+            DaemonCommand::SwitchWorkspace(WorkspaceId(2)),
+            &[primary_test_monitor()],
+        );
+
+        assert_eq!(
+            state
+                .workspaces
+                .window_state(WindowHandle(1))
+                .map(|state| state.workspace),
+            Some(WorkspaceId(2))
+        );
+        assert_eq!(
+            state.window_participation(WindowHandle(1)),
+            WindowParticipation::Floating
+        );
+        assert_eq!(plan.focus, Some(WindowHandle(1)));
+        assert_eq!(plan.hide, vec![WindowHandle(2)]);
+        assert_eq!(
+            plan.show,
+            vec![WorkspaceVisibilityChange {
+                window: WindowHandle(1),
+                restore_rect: Some(Rect::from_size(0, 0, 100, 100)),
+            }]
+        );
+        assert!(plan.moves.is_empty());
+
+        assert!(!state.handle_movesize_end(WindowHandle(1), &[primary_test_monitor()], None));
+        assert_eq!(state.active_interactive_drag, None);
+    }
+
+    #[test]
+    fn switching_workspace_while_modifier_dragging_uses_modifier_drag_window() {
+        let mut state = daemon_state([
+            window(1, "Dragged", Rect::from_size(0, 0, 100, 100)),
+            window(2, "Stays Behind", Rect::from_size(200, 0, 100, 100)),
+        ]);
+        state.active_modifier_drag = Some(ActiveModifierDrag {
+            window: WindowHandle(1),
+            start_cursor: Point { x: 10, y: 10 },
+            last_cursor: Point { x: 10, y: 10 },
+            start_rect: Rect::from_size(0, 0, 100, 100),
+            move_count: 0,
+            started_temporary_float: false,
+        });
+
+        let plan = state.plan_command(
+            DaemonCommand::SwitchWorkspace(WorkspaceId(2)),
+            &[primary_test_monitor()],
+        );
+
+        assert_eq!(
+            state
+                .workspaces
+                .window_state(WindowHandle(1))
+                .map(|state| state.workspace),
+            Some(WorkspaceId(2))
+        );
+        assert_eq!(plan.focus, Some(WindowHandle(1)));
+        assert_eq!(plan.hide, vec![WindowHandle(2)]);
+        assert_eq!(
+            plan.show,
+            vec![WorkspaceVisibilityChange {
+                window: WindowHandle(1),
+                restore_rect: Some(Rect::from_size(0, 0, 100, 100)),
+            }]
+        );
+    }
+
+    #[test]
+    fn switching_relative_workspace_while_dragging_uses_dragged_monitor_workspace() {
+        let monitors = [primary_test_monitor(), secondary_test_monitor()];
+        let mut state = daemon_state([
+            window(1, "Primary", Rect::from_size(0, 0, 100, 100)),
+            window(2, "Dragged Secondary", Rect::from_size(1100, 0, 100, 100)),
+        ]);
+        state.sync_workspace_state(&monitors);
+
+        assert!(state.handle_movesize_start(WindowHandle(2), &monitors));
+
+        let plan = state.plan_command(
+            DaemonCommand::SwitchWorkspaceRelative(CycleDirection::Next),
+            &monitors,
+        );
+
+        assert_eq!(
+            state
+                .workspaces
+                .window_state(WindowHandle(2))
+                .map(|state| state.workspace),
+            Some(WorkspaceId(3))
+        );
+        assert_eq!(
+            state.workspaces.active_workspace_for_monitor(MonitorId(2)),
+            WorkspaceId(3)
+        );
+        assert_eq!(plan.focus, Some(WindowHandle(2)));
+        assert!(
+            plan.show
+                .iter()
+                .any(|change| change.window == WindowHandle(2))
+        );
+    }
+
+    #[test]
+    fn switching_workspace_while_dragging_fullscreen_window_does_not_move_it() {
+        let mut state = daemon_state([
+            window(1, "Fullscreen", primary_test_monitor().rect),
+            window(2, "Stays Behind", Rect::from_size(200, 0, 100, 100)),
+        ]);
+        state.active_interactive_drag = Some(WindowHandle(1));
+
+        let plan = state.plan_command(
+            DaemonCommand::SwitchWorkspace(WorkspaceId(2)),
+            &[primary_test_monitor()],
+        );
+
+        assert_ne!(
+            state
+                .workspaces
+                .window_state(WindowHandle(1))
+                .map(|state| state.workspace),
+            Some(WorkspaceId(2))
+        );
+        assert_ne!(plan.focus, Some(WindowHandle(1)));
+        assert!(
+            !plan
+                .show
+                .iter()
+                .any(|change| change.window == WindowHandle(1))
+        );
+    }
+
+    #[test]
+    fn focus_monitor_next_focuses_visible_window_on_target_monitor() {
+        let monitors = [primary_test_monitor(), secondary_test_monitor()];
+        let mut state = daemon_state([
+            window(1, "Primary", Rect::from_size(0, 0, 100, 100)),
+            window(2, "Secondary", Rect::from_size(1100, 0, 100, 100)),
+        ]);
+        state.sync_workspace_state(&monitors);
+        state.foreground = Some(WindowHandle(1));
+        state.focus_monitor_for_window(WindowHandle(1), &monitors);
+
+        let plan = state.plan_command(
+            DaemonCommand::FocusMonitor(MonitorSelector::Next),
+            &monitors,
+        );
+
+        assert_eq!(state.workspaces.focused_monitor(), Some(MonitorId(2)));
+        assert_eq!(plan.focus, Some(WindowHandle(2)));
+        assert_eq!(state.foreground, Some(WindowHandle(2)));
+        assert!(plan.moves.is_empty());
+    }
+
+    #[test]
+    fn move_window_to_monitor_uses_target_monitor_active_workspace() {
+        let monitors = [primary_test_monitor(), secondary_test_monitor()];
+        let mut state = daemon_state([
+            window(1, "Move Me", Rect::from_size(0, 0, 100, 100)),
+            window(2, "Stay Primary", Rect::from_size(200, 0, 100, 100)),
+            window(3, "Stay Secondary", Rect::from_size(1100, 0, 100, 100)),
+        ]);
+        state.sync_workspace_state(&monitors);
+        state.foreground = Some(WindowHandle(1));
+        state.focus_monitor_for_window(WindowHandle(1), &monitors);
+
+        let plan = state.plan_command(
+            DaemonCommand::MoveFocusedToMonitor(MonitorSelector::Next),
+            &monitors,
+        );
+
+        assert_eq!(
+            state
+                .workspaces
+                .window_state(WindowHandle(1))
+                .map(|state| state.workspace),
+            Some(WorkspaceId(2))
+        );
+        assert_eq!(
+            state
+                .window_monitor_overrides
+                .get(&WindowHandle(1))
+                .copied(),
+            Some(MonitorId(2))
+        );
+        assert_eq!(plan.focus, Some(WindowHandle(1)));
+        assert_eq!(
+            plan.moves,
+            vec![
+                TileAssignment {
+                    window: WindowHandle(2),
+                    rect: primary_test_monitor().work_area,
+                },
+                TileAssignment {
+                    window: WindowHandle(1),
+                    rect: Rect::from_size(1000, 0, 400, 560),
+                },
+                TileAssignment {
+                    window: WindowHandle(3),
+                    rect: Rect::from_size(1400, 0, 400, 560),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn send_workspace_to_monitor_updates_window_ownership_and_focus() {
+        let monitors = [primary_test_monitor(), secondary_test_monitor()];
+        let mut state = daemon_state([
+            window(1, "Workspace Two", Rect::from_size(0, 0, 100, 100)),
+            window(2, "Workspace One", Rect::from_size(200, 0, 100, 100)),
+        ]);
+        state
+            .workspaces
+            .move_window_to_workspace(WindowHandle(1), WorkspaceId(2));
+        state.set_window_participation(WindowHandle(1), WindowParticipation::Floating);
+
+        let plan = state.plan_command(
+            DaemonCommand::SendWorkspaceToMonitor {
+                workspace: WorkspaceId(2),
+                monitor: MonitorSelector::Index(2),
+            },
+            &monitors,
+        );
+
+        assert_eq!(
+            state
+                .window_monitor_overrides
+                .get(&WindowHandle(1))
+                .copied(),
+            Some(MonitorId(2))
+        );
+        assert_eq!(
+            state.workspaces.active_workspace_for_monitor(MonitorId(2)),
+            WorkspaceId(2)
+        );
+        assert_eq!(state.workspaces.focused_monitor(), Some(MonitorId(2)));
+        assert_eq!(plan.focus, Some(WindowHandle(1)));
+        assert_eq!(
+            plan.show,
+            vec![WorkspaceVisibilityChange {
+                window: WindowHandle(1),
+                restore_rect: Some(Rect::from_size(0, 0, 100, 100)),
+            }]
+        );
+        assert_eq!(
+            plan.moves,
+            vec![
+                TileAssignment {
+                    window: WindowHandle(2),
+                    rect: primary_test_monitor().work_area,
+                },
+                TileAssignment {
+                    window: WindowHandle(1),
+                    rect: Rect::from_size(1000, 0, 100, 100),
+                },
+            ]
+        );
+        assert_eq!(
+            state.window_participation(WindowHandle(1)),
+            WindowParticipation::Floating
+        );
+    }
+
+    #[test]
+    fn move_window_to_workspace_and_follow_keeps_floating_state_and_focuses_window() {
+        let mut state = daemon_state([
+            window(1, "Floating", Rect::from_size(0, 0, 100, 100)),
+            window(2, "Other", Rect::from_size(200, 0, 100, 100)),
+        ]);
+        state.foreground = Some(WindowHandle(1));
+        state.set_window_participation(WindowHandle(1), WindowParticipation::Floating);
+
+        let plan = state.plan_command(
+            DaemonCommand::MoveFocusedToWorkspaceAndFollow(WorkspaceId(2)),
+            &[primary_test_monitor()],
+        );
+
+        assert_eq!(state.workspaces.active_workspace(), WorkspaceId(2));
+        assert_eq!(state.foreground, Some(WindowHandle(1)));
+        assert_eq!(plan.focus, Some(WindowHandle(1)));
+        assert_eq!(plan.hide, vec![WindowHandle(2)]);
+        assert_eq!(
+            plan.show,
+            vec![WorkspaceVisibilityChange {
+                window: WindowHandle(1),
+                restore_rect: Some(Rect::from_size(0, 0, 100, 100)),
+            }]
+        );
+        assert_eq!(
+            state.window_participation(WindowHandle(1)),
+            WindowParticipation::Floating
+        );
+        assert!(plan.moves.is_empty());
+    }
+
+    #[test]
+    fn inactive_workspace_windows_are_not_bordered() {
+        let mut state = daemon_state([
+            window(1, "Active", Rect::from_size(0, 0, 100, 100)),
+            window(2, "Hidden", Rect::from_size(200, 0, 100, 100)),
+        ]);
+        state.config.borders.enabled = true;
+        state
+            .workspaces
+            .move_window_to_workspace(WindowHandle(2), WorkspaceId(2));
+
+        let candidates = state.border_candidates(&[primary_test_monitor()]);
+
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.window)
+                .collect::<Vec<_>>(),
+            vec![WindowHandle(1)]
+        );
+    }
+
+    #[test]
+    fn floating_z_order_raises_floating_temporary_and_overflow_windows() {
+        let mut state = daemon_state([
+            window(1, "Tiled", Rect::from_size(0, 0, 100, 100)),
+            window(2, "Floating", Rect::from_size(200, 0, 100, 100)),
+            window(3, "Temporary", Rect::from_size(400, 0, 100, 100)),
+            window(4, "Overflow", Rect::from_size(600, 0, 100, 100)),
+        ]);
+        state.set_window_participation(WindowHandle(2), WindowParticipation::Floating);
+        state.set_window_participation(WindowHandle(3), WindowParticipation::TemporarilyFloating);
+        state.overflow_floating.insert(WindowHandle(4));
+        state.foreground = Some(WindowHandle(3));
+
+        let windows = state.floating_z_order_windows(&[primary_test_monitor()]);
+
+        assert_eq!(
+            windows,
+            vec![WindowHandle(2), WindowHandle(4), WindowHandle(3)]
+        );
+    }
+
+    #[test]
+    fn floating_z_order_excludes_inactive_workspace_windows() {
+        let mut state = daemon_state([window(1, "Hidden", Rect::from_size(0, 0, 100, 100))]);
+        state.set_window_participation(WindowHandle(1), WindowParticipation::Floating);
+        state
+            .workspaces
+            .move_window_to_workspace(WindowHandle(1), WorkspaceId(2));
+
+        let hidden = state.floating_z_order_windows(&[primary_test_monitor()]);
+        state.workspaces.switch_to(WorkspaceId(2));
+        let shown = state.floating_z_order_windows(&[primary_test_monitor()]);
+
+        assert!(hidden.is_empty());
+        assert_eq!(shown, vec![WindowHandle(1)]);
+    }
+
+    #[test]
+    fn floating_z_order_respects_focused_monitor_game_mode_pause() {
+        let monitors = [primary_test_monitor(), secondary_test_monitor()];
+        let mut state = daemon_state([
+            window(1, "Fullscreen Game", monitors[0].rect),
+            window(2, "Primary Floating", Rect::from_size(200, 0, 100, 100)),
+            window(3, "Secondary Floating", Rect::from_size(1100, 0, 100, 100)),
+        ]);
+        state.foreground = Some(WindowHandle(1));
+        state.config.game_mode.pause_focused_monitor_only = true;
+        state.set_window_participation(WindowHandle(2), WindowParticipation::Floating);
+        state.set_window_participation(WindowHandle(3), WindowParticipation::Floating);
+
+        state.update_game_mode(&monitors, "test").unwrap();
+        let windows = state.floating_z_order_windows(&monitors);
+
+        assert_eq!(windows, vec![WindowHandle(3)]);
+    }
+
+    #[test]
+    fn state_snapshot_reports_monitor_workspace_and_window_visibility() {
+        let monitors = [primary_test_monitor(), secondary_test_monitor()];
+        let mut state = daemon_state([
+            window(1, "Primary", Rect::from_size(0, 0, 100, 100)),
+            window(2, "Secondary", Rect::from_size(1100, 0, 100, 100)),
+        ]);
+        state.sync_workspace_state(&monitors);
+        state.foreground = Some(WindowHandle(2));
+        state.focus_monitor_for_window(WindowHandle(2), &monitors);
+
+        let snapshot = state.state_snapshot_with_monitors(&monitors);
+
+        assert_eq!(
+            snapshot.monitors,
+            vec![
+                MonitorStateSnapshot {
+                    monitor_id: 1,
+                    workspace_id: 1,
+                    focused: false,
+                },
+                MonitorStateSnapshot {
+                    monitor_id: 2,
+                    workspace_id: 2,
+                    focused: true,
+                },
+            ]
+        );
+        assert_eq!(snapshot.windows.len(), 2);
+        assert_eq!(snapshot.windows[0].monitor_id, Some(1));
+        assert_eq!(snapshot.windows[0].workspace_id, Some(1));
+        assert!(snapshot.windows[0].visible_on_active_workspace);
+        assert_eq!(snapshot.windows[1].monitor_id, Some(2));
+        assert_eq!(snapshot.windows[1].workspace_id, Some(2));
+        assert!(snapshot.windows[1].focused);
+        assert!(snapshot.windows[1].visible_on_active_workspace);
+    }
+
+    #[test]
     fn work_area_sized_window_on_inactive_workspace_is_not_hidden() {
         let mut state = daemon_state([window(1, "One", primary_test_monitor().work_area)]);
         state
@@ -4258,17 +5665,26 @@ mod tests {
 
         let response = state.handle_ipc_request(IpcRequest::state());
 
+        let IpcResponse {
+            result: winland_ipc::IpcResponseResult::State(snapshot),
+            ..
+        } = response
+        else {
+            panic!("expected state response");
+        };
+
+        assert_eq!(snapshot.total_windows, 2);
+        assert_eq!(snapshot.manageable_windows, 2);
+        assert_eq!(snapshot.floating_windows, 1);
+        assert_eq!(snapshot.temporary_floating_windows, 0);
+        assert_eq!(snapshot.active_workspace, 2);
+        assert_eq!(snapshot.foreground_window, Some(2));
+        assert_eq!(snapshot.windows.len(), 2);
         assert_eq!(
-            response,
-            IpcResponse::state(DaemonStateSnapshot {
-                total_windows: 2,
-                manageable_windows: 2,
-                floating_windows: 1,
-                temporary_floating_windows: 0,
-                active_workspace: 2,
-                foreground_window: Some(2),
-            })
+            snapshot.windows[0].participation,
+            WindowParticipationSnapshot::Floating
         );
+        assert!(snapshot.windows[1].focused);
     }
 
     #[test]
@@ -4400,7 +5816,7 @@ mod tests {
             .plan_command(DaemonCommand::Retile, std::slice::from_ref(&monitor))
             .moves;
 
-        assert!(!state.is_manageable_window(WindowHandle(1)));
+        assert!(!state.is_manageable_window(WindowHandle(1), std::slice::from_ref(&monitor)));
         assert_eq!(
             assignments,
             vec![TileAssignment {
@@ -4465,6 +5881,7 @@ mod tests {
             overflow_floating: BTreeSet::new(),
             workspaces: WorkspaceManager::new(9),
             active_modifier_drag: None,
+            active_interactive_drag: None,
             suppressed_modifier_drag_events: BTreeSet::new(),
             config: RuntimeConfig::default(),
             hotkey_commands: HotkeyCommandMap::default(),

@@ -57,9 +57,14 @@ modifier_drag = { enabled = true, modifiers = "Win" }
 
 # Supported command names:
 # focus-left, focus-down, focus-up, focus-right
+# focus-monitor next, focus-monitor prev, focus-monitor 1
 # swap-left, swap-down, swap-up, swap-right
 # retile, toggle-float, reload, quit
-# switch-workspace-N, move-to-workspace-N
+# switch-workspace-N, switch-workspace N, switch-workspace next, switch-workspace prev
+# move-to-workspace-N, move-window-to-workspace N
+# move-window-to-workspace-and-follow N
+# move-window-to-monitor next, move-window-to-monitor prev, move-window-to-monitor 1
+# send-workspace-to-monitor WORKSPACE MONITOR
 # Bindings may set either command = "..." for Winland actions or launch = "..."
 # for an app command line.
 bindings = [

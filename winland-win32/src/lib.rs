@@ -51,16 +51,17 @@ mod platform {
         EVENT_SYSTEM_MOVESIZESTART, EnumWindows, GA_ROOT, GW_OWNER, GWL_EXSTYLE, GWL_STYLE,
         GWLP_USERDATA, GetAncestor, GetClassNameW, GetCursorPos, GetForegroundWindow, GetMessageW,
         GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
-        GetWindowThreadProcessId, HC_ACTION, HHOOK, HTTRANSPARENT, IsIconic, IsWindowVisible,
-        KBDLLHOOKSTRUCT, MINMAXINFO, MONITORINFOF_PRIMARY, MSG, MSLLHOOKSTRUCT, OBJID_WINDOW,
-        PM_NOREMOVE, PeekMessageW, PostThreadMessageW, RegisterClassW, SMTO_ABORTIFHUNG, SW_HIDE,
-        SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER, SWP_SHOWWINDOW,
-        SendMessageTimeoutW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
-        SetWindowsHookExW, ShowWindow, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL,
-        WH_MOUSE_LL, WINEVENT_OUTOFCONTEXT, WM_APP, WM_GETMINMAXINFO, WM_HOTKEY, WM_KEYDOWN,
-        WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WM_QUIT, WM_SYSKEYDOWN,
-        WNDCLASSW, WS_CAPTION, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
-        WS_THICKFRAME, WindowFromPoint,
+        GetWindowThreadProcessId, HC_ACTION, HHOOK, HTTRANSPARENT, HWND_TOP, IsIconic,
+        IsWindowVisible, KBDLLHOOKSTRUCT, MINMAXINFO, MONITORINFOF_PRIMARY, MSG, MSLLHOOKSTRUCT,
+        OBJID_WINDOW, PM_NOREMOVE, PeekMessageW, PostThreadMessageW, RegisterClassW,
+        SMTO_ABORTIFHUNG, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE,
+        SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SendMessageTimeoutW,
+        SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, SetWindowsHookExW, ShowWindow,
+        TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WINEVENT_OUTOFCONTEXT,
+        WM_APP, WM_GETMINMAXINFO, WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
+        WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WM_QUIT, WM_SYSKEYDOWN, WNDCLASSW, WS_CAPTION,
+        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP, WS_THICKFRAME,
+        WindowFromPoint,
     };
     use windows::core::{PCWSTR, PWSTR};
     use winland_core::{
@@ -168,6 +169,29 @@ mod platform {
         }
 
         Ok(())
+    }
+
+    pub fn raise_window_no_activate(handle: WindowHandle) -> Result<()> {
+        let hwnd = hwnd_from_handle(handle);
+
+        // SAFETY: hwnd comes from documented window enumeration or daemon state.
+        // HWND_TOP raises within the normal non-topmost z-order band; the flags
+        // keep the existing size, position, owner ordering, and activation.
+        unsafe {
+            SetWindowPos(
+                hwnd,
+                HWND_TOP,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+            )
+            .map_err(|source| Win32Error::Windows {
+                context: "SetWindowPos(HWND_TOP)",
+                source,
+            })
+        }
     }
 
     fn set_window_outer_rect(hwnd: HWND, rect: Rect) -> Result<()> {
@@ -2180,6 +2204,10 @@ mod platform {
         Err(Win32Error::UnsupportedPlatform)
     }
 
+    pub fn raise_window_no_activate(_handle: WindowHandle) -> Result<()> {
+        Err(Win32Error::UnsupportedPlatform)
+    }
+
     pub fn window_rect_for_handle(_handle: WindowHandle) -> Result<Rect> {
         Err(Win32Error::UnsupportedPlatform)
     }
@@ -2298,6 +2326,7 @@ pub use platform::hide_window;
 pub use platform::install_hotkey_override;
 pub use platform::install_modifier_drag;
 pub use platform::move_resize_window;
+pub use platform::raise_window_no_activate;
 pub use platform::register_hotkeys;
 pub use platform::request_message_loop_stop;
 pub use platform::run_message_loop;

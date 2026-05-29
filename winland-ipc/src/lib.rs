@@ -67,6 +67,36 @@ pub struct DaemonStateSnapshot {
     pub temporary_floating_windows: usize,
     pub active_workspace: u16,
     pub foreground_window: Option<u64>,
+    pub monitors: Vec<MonitorStateSnapshot>,
+    pub windows: Vec<WindowStateSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MonitorStateSnapshot {
+    pub monitor_id: u64,
+    pub workspace_id: u16,
+    pub focused: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowStateSnapshot {
+    pub handle: u64,
+    pub title: String,
+    pub monitor_id: Option<u64>,
+    pub workspace_id: Option<u16>,
+    pub focused: bool,
+    pub participation: WindowParticipationSnapshot,
+    pub constrained: bool,
+    pub visible_on_active_workspace: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WindowParticipationSnapshot {
+    Tiled,
+    Floating,
+    TemporarilyFloating,
+    OverflowFloating,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -142,6 +172,21 @@ mod tests {
             temporary_floating_windows: 0,
             active_workspace: 2,
             foreground_window: Some(0x1234),
+            monitors: vec![MonitorStateSnapshot {
+                monitor_id: 1,
+                workspace_id: 2,
+                focused: true,
+            }],
+            windows: vec![WindowStateSnapshot {
+                handle: 0x1234,
+                title: "Editor".to_owned(),
+                monitor_id: Some(1),
+                workspace_id: Some(2),
+                focused: true,
+                participation: WindowParticipationSnapshot::Tiled,
+                constrained: false,
+                visible_on_active_workspace: true,
+            }],
         };
 
         let encoded = encode_response(&IpcResponse::state(snapshot.clone())).unwrap();

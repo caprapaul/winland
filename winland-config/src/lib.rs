@@ -1159,6 +1159,7 @@ fn is_protected_hotkey_chord(chord: &HotkeyChord) -> bool {
 }
 
 fn validate_command(context: &str, command: &str, workspace_count: u16, errors: &mut Vec<String>) {
+    let command = command.trim();
     if is_supported_static_command(command) {
         return;
     }
@@ -1167,6 +1168,10 @@ fn validate_command(context: &str, command: &str, workspace_count: u16, errors: 
         .or_else(|| command_workspace_suffix(command, "move-to-workspace-"))
         .is_some_and(|workspace| (1..=workspace_count).contains(&workspace))
     {
+        return;
+    }
+
+    if is_supported_structured_command(command, workspace_count) {
         return;
     }
 
@@ -1193,6 +1198,39 @@ fn is_supported_static_command(command: &str) -> bool {
 
 fn command_workspace_suffix(command: &str, prefix: &str) -> Option<u16> {
     command.strip_prefix(prefix)?.parse().ok()
+}
+
+fn is_supported_structured_command(command: &str, workspace_count: u16) -> bool {
+    let words: Vec<_> = command.split_whitespace().collect();
+    match words.as_slice() {
+        ["switch-workspace", "next" | "prev" | "previous"] => true,
+        ["switch-workspace", workspace]
+        | ["move-window-to-workspace", workspace]
+        | ["move-window-to-workspace-and-follow", workspace] => parse_workspace_arg(workspace)
+            .is_some_and(|workspace| (1..=workspace_count).contains(&workspace)),
+        ["focus-monitor", monitor] | ["move-window-to-monitor", monitor] => {
+            parse_monitor_arg(monitor)
+        }
+        ["send-workspace-to-monitor", workspace, monitor] => {
+            parse_workspace_arg(workspace)
+                .is_some_and(|workspace| (1..=workspace_count).contains(&workspace))
+                && parse_monitor_arg(monitor)
+        }
+        _ => false,
+    }
+}
+
+fn parse_workspace_arg(input: &str) -> Option<u16> {
+    input.parse::<u16>().ok().filter(|workspace| *workspace > 0)
+}
+
+fn parse_monitor_arg(input: &str) -> bool {
+    matches!(input, "next" | "prev" | "previous")
+        || input.parse::<usize>().ok().is_some_and(|index| index > 0)
+        || input
+            .strip_prefix("0x")
+            .or_else(|| input.strip_prefix("0X"))
+            .is_some_and(|hex| u64::from_str_radix(hex, 16).is_ok())
 }
 
 fn validate_window_rules(
@@ -1589,6 +1627,30 @@ mod tests {
 
         assert!(output.contains("must set exactly one of command or launch"));
         assert!(output.contains("hotkeys.bindings[2].launch must not be empty"));
+    }
+
+    #[test]
+    fn validation_accepts_workspace_and_monitor_polish_commands() {
+        let config = parse_toml(
+            r#"
+            [workspaces]
+            count = 4
+
+            [hotkeys]
+            bindings = [
+              { keys = "Ctrl+Alt+1", command = "switch-workspace next" },
+              { keys = "Ctrl+Alt+2", command = "switch-workspace 3" },
+              { keys = "Ctrl+Alt+3", command = "move-window-to-workspace 2" },
+              { keys = "Ctrl+Alt+4", command = "move-window-to-workspace-and-follow 2" },
+              { keys = "Ctrl+Alt+5", command = "focus-monitor prev" },
+              { keys = "Ctrl+Alt+6", command = "move-window-to-monitor 2" },
+              { keys = "Ctrl+Alt+7", command = "send-workspace-to-monitor 2 0x2" },
+            ]
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.hotkeys.bindings.len(), 7);
     }
 
     #[test]

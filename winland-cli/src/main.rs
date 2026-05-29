@@ -9,7 +9,8 @@ use winland_core::{
     detect_game_mode, tile_windows_with_config,
 };
 use winland_ipc::{
-    DaemonStateSnapshot, IpcRequest, IpcResponseResult, decode_response, encode_request,
+    DaemonStateSnapshot, IpcRequest, IpcResponseResult, WindowParticipationSnapshot,
+    decode_response, encode_request,
 };
 
 #[derive(Debug, Parser)]
@@ -884,8 +885,7 @@ fn format_state_snapshot(snapshot: &DaemonStateSnapshot) -> String {
         .foreground_window
         .map(|handle| format!("0x{handle:X}"))
         .unwrap_or_else(|| "-".to_owned());
-
-    format!(
+    let mut output = format!(
         "Winland daemon is running (IPC protocol v{}).\nWindows: {} total, {} manageable, {} floating, {} temporary floating\nWorkspace: active {}\nForeground: {}",
         winland_ipc::PROTOCOL_VERSION,
         snapshot.total_windows,
@@ -894,7 +894,64 @@ fn format_state_snapshot(snapshot: &DaemonStateSnapshot) -> String {
         snapshot.temporary_floating_windows,
         snapshot.active_workspace,
         foreground
-    )
+    );
+
+    if !snapshot.monitors.is_empty() {
+        output.push_str("\n\nMonitors:");
+        for monitor in &snapshot.monitors {
+            output.push_str(&format!(
+                "\n  {} workspace {}{}",
+                format_hwnd_like(monitor.monitor_id),
+                monitor.workspace_id,
+                if monitor.focused { " focused" } else { "" }
+            ));
+        }
+    }
+
+    if !snapshot.windows.is_empty() {
+        output.push_str("\n\nWindows:");
+        for window in &snapshot.windows {
+            output.push_str(&format!(
+                "\n  {} ws {} mon {} {}{}{} - {}",
+                format_hwnd_like(window.handle),
+                window
+                    .workspace_id
+                    .map(|workspace| workspace.to_string())
+                    .unwrap_or_else(|| "-".to_owned()),
+                window
+                    .monitor_id
+                    .map(format_hwnd_like)
+                    .unwrap_or_else(|| "-".to_owned()),
+                participation_label(window.participation),
+                if window.constrained {
+                    " constrained"
+                } else {
+                    ""
+                },
+                if window.visible_on_active_workspace {
+                    " visible"
+                } else {
+                    " hidden"
+                },
+                truncate(&window.title, 48)
+            ));
+        }
+    }
+
+    output
+}
+
+fn format_hwnd_like(value: u64) -> String {
+    format!("0x{value:X}")
+}
+
+fn participation_label(participation: WindowParticipationSnapshot) -> &'static str {
+    match participation {
+        WindowParticipationSnapshot::Tiled => "tiled",
+        WindowParticipationSnapshot::Floating => "floating",
+        WindowParticipationSnapshot::TemporarilyFloating => "temporary-floating",
+        WindowParticipationSnapshot::OverflowFloating => "overflow-floating",
+    }
 }
 
 #[cfg(test)]
@@ -910,6 +967,21 @@ mod tests {
             temporary_floating_windows: 0,
             active_workspace: 4,
             foreground_window: Some(0xCAFE),
+            monitors: vec![winland_ipc::MonitorStateSnapshot {
+                monitor_id: 1,
+                workspace_id: 4,
+                focused: true,
+            }],
+            windows: vec![winland_ipc::WindowStateSnapshot {
+                handle: 0xCAFE,
+                title: "Editor".to_owned(),
+                monitor_id: Some(1),
+                workspace_id: Some(4),
+                focused: true,
+                participation: WindowParticipationSnapshot::Floating,
+                constrained: true,
+                visible_on_active_workspace: true,
+            }],
         };
 
         let output = format_state_snapshot(&snapshot);
@@ -918,5 +990,7 @@ mod tests {
         assert!(output.contains("3 total, 2 manageable"));
         assert!(output.contains("Workspace: active 4"));
         assert!(output.contains("Foreground: 0xCAFE"));
+        assert!(output.contains("0x1 workspace 4 focused"));
+        assert!(output.contains("0xCAFE ws 4 mon 0x1 floating constrained visible"));
     }
 }

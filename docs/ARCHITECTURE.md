@@ -135,4 +135,5 @@ Every unsafe block should state the preconditions being relied on.
 - Pure layout, workspace, rule, fullscreen, game-mode, and config tests live in `winland-core`, `winland-config`, `winland-ipc`, and daemon unit tests.
 - Desktop-mutating behavior is not exercised by default tests.
 - `winland-win32` exposes stubs on non-Windows so pure tests can still compile where possible.
-
+- The standard regression command is `cargo test --workspace`; run `cargo fmt` and `cargo clippy --workspace --all-targets` with it before behavior changes land.
+- CI runs those checks on a Windows runner so Win32-facing crates stay compiled without requiring tests to rearrange the desktop.

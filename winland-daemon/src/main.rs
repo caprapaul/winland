@@ -4552,7 +4552,7 @@ fn nearest_assignment(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use winland_core::{FullscreenArea, MonitorId, Rect, WindowStyles};
+    use winland_core::{FullscreenArea, MonitorId, Rect, WindowSizeConstraints, WindowStyles};
 
     #[test]
     fn config_hotkey_commands_route_without_real_hotkeys() {
@@ -6161,6 +6161,30 @@ mod tests {
     }
 
     #[test]
+    fn state_snapshot_reports_constrained_overflow_and_hidden_workspace_status() {
+        let mut constrained = window(1, "Constrained", Rect::from_size(0, 0, 100, 100));
+        constrained.size_constraints = WindowSizeConstraints::minimum(500, 300);
+        let mut state = daemon_state([
+            constrained,
+            window(2, "Overflow", Rect::from_size(200, 0, 100, 100)),
+        ]);
+        state.overflow_floating.insert(WindowHandle(2));
+        state
+            .workspaces
+            .move_window_to_workspace(WindowHandle(2), WorkspaceId(2));
+
+        let snapshot = state.state_snapshot_with_monitors(&[primary_test_monitor()]);
+
+        assert_eq!(snapshot.windows.len(), 2);
+        assert!(snapshot.windows[0].constrained);
+        assert_eq!(
+            snapshot.windows[1].participation,
+            WindowParticipationSnapshot::OverflowFloating
+        );
+        assert!(!snapshot.windows[1].visible_on_active_workspace);
+    }
+
+    #[test]
     fn config_diff_reports_reload_sections() {
         let old = Config::default();
         let mut new = old.clone();
@@ -6171,6 +6195,29 @@ mod tests {
         let diff = ConfigDiff::between(&old, &new);
 
         assert_eq!(diff.changed_sections, vec!["gaps", "borders", "game-mode"]);
+    }
+
+    #[test]
+    fn config_diff_reports_rule_only_reload_section() {
+        let old = Config::default();
+        let mut new = old.clone();
+        new.window_rules.push(winland_config::WindowRuleConfig {
+            name: Some("game".to_owned()),
+            matcher: winland_config::WindowRuleMatchConfig {
+                process_name: Some(winland_config::TextMatcherConfig::Exact(
+                    "game.exe".to_owned(),
+                )),
+                ..winland_config::WindowRuleMatchConfig::default()
+            },
+            action: winland_config::WindowRuleActionConfig {
+                mode: Some(winland_config::WindowRuleModeConfig::Game),
+                ..winland_config::WindowRuleActionConfig::default()
+            },
+        });
+
+        let diff = ConfigDiff::between(&old, &new);
+
+        assert_eq!(diff.changed_sections, vec!["window-rules"]);
     }
 
     #[test]
@@ -6258,6 +6305,31 @@ mod tests {
     }
 
     #[test]
+    fn rule_reload_removes_game_mode_windows_from_tiling_order() {
+        let mut state = daemon_state([
+            window(1, "Editor", Rect::from_size(0, 0, 100, 100)),
+            window(2, "Game", Rect::from_size(200, 0, 100, 100)),
+        ]);
+        state.config.window_rules = vec![WindowRule {
+            name: "game mode".to_owned(),
+            matcher: winland_core::WindowRuleMatch {
+                title: Some(winland_core::TextMatcher::Exact("Game".to_owned())),
+                ..winland_core::WindowRuleMatch::default()
+            },
+            action: winland_core::WindowRuleAction {
+                mode: Some(WindowRuleMode::Game),
+                ..winland_core::WindowRuleAction::default()
+            },
+        }];
+
+        let stats = state.reapply_window_rules_after_reload(&[primary_test_monitor()]);
+
+        assert_eq!(stats.removed_from_tile_order, 1);
+        assert_eq!(state.tile_order, vec![WindowHandle(1)]);
+        assert!(state.workspaces.window_state(WindowHandle(2)).is_none());
+    }
+
+    #[test]
     fn border_candidates_use_focus_inactive_and_floating_colors() {
         let mut state = daemon_state([
             window(1, "One", Rect::from_size(0, 0, 100, 100)),
@@ -6316,6 +6388,25 @@ mod tests {
         state.config.borders.enabled = true;
         state.foreground = Some(WindowHandle(1));
 
+        let candidates = state.border_candidates(&[primary_test_monitor()]);
+
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn border_candidates_hide_all_while_game_mode_disables_borders() {
+        let mut game = window(1, "Configured Game", Rect::from_size(0, 0, 100, 100));
+        game.executable_path = Some(r"C:\Games\game.exe".to_owned());
+        let mut state =
+            daemon_state([game, window(2, "Editor", Rect::from_size(200, 0, 100, 100))]);
+        state.config.borders.enabled = true;
+        state.config.game_mode.policy.game_exes = vec!["game.exe".to_owned()];
+        state.config.game_mode.disable_borders = true;
+        state.foreground = Some(WindowHandle(1));
+
+        state
+            .update_game_mode(&[primary_test_monitor()], "test")
+            .unwrap();
         let candidates = state.border_candidates(&[primary_test_monitor()]);
 
         assert!(candidates.is_empty());

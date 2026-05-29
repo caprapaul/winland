@@ -1520,6 +1520,59 @@ mod tests {
     }
 
     #[test]
+    fn repository_example_config_is_valid() {
+        let config = parse_toml(include_str!("../../winland.toml")).unwrap();
+
+        assert!(config.validate().is_ok());
+        assert!(!config.hotkeys.bindings.is_empty());
+        assert_eq!(config.layout_config().kind, LayoutKind::Dwindle);
+    }
+
+    #[test]
+    fn layout_override_precedence_is_workspace_then_primary_then_exact_monitor() {
+        let config = parse_toml(
+            r#"
+            [layout]
+            default = "master-stack"
+            gap = 1
+
+            [layout.per_workspace]
+            "2" = { layout = "vertical-stack", gap = 5 }
+
+            [layout.per_monitor]
+            primary = { layout = "horizontal-stack", gap = 7 }
+            "0x2" = { layout = "dwindle", gap = 9 }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.layout_config_for_monitor(MonitorId(3), false, WorkspaceId(2)),
+            LayoutConfig {
+                kind: LayoutKind::VerticalStack,
+                gap: 5,
+                ..LayoutConfig::default()
+            }
+        );
+        assert_eq!(
+            config.layout_config_for_monitor(MonitorId(3), true, WorkspaceId(2)),
+            LayoutConfig {
+                kind: LayoutKind::HorizontalStack,
+                gap: 7,
+                ..LayoutConfig::default()
+            }
+        );
+        assert_eq!(
+            config.layout_config_for_monitor(MonitorId(2), true, WorkspaceId(2)),
+            LayoutConfig {
+                kind: LayoutKind::Dwindle,
+                gap: 9,
+                ..LayoutConfig::default()
+            }
+        );
+    }
+
+    #[test]
     fn validation_reports_multiple_errors() {
         let error = parse_toml(
             r##"
@@ -1571,6 +1624,55 @@ mod tests {
         assert!(output.contains("hotkeys.modifier_drag.modifiers"));
         assert!(output.contains("switch-workspace-2"));
         assert!(output.contains("window_rules[0].action.workspace"));
+    }
+
+    #[test]
+    fn invalid_window_rules_report_empty_match_and_empty_action() {
+        let error = parse_toml(
+            r#"
+            [[window_rules]]
+            name = "broken"
+            [window_rules.match]
+            [window_rules.action]
+            "#,
+        )
+        .unwrap_err();
+
+        let ConfigError::Validation(errors) = error else {
+            panic!("expected validation errors");
+        };
+        let output = errors.to_string();
+
+        assert!(output.contains("window_rules[0].match must contain at least one matcher"));
+        assert!(output.contains("window_rules[0].action must contain at least one action"));
+    }
+
+    #[test]
+    fn load_path_reports_read_parse_and_validation_failures_without_defaults() {
+        let dir = unique_temp_dir("load-path-errors");
+        fs::create_dir_all(&dir).unwrap();
+
+        let missing = dir.join("missing.toml");
+        assert!(matches!(
+            load_path(&missing),
+            Err(ConfigError::Read { path, .. }) if path == missing
+        ));
+
+        let parse_error = dir.join("parse-error.toml");
+        fs::write(&parse_error, "[layout\n").unwrap();
+        assert!(matches!(
+            load_path(&parse_error),
+            Err(ConfigError::Parse(_))
+        ));
+
+        let validation_error = dir.join("validation-error.toml");
+        fs::write(&validation_error, "[layout]\ngap = 999\n").unwrap();
+        assert!(matches!(
+            load_path(&validation_error),
+            Err(ConfigError::Validation(_))
+        ));
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1704,5 +1806,13 @@ mod tests {
             size_constraints: winland_core::WindowSizeConstraints::NONE,
             rect: Rect::from_size(0, 0, 100, 100),
         }
+    }
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        env::temp_dir().join(format!(
+            "winland-config-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ))
     }
 }

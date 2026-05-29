@@ -2704,6 +2704,38 @@ mod tests {
     }
 
     #[test]
+    fn every_layout_keeps_many_normal_windows_inside_work_area_without_overlap() {
+        let work_area = Rect::from_size(20, 30, 1280, 720);
+        let windows: Vec<_> = (1..=7).map(WindowHandle).collect();
+
+        for kind in [
+            LayoutKind::MasterStack,
+            LayoutKind::Dwindle,
+            LayoutKind::VerticalStack,
+            LayoutKind::HorizontalStack,
+        ] {
+            let assignments = tile_windows_with_config(
+                work_area,
+                &windows,
+                LayoutConfig {
+                    kind,
+                    gap: 9,
+                    border: 2,
+                    master_ratio_percent: 55,
+                    smart_split: true,
+                    preserve_split: true,
+                },
+            );
+
+            assert_eq!(assignments.len(), windows.len(), "{kind:?}");
+            assert!(
+                tile_assignments_fit_work_area(work_area, &assignments),
+                "{kind:?}: {assignments:?}"
+            );
+        }
+    }
+
+    #[test]
     fn tiling_two_windows_splits_master_and_stack_evenly() {
         let work_area = Rect::from_size(0, 0, 1000, 800);
         let assignments = tile_windows(work_area, &[WindowHandle(1), WindowHandle(2)]);
@@ -3906,6 +3938,37 @@ mod tests {
     }
 
     #[test]
+    fn moving_window_between_workspaces_keeps_one_workspace_state_record() {
+        let mut workspaces = WorkspaceManager::new(3);
+        let window = WindowHandle(1);
+
+        assert!(workspaces.track_window(window, Rect::from_size(0, 0, 100, 100)));
+        assert!(workspaces.move_window_to_workspace(window, WorkspaceId(2)));
+        assert!(workspaces.move_window_to_workspace(window, WorkspaceId(3)));
+
+        assert_eq!(
+            workspaces.window_states().collect::<Vec<_>>(),
+            vec![(
+                window,
+                WorkspaceWindowState {
+                    workspace: WorkspaceId(3),
+                    last_rect: Some(Rect::from_size(0, 0, 100, 100)),
+                    visible_on_all_workspaces: false,
+                }
+            )]
+        );
+        assert_eq!(workspaces.visible_windows().collect::<Vec<_>>(), Vec::new());
+
+        let plan = workspaces.switch_to(WorkspaceId(3));
+
+        assert_eq!(plan.show.len(), 1);
+        assert_eq!(
+            workspaces.visible_windows().collect::<Vec<_>>(),
+            vec![window]
+        );
+    }
+
+    #[test]
     fn workspace_state_survives_create_destroy_style_updates() {
         let mut workspaces = WorkspaceManager::new(2);
         assert!(workspaces.track_window(WindowHandle(1), Rect::from_size(0, 0, 100, 100)));
@@ -4129,5 +4192,77 @@ mod tests {
         assert!(detection.active);
         assert_eq!(detection.matched_rule_mode, Some(WindowRuleMode::Game));
         assert_eq!(detection.matched_rules, vec!["steam game"]);
+    }
+
+    #[test]
+    fn game_mode_treats_ignore_and_fullscreen_rule_modes_as_conservative_triggers() {
+        let monitors = [MonitorInfo {
+            id: MonitorId(7),
+            is_primary: true,
+            rect: Rect::from_size(0, 0, 1920, 1080),
+            work_area: Rect::from_size(0, 0, 1920, 1040),
+        }];
+
+        for mode in [WindowRuleMode::Ignore, WindowRuleMode::Fullscreen] {
+            let rule = WindowRule {
+                name: format!("{mode:?} rule"),
+                matcher: WindowRuleMatch {
+                    process_name: Some(TextMatcher::Exact("notepad.exe".to_owned())),
+                    ..WindowRuleMatch::default()
+                },
+                action: WindowRuleAction {
+                    mode: Some(mode),
+                    ..WindowRuleAction::default()
+                },
+            };
+
+            let detection = detect_game_mode(
+                Some(&window()),
+                &monitors,
+                &[rule],
+                &GameModePolicy::default(),
+            );
+
+            assert!(detection.active, "{mode:?}");
+            assert_eq!(detection.matched_rule_mode, Some(mode));
+        }
+    }
+
+    #[test]
+    fn game_mode_disabled_keeps_fullscreen_diagnostic_but_does_not_activate() {
+        let monitors = [MonitorInfo {
+            id: MonitorId(7),
+            is_primary: true,
+            rect: Rect::from_size(0, 0, 1920, 1080),
+            work_area: Rect::from_size(0, 0, 1920, 1040),
+        }];
+        let mut focused = window();
+        focused.rect = monitors[0].rect;
+        let policy = GameModePolicy {
+            enabled: false,
+            ..GameModePolicy::default()
+        };
+
+        let detection = detect_game_mode(Some(&focused), &monitors, &[], &policy);
+
+        assert!(!detection.active);
+        assert!(detection.fullscreen.is_fullscreen);
+        assert_eq!(detection.reason, None);
+    }
+
+    #[test]
+    fn game_mode_executable_matching_uses_exact_process_file_name() {
+        let mut helper = window();
+        helper.executable_path = Some(r"C:\Games\not-game.exe".to_owned());
+        let mut launcher = window();
+        launcher.executable_path = Some(r"C:\Games\Launcher.EXE".to_owned());
+        let policy = GameModePolicy {
+            game_exes: vec!["game.exe".to_owned()],
+            ignored_exes: vec!["launcher.exe".to_owned()],
+            ..GameModePolicy::default()
+        };
+
+        assert!(!game_mode_executable_matches(&helper, &policy));
+        assert!(game_mode_executable_matches(&launcher, &policy));
     }
 }

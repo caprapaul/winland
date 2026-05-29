@@ -46,6 +46,20 @@ cargo clippy --workspace --all-targets
 cargo test --workspace
 ```
 
+## Tests
+
+The default regression suite is designed to be safe on a normal developer desktop. It focuses on pure layout, workspace, rule, config, IPC, diagnostics, game-mode, and border decision logic; it does not move real windows, require admin privileges, or require games/anti-cheat software.
+
+Run the full local suite from the workspace root:
+
+```powershell
+cargo fmt
+cargo clippy --workspace --all-targets
+cargo test --workspace
+```
+
+Desktop-mutating smoke tests should remain opt-in and clearly named if they are added later.
+
 ## Quick Start
 
 From the workspace root:
@@ -131,4 +145,3 @@ See [docs/GAME_MODE.md](docs/GAME_MODE.md) before using advanced interception or
 - [Architecture](docs/ARCHITECTURE.md)
 - [Game Mode](docs/GAME_MODE.md)
 - [Experimental Shell Replacement](docs/experimental-shell-replacement.md)
-

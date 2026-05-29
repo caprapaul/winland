@@ -227,6 +227,51 @@ mod tests {
     }
 
     #[test]
+    fn state_response_json_uses_stable_kebab_case_tags_and_values() {
+        let snapshot = DaemonStateSnapshot {
+            config_path: None,
+            config_version: 1,
+            config_loaded_at_unix_ms: 10,
+            total_windows: 1,
+            manageable_windows: 1,
+            floating_windows: 0,
+            temporary_floating_windows: 1,
+            active_workspace: 1,
+            foreground_window: Some(0xBEEF),
+            monitors: vec![MonitorStateSnapshot {
+                monitor_id: 7,
+                workspace_id: 1,
+                focused: true,
+            }],
+            windows: vec![WindowStateSnapshot {
+                handle: 0xBEEF,
+                title: "Diagnostics".to_owned(),
+                monitor_id: Some(7),
+                workspace_id: Some(1),
+                focused: true,
+                participation: WindowParticipationSnapshot::TemporarilyFloating,
+                constrained: true,
+                visible_on_active_workspace: false,
+            }],
+        };
+
+        let encoded = encode_response(&IpcResponse::state(snapshot)).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(encoded.trim_ascii_end()).unwrap();
+
+        assert_eq!(json["protocol_version"], PROTOCOL_VERSION);
+        assert_eq!(json["result"]["type"], "state");
+        assert_eq!(
+            json["result"]["windows"][0]["participation"],
+            "temporarily-floating"
+        );
+        assert_eq!(json["result"]["windows"][0]["constrained"], true);
+        assert_eq!(
+            json["result"]["windows"][0]["visible_on_active_workspace"],
+            false
+        );
+    }
+
+    #[test]
     fn reload_config_request_and_response_round_trip() {
         let encoded = encode_request(&IpcRequest::reload_config()).unwrap();
         let decoded = decode_request(&encoded).unwrap();

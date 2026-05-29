@@ -4,7 +4,10 @@ use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use tracing::debug;
 use tracing_subscriber::EnvFilter;
-use winland_core::{Manageability, MonitorInfo, WindowInfo, WorkspaceId, tile_windows_with_config};
+use winland_core::{
+    GameModeReason, Manageability, MonitorInfo, WindowHandle, WindowInfo, WorkspaceId,
+    detect_game_mode, tile_windows_with_config,
+};
 use winland_ipc::{
     DaemonStateSnapshot, IpcRequest, IpcResponseResult, decode_response, encode_request,
 };
@@ -25,6 +28,8 @@ enum Command {
     Windows(WindowsArgs),
     /// List discovered monitors and their stable Winland IDs.
     Monitors,
+    /// Explain fullscreen and game-mode handling for the foreground or selected window.
+    DiagnoseWindow(DiagnoseWindowArgs),
     /// Arrange manageable windows on the primary monitor once.
     TileOnce,
     /// Inspect or validate Winland configuration.
@@ -45,6 +50,13 @@ struct WindowsArgs {
     /// Show only windows that Winland would currently consider manageable.
     #[arg(long)]
     manageable_only: bool,
+}
+
+#[derive(Debug, Args)]
+struct DiagnoseWindowArgs {
+    /// HWND to diagnose, as decimal or hex with 0x prefix. Defaults to foreground.
+    #[arg(long)]
+    hwnd: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -155,6 +167,7 @@ fn main() -> Result<()> {
         Command::State(args) => daemon_state(args),
         Command::Windows(args) => list_windows(args),
         Command::Monitors => list_monitors(),
+        Command::DiagnoseWindow(args) => diagnose_window(args),
         Command::TileOnce => tile_once(),
         Command::Config(args) => handle_config(args),
         Command::Shell(args) => handle_shell(args),
@@ -213,6 +226,114 @@ fn list_monitors() -> Result<()> {
     Ok(())
 }
 
+fn diagnose_window(args: DiagnoseWindowArgs) -> Result<()> {
+    let loaded_config = winland_config::load_or_default(None)?;
+    let windows = winland_win32::enumerate_windows()?;
+    let monitors = winland_win32::enumerate_monitors()?;
+    let rules = loaded_config.config.window_rules()?;
+    let handle = match args.hwnd.as_deref() {
+        Some(input) => parse_hwnd(input)?,
+        None => winland_win32::foreground_window()?
+            .ok_or_else(|| anyhow::anyhow!("no foreground window is available"))?,
+    };
+    let window = windows
+        .iter()
+        .find(|window| window.handle == handle)
+        .ok_or_else(|| anyhow::anyhow!("window {handle} was not found in enumeration"))?;
+    let policy = loaded_config.config.game_mode_policy();
+    let detection = detect_game_mode(Some(window), &monitors, &rules, &policy);
+
+    println!("Window: {}", window.handle);
+    println!("Title: {}", empty_dash(&window.title));
+    println!("Class: {}", empty_dash(&window.class_name));
+    println!(
+        "Executable: {}",
+        window.executable_path.as_deref().unwrap_or("-")
+    );
+    println!("Monitor: {}", monitor_label(window, &monitors));
+    println!(
+        "Manageable: {} ({})",
+        yes_no(window.is_manageable()),
+        manageability_reason(window)
+    );
+    println!(
+        "Fullscreen: {}{}",
+        yes_no(detection.fullscreen.is_fullscreen),
+        fullscreen_suffix(&detection.fullscreen)
+    );
+    println!(
+        "Game mode: {}",
+        if detection.active {
+            "active"
+        } else {
+            "inactive"
+        }
+    );
+    println!(
+        "Detection reason: {}",
+        detection
+            .reason
+            .as_ref()
+            .map(game_mode_reason)
+            .unwrap_or_else(|| "-".to_owned())
+    );
+    println!(
+        "Matched game exe: {}",
+        detection.matched_executable.as_deref().unwrap_or("-")
+    );
+    println!(
+        "Matched game rule: {}",
+        if detection.matched_rules.is_empty() {
+            "-".to_owned()
+        } else {
+            detection.matched_rules.join(", ")
+        }
+    );
+    println!(
+        "Layout paused: {}",
+        yes_no(
+            detection.active
+                && loaded_config
+                    .config
+                    .game_mode
+                    .pause_all_layouts_when_game_focused
+        )
+    );
+    println!(
+        "Layout pause scope: {}",
+        if detection.active
+            && loaded_config
+                .config
+                .game_mode
+                .pause_all_layouts_when_game_focused
+        {
+            if loaded_config.config.game_mode.pause_focused_monitor_only
+                && detection.fullscreen.monitor.is_some()
+            {
+                "focused monitor"
+            } else {
+                "global"
+            }
+        } else {
+            "-"
+        }
+    );
+    println!(
+        "Borders paused: {}",
+        yes_no(detection.active && loaded_config.config.game_mode.disable_borders)
+    );
+    println!(
+        "Animations paused: {}",
+        yes_no(detection.active && loaded_config.config.game_mode.disable_animations)
+    );
+    println!(
+        "Keyboard/mouse hook bypass: {}",
+        yes_no(detection.active && loaded_config.config.game_mode.disable_keyboard_hooks)
+    );
+
+    Ok(())
+}
+
 fn handle_config(args: ConfigArgs) -> Result<()> {
     match args.command {
         ConfigCommand::Validate(args) => validate_config(args),
@@ -233,6 +354,18 @@ fn validate_config(args: ConfigValidateArgs) -> Result<()> {
         layout.border,
         yes_no(layout.smart_split),
         yes_no(layout.preserve_split)
+    );
+    println!(
+        "Game mode: {} (fullscreen {}, tolerance {}px, game_exes {}, ignored_exes {})",
+        if loaded.config.game_mode.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        yes_no(loaded.config.game_mode.pause_on_fullscreen),
+        loaded.config.game_mode.fullscreen_tolerance_px,
+        loaded.config.game_mode.game_exes.len(),
+        loaded.config.game_mode.ignored_exes.len()
     );
 
     Ok(())
@@ -619,6 +752,66 @@ fn primary_monitor(monitors: &[MonitorInfo]) -> Result<&MonitorInfo> {
         .find(|monitor| monitor.is_primary)
         .or_else(|| monitors.first())
         .ok_or_else(|| anyhow::anyhow!("no monitors were discovered"))
+}
+
+fn parse_hwnd(input: &str) -> Result<WindowHandle> {
+    let trimmed = input.trim();
+    let value = if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        u64::from_str_radix(hex, 16)?
+    } else {
+        trimmed.parse()?
+    };
+
+    Ok(WindowHandle(value))
+}
+
+fn monitor_label(window: &WindowInfo, monitors: &[MonitorInfo]) -> String {
+    monitors
+        .iter()
+        .filter_map(|monitor| {
+            let overlap = rect_overlap_area(window.rect, monitor.rect);
+            (overlap > 0).then_some((overlap, monitor.id))
+        })
+        .max_by_key(|(overlap, id)| (*overlap, std::cmp::Reverse(*id)))
+        .map(|(_, id)| id.to_string())
+        .unwrap_or_else(|| "-".to_owned())
+}
+
+fn fullscreen_suffix(detection: &winland_core::FullscreenDetection) -> String {
+    match (detection.monitor, detection.area) {
+        (Some(monitor), Some(area)) => format!(" ({area:?} on {monitor})"),
+        _ => String::new(),
+    }
+}
+
+fn game_mode_reason(reason: &GameModeReason) -> String {
+    match reason {
+        GameModeReason::ConfiguredExecutable(exe) => format!("configured executable {exe}"),
+        GameModeReason::WindowRule {
+            mode,
+            matched_rules,
+        } => format!("window rule mode {mode:?} via {}", matched_rules.join(", ")),
+        GameModeReason::Fullscreen { monitor, area } => {
+            format!("fullscreen {area:?} on {monitor}")
+        }
+    }
+}
+
+fn rect_overlap_area(a: winland_core::Rect, b: winland_core::Rect) -> i64 {
+    let left = a.left.max(b.left);
+    let top = a.top.max(b.top);
+    let right = a.right.min(b.right);
+    let bottom = a.bottom.min(b.bottom);
+    let width = i64::from(right.saturating_sub(left).max(0));
+    let height = i64::from(bottom.saturating_sub(top).max(0));
+    width * height
+}
+
+fn empty_dash(value: &str) -> &str {
+    if value.trim().is_empty() { "-" } else { value }
 }
 
 fn column_widths(headers: &[&str], rows: &[Vec<String>]) -> Vec<usize> {

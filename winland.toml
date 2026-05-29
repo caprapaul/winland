@@ -27,6 +27,7 @@ window_rules = []
 # executable_path = { contains = "\\AppData\\Local\\" }
 # [window_rules.action]
 # manage = false
+# mode = "ignore"
 
 [general]
 # One of: trace, debug, info, warn, error, off.
@@ -179,3 +180,23 @@ inactive_color = "#3A3A3A"
 floating_color = "#FFB454"
 show_inactive = true
 disable_when_fullscreen = true
+
+[game_mode]
+# Back off when a focused game or fullscreen/borderless window is detected.
+# See docs/game-mode.md for detection rules, monitor-only pause, and diagnostics.
+enabled = true
+pause_on_fullscreen = true
+pause_all_layouts_when_game_focused = true
+pause_focused_monitor_only = false
+disable_borders = true
+disable_animations = true
+disable_keyboard_hooks = true
+fullscreen_tolerance_px = 4
+
+# Executable-name matches are case-insensitive and apply to the process name,
+# not the full path. Both lists make Winland ignore the window and activate
+# game mode when it is focused.
+ignored_exes = []
+game_exes = []
+# Example:
+# game_exes = ["eldenring.exe", "cs2.exe"]

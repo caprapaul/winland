@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use winland_core::{
-    LayoutConfig, LayoutKind, MonitorId, TextMatcher, WindowRule, WindowRuleAction,
-    WindowRuleMatch, WorkspaceId,
+    GameModePolicy, LayoutConfig, LayoutKind, MonitorId, TextMatcher, WindowRule, WindowRuleAction,
+    WindowRuleMatch, WindowRuleMode, WorkspaceId,
 };
 
 pub const DEFAULT_FILE_NAME: &str = "winland.toml";
@@ -26,6 +26,7 @@ pub struct Config {
     pub workspaces: WorkspacesConfig,
     pub behavior: BehaviorConfig,
     pub borders: BordersConfig,
+    pub game_mode: GameModeConfig,
     #[serde(rename = "window_rules")]
     pub window_rules: Vec<WindowRuleConfig>,
 }
@@ -39,6 +40,7 @@ impl Config {
         validate_workspaces(&self.workspaces, &mut errors);
         validate_hotkeys(&self.hotkeys, self.workspaces.count, &mut errors);
         validate_borders(&self.borders, &mut errors);
+        validate_game_mode(&self.game_mode, &mut errors);
         validate_window_rules(
             &self.window_rules,
             self.workspaces.count,
@@ -99,6 +101,16 @@ impl Config {
             .iter()
             .map(WindowRuleConfig::to_core_rule)
             .collect()
+    }
+
+    pub fn game_mode_policy(&self) -> GameModePolicy {
+        GameModePolicy {
+            enabled: self.game_mode.enabled,
+            pause_on_fullscreen: self.game_mode.pause_on_fullscreen,
+            fullscreen_tolerance_px: i32::from(self.game_mode.fullscreen_tolerance_px),
+            game_exes: self.game_mode.game_exes.clone(),
+            ignored_exes: self.game_mode.ignored_exes.clone(),
+        }
     }
 }
 
@@ -343,6 +355,38 @@ impl Default for BordersConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct GameModeConfig {
+    pub enabled: bool,
+    pub pause_on_fullscreen: bool,
+    pub pause_all_layouts_when_game_focused: bool,
+    pub pause_focused_monitor_only: bool,
+    pub disable_borders: bool,
+    pub disable_animations: bool,
+    pub disable_keyboard_hooks: bool,
+    pub fullscreen_tolerance_px: u16,
+    pub ignored_exes: Vec<String>,
+    pub game_exes: Vec<String>,
+}
+
+impl Default for GameModeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            pause_on_fullscreen: true,
+            pause_all_layouts_when_game_focused: true,
+            pause_focused_monitor_only: false,
+            disable_borders: true,
+            disable_animations: true,
+            disable_keyboard_hooks: true,
+            fullscreen_tolerance_px: 4,
+            ignored_exes: Vec::new(),
+            game_exes: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum OverflowFocusPolicy {
@@ -424,6 +468,7 @@ pub struct WindowRuleActionConfig {
     pub workspace: Option<u16>,
     pub always_on_workspace: Option<bool>,
     pub layout: Option<String>,
+    pub mode: Option<WindowRuleModeConfig>,
 }
 
 impl WindowRuleActionConfig {
@@ -434,6 +479,7 @@ impl WindowRuleActionConfig {
             target_workspace: self.workspace.map(WorkspaceId),
             always_on_workspace: self.always_on_workspace,
             layout: self.layout.clone(),
+            mode: self.mode.map(WindowRuleModeConfig::to_core),
         }
     }
 
@@ -443,6 +489,25 @@ impl WindowRuleActionConfig {
             && self.workspace.is_none()
             && self.always_on_workspace.is_none()
             && self.layout.is_none()
+            && self.mode.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum WindowRuleModeConfig {
+    Ignore,
+    Game,
+    Fullscreen,
+}
+
+impl WindowRuleModeConfig {
+    fn to_core(self) -> WindowRuleMode {
+        match self {
+            Self::Ignore => WindowRuleMode::Ignore,
+            Self::Game => WindowRuleMode::Game,
+            Self::Fullscreen => WindowRuleMode::Fullscreen,
+        }
     }
 }
 
@@ -822,6 +887,36 @@ fn validate_borders(borders: &BordersConfig, errors: &mut Vec<String>) {
     validate_hex_color("borders.active_color", &borders.active_color, errors);
     validate_hex_color("borders.inactive_color", &borders.inactive_color, errors);
     validate_hex_color("borders.floating_color", &borders.floating_color, errors);
+}
+
+fn validate_game_mode(game_mode: &GameModeConfig, errors: &mut Vec<String>) {
+    if game_mode.fullscreen_tolerance_px > 32 {
+        errors.push("game_mode.fullscreen_tolerance_px must be <= 32".to_owned());
+    }
+
+    validate_executable_names("game_mode.game_exes", &game_mode.game_exes, errors);
+    validate_executable_names("game_mode.ignored_exes", &game_mode.ignored_exes, errors);
+}
+
+fn validate_executable_names(context: &str, values: &[String], errors: &mut Vec<String>) {
+    let mut seen = BTreeSet::new();
+    for (index, value) in values.iter().enumerate() {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            errors.push(format!("{context}[{index}] must not be empty"));
+            continue;
+        }
+        if trimmed.contains('\\') || trimmed.contains('/') {
+            errors.push(format!(
+                "{context}[{index}] must be an executable name, not a path"
+            ));
+        }
+        if !seen.insert(trimmed.to_ascii_lowercase()) {
+            errors.push(format!(
+                "{context}[{index}] duplicates an earlier executable"
+            ));
+        }
+    }
 }
 
 fn validate_hex_color(context: &str, value: &str, errors: &mut Vec<String>) {
@@ -1245,6 +1340,14 @@ mod tests {
         assert_eq!(config.borders.floating_color, "#FFB454");
         assert!(config.borders.show_inactive);
         assert!(config.borders.disable_when_fullscreen);
+        assert!(config.game_mode.enabled);
+        assert!(config.game_mode.pause_on_fullscreen);
+        assert!(config.game_mode.pause_all_layouts_when_game_focused);
+        assert!(!config.game_mode.pause_focused_monitor_only);
+        assert!(config.game_mode.disable_borders);
+        assert!(config.game_mode.disable_animations);
+        assert!(config.game_mode.disable_keyboard_hooks);
+        assert_eq!(config.game_mode.fullscreen_tolerance_px, 4);
         assert_eq!(config.hotkeys.bindings[0].keys, "Win+T");
         assert_eq!(config.hotkeys.bindings[0].launch.as_deref(), Some("wt.exe"));
         assert!(config.hotkeys.bindings[0].override_app);
@@ -1312,6 +1415,18 @@ mod tests {
             show_inactive = false
             disable_when_fullscreen = true
 
+            [game_mode]
+            enabled = true
+            pause_on_fullscreen = true
+            pause_all_layouts_when_game_focused = true
+            pause_focused_monitor_only = false
+            disable_borders = true
+            disable_animations = true
+            disable_keyboard_hooks = true
+            fullscreen_tolerance_px = 6
+            ignored_exes = ["launcher.exe"]
+            game_exes = ["cs2.exe", "eldenring.exe"]
+
             [[window_rules]]
             name = "float settings"
             [window_rules.match]
@@ -1321,6 +1436,7 @@ mod tests {
             float = true
             workspace = 2
             always_on_workspace = true
+            mode = "game"
             "##,
         )
         .unwrap();
@@ -1351,7 +1467,18 @@ mod tests {
         assert_eq!(config.borders.inactive_color, "#445566");
         assert_eq!(config.borders.floating_color, "#778899");
         assert!(!config.borders.show_inactive);
+        assert_eq!(config.game_mode.fullscreen_tolerance_px, 6);
+        assert_eq!(config.game_mode.ignored_exes, vec!["launcher.exe"]);
+        assert_eq!(config.game_mode.game_exes, vec!["cs2.exe", "eldenring.exe"]);
+        assert_eq!(
+            config.game_mode_policy().game_exes,
+            vec!["cs2.exe", "eldenring.exe"]
+        );
         assert_eq!(config.window_rules().unwrap().len(), 1);
+        assert_eq!(
+            config.window_rules().unwrap()[0].action.mode,
+            Some(winland_core::WindowRuleMode::Game)
+        );
     }
 
     #[test]
@@ -1367,6 +1494,10 @@ mod tests {
             [borders]
             width = 0
             active_color = "blue"
+
+            [game_mode]
+            fullscreen_tolerance_px = 100
+            game_exes = ["", "C:\\Games\\bad.exe"]
 
             [workspaces]
             count = 1
@@ -1396,6 +1527,8 @@ mod tests {
         assert!(output.contains("layout.master_ratio_percent"));
         assert!(output.contains("borders.width"));
         assert!(output.contains("borders.active_color"));
+        assert!(output.contains("game_mode.fullscreen_tolerance_px"));
+        assert!(output.contains("game_mode.game_exes"));
         assert!(output.contains("duplicate hotkey modifier"));
         assert!(output.contains("hotkeys.modifier_drag.modifiers"));
         assert!(output.contains("switch-workspace-2"));

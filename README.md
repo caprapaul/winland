@@ -35,3 +35,7 @@ The shell replacement prototype is VM-only, opt-in, and reversible. It uses `win
 ## Current IPC Slice
 
 The first IPC control slice exposes `winland state`, backed by a versioned local named-pipe protocol. It reports daemon health and high-level window/workspace counts in human-readable form, with `winland state --json` available for scripts. Mutating IPC commands such as focus, swap, retile, reload, and quit are intentionally still upcoming.
+
+## Game Mode
+
+Game mode makes Winland back off around focused games and fullscreen or borderless fullscreen windows. It can pause layouts globally or only on the game monitor, hide border overlays, and bypass existing input hooks. See [docs/game-mode.md](docs/game-mode.md) for configuration, diagnostics, and safety boundaries.

@@ -634,6 +634,13 @@ impl fmt::Display for WorkspaceId {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowRuleMode {
+    Ignore,
+    Game,
+    Fullscreen,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkspaceWindowState {
     pub workspace: WorkspaceId,
     pub last_rect: Option<Rect>,
@@ -995,6 +1002,7 @@ pub struct WindowRuleAction {
     pub target_workspace: Option<WorkspaceId>,
     pub always_on_workspace: Option<bool>,
     pub layout: Option<String>,
+    pub mode: Option<WindowRuleMode>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1011,6 +1019,7 @@ pub struct WindowRuleDecision {
     pub target_workspace: Option<WorkspaceId>,
     pub always_on_workspace: Option<bool>,
     pub layout: Option<String>,
+    pub mode: Option<WindowRuleMode>,
     pub matched_rules: Vec<String>,
 }
 
@@ -1180,6 +1189,205 @@ pub fn windows_in_monitor<'a>(
         .filter(|window| monitor.rect.contains(window.rect.center()))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FullscreenArea {
+    MonitorBounds,
+    WorkArea,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FullscreenDetection {
+    pub is_fullscreen: bool,
+    pub monitor: Option<MonitorId>,
+    pub area: Option<FullscreenArea>,
+}
+
+impl FullscreenDetection {
+    pub const fn inactive() -> Self {
+        Self {
+            is_fullscreen: false,
+            monitor: None,
+            area: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GameModePolicy {
+    pub enabled: bool,
+    pub pause_on_fullscreen: bool,
+    pub fullscreen_tolerance_px: i32,
+    pub game_exes: Vec<String>,
+    pub ignored_exes: Vec<String>,
+}
+
+impl Default for GameModePolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            pause_on_fullscreen: true,
+            fullscreen_tolerance_px: 4,
+            game_exes: Vec::new(),
+            ignored_exes: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GameModeReason {
+    ConfiguredExecutable(String),
+    WindowRule {
+        mode: WindowRuleMode,
+        matched_rules: Vec<String>,
+    },
+    Fullscreen {
+        monitor: MonitorId,
+        area: FullscreenArea,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GameModeDetection {
+    pub active: bool,
+    pub reason: Option<GameModeReason>,
+    pub fullscreen: FullscreenDetection,
+    pub matched_executable: Option<String>,
+    pub matched_rule_mode: Option<WindowRuleMode>,
+    pub matched_rules: Vec<String>,
+}
+
+impl GameModeDetection {
+    pub fn inactive(fullscreen: FullscreenDetection) -> Self {
+        Self {
+            active: false,
+            reason: None,
+            fullscreen,
+            matched_executable: None,
+            matched_rule_mode: None,
+            matched_rules: Vec::new(),
+        }
+    }
+}
+
+pub fn detect_fullscreen_rect(
+    rect: Rect,
+    monitors: &[MonitorInfo],
+    tolerance_px: i32,
+) -> FullscreenDetection {
+    let tolerance = tolerance_px.max(0);
+    for monitor in monitors {
+        if rect_matches_with_tolerance(rect, monitor.rect, tolerance) {
+            return FullscreenDetection {
+                is_fullscreen: true,
+                monitor: Some(monitor.id),
+                area: Some(FullscreenArea::MonitorBounds),
+            };
+        }
+
+        if rect_matches_with_tolerance(rect, monitor.work_area, tolerance) {
+            return FullscreenDetection {
+                is_fullscreen: true,
+                monitor: Some(monitor.id),
+                area: Some(FullscreenArea::WorkArea),
+            };
+        }
+    }
+
+    FullscreenDetection::inactive()
+}
+
+pub fn detect_fullscreen_window(
+    window: &WindowInfo,
+    monitors: &[MonitorInfo],
+    tolerance_px: i32,
+) -> FullscreenDetection {
+    detect_fullscreen_rect(window.rect, monitors, tolerance_px)
+}
+
+pub fn detect_game_mode(
+    focused_window: Option<&WindowInfo>,
+    monitors: &[MonitorInfo],
+    rules: &[WindowRule],
+    policy: &GameModePolicy,
+) -> GameModeDetection {
+    let Some(window) = focused_window else {
+        return GameModeDetection::inactive(FullscreenDetection::inactive());
+    };
+    let fullscreen = detect_fullscreen_window(window, monitors, policy.fullscreen_tolerance_px);
+
+    if !policy.enabled {
+        return GameModeDetection::inactive(fullscreen);
+    }
+
+    if let Some(executable) = matched_game_executable(window, policy) {
+        return GameModeDetection {
+            active: true,
+            reason: Some(GameModeReason::ConfiguredExecutable(executable.clone())),
+            fullscreen,
+            matched_executable: Some(executable),
+            matched_rule_mode: None,
+            matched_rules: Vec::new(),
+        };
+    }
+
+    let decision = evaluate_window_rules(window, rules);
+    if let Some(
+        mode @ (WindowRuleMode::Ignore | WindowRuleMode::Game | WindowRuleMode::Fullscreen),
+    ) = decision.mode
+    {
+        return GameModeDetection {
+            active: true,
+            reason: Some(GameModeReason::WindowRule {
+                mode,
+                matched_rules: decision.matched_rules.clone(),
+            }),
+            fullscreen,
+            matched_executable: None,
+            matched_rule_mode: Some(mode),
+            matched_rules: decision.matched_rules,
+        };
+    }
+
+    if policy.pause_on_fullscreen
+        && fullscreen.is_fullscreen
+        && let (Some(monitor), Some(area)) = (fullscreen.monitor, fullscreen.area)
+    {
+        return GameModeDetection {
+            active: true,
+            reason: Some(GameModeReason::Fullscreen { monitor, area }),
+            fullscreen,
+            matched_executable: None,
+            matched_rule_mode: None,
+            matched_rules: Vec::new(),
+        };
+    }
+
+    GameModeDetection::inactive(fullscreen)
+}
+
+pub fn game_mode_executable_matches(window: &WindowInfo, policy: &GameModePolicy) -> bool {
+    matched_game_executable(window, policy).is_some()
+}
+
+fn matched_game_executable(window: &WindowInfo, policy: &GameModePolicy) -> Option<String> {
+    let executable_path = window.executable_path.as_deref()?;
+    let process_name = process_name(executable_path)?;
+
+    policy
+        .game_exes
+        .iter()
+        .chain(policy.ignored_exes.iter())
+        .find(|configured| process_name.eq_ignore_ascii_case(configured.trim()))
+        .cloned()
+}
+
+fn rect_matches_with_tolerance(actual: Rect, expected: Rect, tolerance: i32) -> bool {
+    (actual.left - expected.left).abs() <= tolerance
+        && (actual.top - expected.top).abs() <= tolerance
+        && (actual.right - expected.right).abs() <= tolerance
+        && (actual.bottom - expected.bottom).abs() <= tolerance
+}
+
 fn is_shell_class(class_name: &str) -> bool {
     matches!(
         class_name,
@@ -1209,6 +1417,9 @@ fn merge_rule_action(decision: &mut WindowRuleDecision, action: &WindowRuleActio
     }
     if action.layout.is_some() {
         decision.layout = action.layout.clone();
+    }
+    if action.mode.is_some() {
+        decision.mode = action.mode;
     }
 }
 
@@ -3553,5 +3764,99 @@ mod tests {
             decision.matched_rules,
             vec!["float all app frames", "keep notepad tiled"]
         );
+    }
+
+    #[test]
+    fn fullscreen_detection_accepts_monitor_bounds_with_tolerance() {
+        let monitors = [MonitorInfo {
+            id: MonitorId(7),
+            is_primary: true,
+            rect: Rect::from_size(0, 0, 1920, 1080),
+            work_area: Rect::from_size(0, 0, 1920, 1040),
+        }];
+
+        let detection = detect_fullscreen_rect(Rect::from_size(-3, 2, 1924, 1077), &monitors, 4);
+
+        assert_eq!(
+            detection,
+            FullscreenDetection {
+                is_fullscreen: true,
+                monitor: Some(MonitorId(7)),
+                area: Some(FullscreenArea::MonitorBounds),
+            }
+        );
+    }
+
+    #[test]
+    fn fullscreen_detection_accepts_work_area_with_tolerance() {
+        let monitors = [MonitorInfo {
+            id: MonitorId(7),
+            is_primary: true,
+            rect: Rect::from_size(0, 0, 1920, 1080),
+            work_area: Rect::from_size(0, 0, 1920, 1040),
+        }];
+
+        let detection = detect_fullscreen_rect(Rect::from_size(0, 0, 1920, 1038), &monitors, 4);
+
+        assert_eq!(detection.monitor, Some(MonitorId(7)));
+        assert_eq!(detection.area, Some(FullscreenArea::WorkArea));
+    }
+
+    #[test]
+    fn game_mode_detects_configured_executables_before_fullscreen() {
+        let monitors = [MonitorInfo {
+            id: MonitorId(7),
+            is_primary: true,
+            rect: Rect::from_size(0, 0, 1920, 1080),
+            work_area: Rect::from_size(0, 0, 1920, 1040),
+        }];
+        let mut game = window();
+        game.executable_path = Some(r"C:\Games\CS2.EXE".to_owned());
+        game.rect = Rect::from_size(100, 100, 1280, 720);
+        let policy = GameModePolicy {
+            game_exes: vec!["cs2.exe".to_owned()],
+            ..GameModePolicy::default()
+        };
+
+        let detection = detect_game_mode(Some(&game), &monitors, &[], &policy);
+
+        assert!(detection.active);
+        assert_eq!(detection.matched_executable.as_deref(), Some("cs2.exe"));
+        assert!(matches!(
+            detection.reason,
+            Some(GameModeReason::ConfiguredExecutable(_))
+        ));
+    }
+
+    #[test]
+    fn game_mode_detects_rule_modes() {
+        let monitors = [MonitorInfo {
+            id: MonitorId(7),
+            is_primary: true,
+            rect: Rect::from_size(0, 0, 1920, 1080),
+            work_area: Rect::from_size(0, 0, 1920, 1040),
+        }];
+        let rule = WindowRule {
+            name: "steam game".to_owned(),
+            matcher: WindowRuleMatch {
+                process_name: Some(TextMatcher::Exact("notepad.exe".to_owned())),
+                ..WindowRuleMatch::default()
+            },
+            action: WindowRuleAction {
+                mode: Some(WindowRuleMode::Game),
+                ..WindowRuleAction::default()
+            },
+        };
+
+        let detection = detect_game_mode(
+            Some(&window()),
+            &monitors,
+            &[rule],
+            &GameModePolicy::default(),
+        );
+
+        assert!(detection.active);
+        assert_eq!(detection.matched_rule_mode, Some(WindowRuleMode::Game));
+        assert_eq!(detection.matched_rules, vec!["steam game"]);
     }
 }

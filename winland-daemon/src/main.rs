@@ -16,12 +16,13 @@ use winland_config::{
     TextMatcherConfig,
 };
 use winland_core::{
-    DwindleSplit, LayoutConfig, LayoutKind, MonitorId, MonitorInfo, Point, Rect, TileAssignment,
-    WindowHandle, WindowInfo, WindowLayoutInfo, WindowParticipation, WindowRule,
-    WindowRuleDecision, WindowSizeConstraints, WorkspaceId, WorkspaceManager,
-    WorkspaceVisibilityChange, evaluate_window_rules, split_direction_for_point,
-    tile_assignments_fit_work_area, tile_layout_windows_with_config,
-    tile_layout_windows_with_state,
+    DwindleSplit, FullscreenDetection, GameModeDetection, GameModePolicy, GameModeReason,
+    LayoutConfig, LayoutKind, MonitorId, MonitorInfo, Point, Rect, TileAssignment, WindowHandle,
+    WindowInfo, WindowLayoutInfo, WindowParticipation, WindowRule, WindowRuleDecision,
+    WindowRuleMode, WindowSizeConstraints, WorkspaceId, WorkspaceManager,
+    WorkspaceVisibilityChange, detect_fullscreen_window, detect_game_mode, evaluate_window_rules,
+    game_mode_executable_matches, split_direction_for_point, tile_assignments_fit_work_area,
+    tile_layout_windows_with_config, tile_layout_windows_with_state,
 };
 use winland_ipc::{
     DaemonStateSnapshot, IpcCommand, IpcRequest, IpcResponse, decode_request, encode_response,
@@ -221,6 +222,7 @@ struct RuntimeConfig {
     retile_on_drag_end: bool,
     overflow_focus_policy: OverflowFocusPolicy,
     borders: RuntimeBorderConfig,
+    game_mode: RuntimeGameModeConfig,
 }
 
 impl RuntimeConfig {
@@ -237,6 +239,7 @@ impl RuntimeConfig {
             retile_on_drag_end: config.behavior.retile_on_drag_end,
             overflow_focus_policy: config.behavior.overflow_focus_policy,
             borders: RuntimeBorderConfig::from_config(&config.borders)?,
+            game_mode: RuntimeGameModeConfig::from_config(config),
         })
     }
 
@@ -248,6 +251,31 @@ impl RuntimeConfig {
             monitor,
             workspace,
         )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeGameModeConfig {
+    policy: GameModePolicy,
+    pause_all_layouts_when_game_focused: bool,
+    pause_focused_monitor_only: bool,
+    disable_borders: bool,
+    disable_animations: bool,
+    disable_keyboard_hooks: bool,
+}
+
+impl RuntimeGameModeConfig {
+    fn from_config(config: &Config) -> Self {
+        Self {
+            policy: config.game_mode_policy(),
+            pause_all_layouts_when_game_focused: config
+                .game_mode
+                .pause_all_layouts_when_game_focused,
+            pause_focused_monitor_only: config.game_mode.pause_focused_monitor_only,
+            disable_borders: config.game_mode.disable_borders,
+            disable_animations: config.game_mode.disable_animations,
+            disable_keyboard_hooks: config.game_mode.disable_keyboard_hooks,
+        }
     }
 }
 
@@ -524,6 +552,38 @@ struct DaemonState {
     config: RuntimeConfig,
     hotkey_commands: HotkeyCommandMap,
     border_manager: Option<BorderManager>,
+    game_mode: GameModeRuntimeState,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct GameModeRuntimeState {
+    active: Option<GameModeActivation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GameModeActivation {
+    window: WindowHandle,
+    title: String,
+    executable_path: Option<String>,
+    monitor: Option<MonitorId>,
+    reason: GameModeReason,
+    actions: GameModeActions,
+    fullscreen: FullscreenDetection,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct GameModeActions {
+    pause_layouts: bool,
+    pause_focused_monitor_only: bool,
+    hide_borders: bool,
+    disable_animations: bool,
+    disable_keyboard_hooks: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct GameModeTransition {
+    activated: bool,
+    deactivated: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -569,6 +629,7 @@ impl DaemonState {
             config,
             hotkey_commands,
             border_manager: None,
+            game_mode: GameModeRuntimeState::default(),
         };
         state.tile_order = state.manageable_handles_sorted();
         state.sync_workspace_state(&monitors);
@@ -584,6 +645,11 @@ impl DaemonState {
         let monitors =
             winland_win32::enumerate_monitors().context("enumerate monitors for startup retile")?;
         self.sync_workspace_state(&monitors);
+        self.update_game_mode(&monitors, "startup retile")?;
+        if self.game_mode_pauses_layouts() {
+            info!("startup retile skipped because game mode is active");
+            return Ok(());
+        }
         let assignments = self.tile_assignments(&monitors);
         self.apply_tile_assignments_with_feedback(&assignments, &monitors, "startup retile");
         info!(
@@ -591,6 +657,140 @@ impl DaemonState {
             "completed startup retile request"
         );
         Ok(())
+    }
+
+    fn update_game_mode(
+        &mut self,
+        monitors: &[MonitorInfo],
+        operation: &'static str,
+    ) -> Result<GameModeTransition> {
+        let detection = self.current_game_mode_detection(monitors);
+        let previous = self.game_mode.active.clone();
+        let next = self.activation_from_detection(detection, monitors);
+        let transition = GameModeTransition {
+            activated: previous.is_none() && next.is_some(),
+            deactivated: previous.is_some() && next.is_none(),
+        };
+
+        if previous.as_ref() != next.as_ref() {
+            match &next {
+                Some(active) => {
+                    info!(
+                        focused = %active.window,
+                        title = %active.title,
+                        exe = %active.executable_path.as_deref().unwrap_or("-"),
+                        monitor = ?active.monitor,
+                        reason = %game_mode_reason_label(&active.reason),
+                        pause_layouts = active.actions.pause_layouts,
+                        pause_focused_monitor_only = active.actions.pause_focused_monitor_only,
+                        layout_pause_scope = game_mode_layout_pause_scope_for(active),
+                        hide_borders = active.actions.hide_borders,
+                        disable_animations = active.actions.disable_animations,
+                        disable_keyboard_hooks = active.actions.disable_keyboard_hooks,
+                        operation,
+                        "game mode activated"
+                    );
+                }
+                None => {
+                    if let Some(previous) = previous {
+                        info!(
+                            focused = %previous.window,
+                            title = %previous.title,
+                            exe = %previous.executable_path.as_deref().unwrap_or("-"),
+                            monitor = ?previous.monitor,
+                            reason = %game_mode_reason_label(&previous.reason),
+                            operation,
+                            "game mode deactivated"
+                        );
+                    }
+                }
+            }
+        }
+
+        self.game_mode.active = next;
+
+        winland_win32::set_input_hooks_paused(
+            self.game_mode
+                .active
+                .as_ref()
+                .is_some_and(|active| active.actions.disable_keyboard_hooks),
+        );
+
+        if self.game_mode_hides_borders()
+            && let Some(manager) = &self.border_manager
+        {
+            manager
+                .clear()
+                .context("clear border overlays for game mode")?;
+        }
+
+        Ok(transition)
+    }
+
+    fn current_game_mode_detection(&self, monitors: &[MonitorInfo]) -> GameModeDetection {
+        let focused_window = self.foreground.and_then(|handle| self.windows.get(&handle));
+        detect_game_mode(
+            focused_window,
+            monitors,
+            &self.config.window_rules,
+            &self.config.game_mode.policy,
+        )
+    }
+
+    fn activation_from_detection(
+        &self,
+        detection: GameModeDetection,
+        monitors: &[MonitorInfo],
+    ) -> Option<GameModeActivation> {
+        if !detection.active {
+            return None;
+        }
+        let window = self.foreground?;
+        let info = self.windows.get(&window)?;
+        let reason = detection.reason?;
+        let monitor = detection
+            .fullscreen
+            .monitor
+            .or_else(|| monitor_for_rect(info.rect, monitors));
+        let actions = GameModeActions {
+            pause_layouts: self.config.game_mode.pause_all_layouts_when_game_focused,
+            pause_focused_monitor_only: self.config.game_mode.pause_focused_monitor_only,
+            hide_borders: self.config.game_mode.disable_borders,
+            disable_animations: self.config.game_mode.disable_animations,
+            disable_keyboard_hooks: self.config.game_mode.disable_keyboard_hooks,
+        };
+
+        Some(GameModeActivation {
+            window,
+            title: info.title.clone(),
+            executable_path: info.executable_path.clone(),
+            monitor,
+            reason,
+            actions,
+            fullscreen: detection.fullscreen,
+        })
+    }
+
+    fn game_mode_pauses_layouts(&self) -> bool {
+        self.game_mode.active.as_ref().is_some_and(|active| {
+            active.actions.pause_layouts
+                && (!active.actions.pause_focused_monitor_only || active.monitor.is_none())
+        })
+    }
+
+    fn game_mode_pauses_monitor(&self, monitor: MonitorId) -> bool {
+        self.game_mode.active.as_ref().is_some_and(|active| {
+            active.actions.pause_layouts
+                && active.actions.pause_focused_monitor_only
+                && active.monitor == Some(monitor)
+        })
+    }
+
+    fn game_mode_hides_borders(&self) -> bool {
+        self.game_mode
+            .active
+            .as_ref()
+            .is_some_and(|active| active.actions.hide_borders)
     }
 
     fn reconcile_after_events(&mut self, batch: &[WindowEvent]) -> Result<()> {
@@ -631,10 +831,18 @@ impl DaemonState {
             .context("enumerate monitors while preserving daemon state")?;
         let diff = self.diff(&refreshed, &monitors);
         self.preserve_keyboard_state(&mut refreshed, &monitors);
+        refreshed.game_mode = self.game_mode.clone();
         let border_manager = self.border_manager.take();
         *self = refreshed;
         self.border_manager = border_manager;
-        let event_plan = self.plan_after_window_events(batch, &diff, &monitors);
+        let transition = self.update_game_mode(&monitors, "event reconciliation")?;
+        let mut event_plan = self.plan_after_window_events(batch, &diff, &monitors);
+        if transition.deactivated && self.config.dynamic_retile {
+            event_plan.moves = self.tile_assignments(&monitors);
+        }
+        if self.game_mode_pauses_layouts() {
+            event_plan.moves.clear();
+        }
         self.apply_tile_assignments_with_feedback(&event_plan.moves, &monitors, "dynamic retile");
         self.sync_borders_with_monitors(&monitors, "event reconciliation borders")?;
 
@@ -727,6 +935,17 @@ impl DaemonState {
             WindowEventKind::ForegroundChanged => {
                 self.foreground =
                     winland_win32::foreground_window().context("read foreground window")?;
+                let monitors = winland_win32::enumerate_monitors()
+                    .context("enumerate monitors for foreground game-mode update")?;
+                let transition = self.update_game_mode(&monitors, "foreground update")?;
+                if transition.deactivated && self.config.dynamic_retile {
+                    let assignments = self.tile_assignments(&monitors);
+                    self.apply_tile_assignments_with_feedback(
+                        &assignments,
+                        &monitors,
+                        "game mode exit retile",
+                    );
+                }
                 self.sync_borders("foreground border update")?;
                 debug!(
                     foreground = ?self.foreground,
@@ -774,7 +993,21 @@ impl DaemonState {
             }
         }
 
+        let transition = self.update_game_mode(&monitors, "low-latency moved update")?;
+        if transition.deactivated && self.config.dynamic_retile {
+            let assignments = self.tile_assignments(&monitors);
+            self.apply_tile_assignments_with_feedback(
+                &assignments,
+                &monitors,
+                "game mode exit retile",
+            );
+        }
+
         if moved_between_monitors && self.config.dynamic_retile {
+            if self.game_mode_pauses_layouts() {
+                self.sync_borders_with_monitors(&monitors, "low-latency moved borders")?;
+                return Ok(true);
+            }
             let assignments = self.tile_assignments(&monitors);
             self.apply_tile_assignments_with_feedback(
                 &assignments,
@@ -811,23 +1044,36 @@ impl DaemonState {
 
         let monitors = winland_win32::enumerate_monitors()
             .context("enumerate monitors for low-latency movesize event")?;
+        let transition = self.update_game_mode(&monitors, "low-latency movesize update")?;
         let plan = self.plan_after_window_events(&[event], &SnapshotDiff::default(), &monitors);
-        self.apply_tile_assignments_with_feedback(
-            &plan.moves,
-            &monitors,
-            "low-latency movesize retile",
-        );
+        let moves = if transition.deactivated && self.config.dynamic_retile {
+            self.tile_assignments(&monitors)
+        } else if self.game_mode_pauses_layouts() {
+            Vec::new()
+        } else {
+            plan.moves
+        };
+        self.apply_tile_assignments_with_feedback(&moves, &monitors, "low-latency movesize retile");
         self.sync_borders_with_monitors(&monitors, "low-latency movesize borders")?;
         debug!(
             kind = ?event.kind,
             window = %event.window,
-            retile_moves = plan.moves.len(),
+            retile_moves = moves.len(),
             "handled movesize event without full snapshot rebuild"
         );
         Ok(true)
     }
 
     fn handle_mouse_drag(&mut self, event: MouseDragEvent) -> Result<()> {
+        if self.game_mode_pauses_layouts() {
+            debug!(
+                window = %event.window,
+                kind = ?event.kind,
+                "ignored modifier drag event while game mode is active"
+            );
+            return Ok(());
+        }
+
         match event.kind {
             MouseDragEventKind::Started => self.start_modifier_drag(event),
             MouseDragEventKind::Moved => self.move_modifier_drag(event),
@@ -1073,8 +1319,14 @@ impl DaemonState {
             let border_manager = self.border_manager.take();
             *self = refreshed;
             self.border_manager = border_manager;
+            self.update_game_mode(&monitors, "reload")?;
             self.log_snapshot("reloaded daemon state");
             self.sync_borders_with_monitors(&monitors, "reload borders")?;
+            return Ok(());
+        }
+
+        if self.game_mode_pauses_layouts() && command.is_suppressed_by_game_mode() {
+            info!(?command, "ignored daemon command while game mode is active");
             return Ok(());
         }
 
@@ -1659,12 +1911,24 @@ impl DaemonState {
     }
 
     fn tile_assignments(&mut self, monitors: &[MonitorInfo]) -> Vec<TileAssignment> {
+        if self.game_mode_pauses_layouts() {
+            return Vec::new();
+        }
+
         let cursor_position = winland_win32::cursor_position().ok();
         let active_workspace = self.workspaces.active_workspace();
         let mut assignments = Vec::new();
         let mut next_overflow_floating = BTreeSet::new();
 
         for monitor in monitors {
+            if self.game_mode_pauses_monitor(monitor.id) {
+                debug!(
+                    monitor = %monitor.id,
+                    "skipped tile assignments for game-mode paused monitor"
+                );
+                continue;
+            }
+
             let handles = self.tiled_handles_for_monitor(monitor, monitors);
             let layout = self.config.layout_for_monitor(monitor, active_workspace);
             let overflow_plan =
@@ -1943,7 +2207,11 @@ impl DaemonState {
                     self.workspaces.update_window_rect(handle, window.rect);
                 }
             } else if self.is_manageable_by_rules(&window, &decision)
-                && !is_fullscreen_window(&window, monitors)
+                && !is_fullscreen_window(
+                    &window,
+                    monitors,
+                    self.config.game_mode.policy.fullscreen_tolerance_px,
+                )
             {
                 if let Some(workspace) = decision.target_workspace {
                     self.workspaces
@@ -1965,7 +2233,11 @@ impl DaemonState {
     fn should_hide_for_workspace(&self, window: WindowHandle, monitors: &[MonitorInfo]) -> bool {
         self.windows.get(&window).is_some_and(|info| {
             self.is_workspace_manageable_by_rules(info, &self.rule_decision(info))
-                && !is_fullscreen_window(info, monitors)
+                && !is_fullscreen_window(
+                    info,
+                    monitors,
+                    self.config.game_mode.policy.fullscreen_tolerance_px,
+                )
         })
     }
 
@@ -2158,7 +2430,13 @@ impl DaemonState {
     }
 
     fn is_manageable_by_rules(&self, window: &WindowInfo, decision: &WindowRuleDecision) -> bool {
-        window.is_manageable() && decision.manage != Some(false)
+        window.is_manageable()
+            && decision.manage != Some(false)
+            && !matches!(
+                decision.mode,
+                Some(WindowRuleMode::Ignore | WindowRuleMode::Game | WindowRuleMode::Fullscreen)
+            )
+            && !game_mode_executable_matches(window, &self.config.game_mode.policy)
     }
 
     fn is_workspace_manageable_by_rules(
@@ -2166,7 +2444,13 @@ impl DaemonState {
         window: &WindowInfo,
         decision: &WindowRuleDecision,
     ) -> bool {
-        window.is_workspace_manageable() && decision.manage != Some(false)
+        window.is_workspace_manageable()
+            && decision.manage != Some(false)
+            && !matches!(
+                decision.mode,
+                Some(WindowRuleMode::Ignore | WindowRuleMode::Game | WindowRuleMode::Fullscreen)
+            )
+            && !game_mode_executable_matches(window, &self.config.game_mode.policy)
     }
 
     fn sync_borders(&mut self, operation: &'static str) -> Result<()> {
@@ -2216,11 +2500,18 @@ impl DaemonState {
             return Vec::new();
         }
 
+        if self.game_mode_hides_borders() {
+            return Vec::new();
+        }
+
         if config.disable_when_fullscreen
             && self.foreground.is_some_and(|window| {
                 self.windows.get(&window).is_some_and(|info| {
-                    is_fullscreen_window(info, monitors)
-                        || !self.is_manageable_by_rules(info, &self.rule_decision(info))
+                    is_fullscreen_window(
+                        info,
+                        monitors,
+                        self.config.game_mode.policy.fullscreen_tolerance_px,
+                    ) || !self.is_manageable_by_rules(info, &self.rule_decision(info))
                 })
             })
         {
@@ -2230,7 +2521,12 @@ impl DaemonState {
         self.windows
             .iter()
             .filter(|(handle, window)| {
-                self.is_manageable_window(**handle) && !is_fullscreen_window(window, monitors)
+                self.is_manageable_window(**handle)
+                    && !is_fullscreen_window(
+                        window,
+                        monitors,
+                        self.config.game_mode.policy.fullscreen_tolerance_px,
+                    )
             })
             .filter_map(|(handle, window)| {
                 let participation = self.window_participation(*handle);
@@ -2297,6 +2593,18 @@ impl DaemonCommand {
         matches!(
             self,
             Self::Swap(_)
+                | Self::Retile
+                | Self::ToggleFloat
+                | Self::SwitchWorkspace(_)
+                | Self::MoveFocusedToWorkspace(_)
+        )
+    }
+
+    fn is_suppressed_by_game_mode(&self) -> bool {
+        matches!(
+            self,
+            Self::Focus(_)
+                | Self::Swap(_)
                 | Self::Retile
                 | Self::ToggleFloat
                 | Self::SwitchWorkspace(_)
@@ -2427,12 +2735,7 @@ fn install_modifier_drag(
     let modifiers = modifier_drag_modifiers_from_config(config)?;
     let options = ModifierDragOptions {
         modifiers,
-        bypass: HotkeyBypassRules {
-            fullscreen: config.hotkeys.bypass.fullscreen,
-            class_names: text_matchers_from_config(&config.hotkeys.bypass.class)?,
-            executable_paths: text_matchers_from_config(&config.hotkeys.bypass.executable_path)?,
-            process_names: text_matchers_from_config(&config.hotkeys.bypass.process_name)?,
-        },
+        bypass: hotkey_bypass_rules_from_config(config)?,
     };
     let registration = winland_win32::install_modifier_drag(options, mouse_drag_sender)
         .context("install documented low-level mouse hook for modifier drag")?;
@@ -2505,13 +2808,32 @@ fn hotkey_override_options_from_config(config: &Config) -> Result<HotkeyOverride
             modifiers: hotkey_modifiers_from_config(&panic_chord),
             virtual_key: virtual_key_from_config(&panic_chord.key),
         },
-        bypass: HotkeyBypassRules {
-            fullscreen: config.hotkeys.bypass.fullscreen,
-            class_names: text_matchers_from_config(&config.hotkeys.bypass.class)?,
-            executable_paths: text_matchers_from_config(&config.hotkeys.bypass.executable_path)?,
-            process_names: text_matchers_from_config(&config.hotkeys.bypass.process_name)?,
-        },
+        bypass: hotkey_bypass_rules_from_config(config)?,
         latency_budget: Duration::from_micros(config.hotkeys.override_latency_budget_micros),
+    })
+}
+
+fn hotkey_bypass_rules_from_config(config: &Config) -> Result<HotkeyBypassRules> {
+    let mut process_names = text_matchers_from_config(&config.hotkeys.bypass.process_name)?;
+    if config.game_mode.enabled && config.game_mode.disable_keyboard_hooks {
+        process_names.extend(
+            config
+                .game_mode
+                .game_exes
+                .iter()
+                .chain(config.game_mode.ignored_exes.iter())
+                .map(|exe| winland_core::TextMatcher::Exact(exe.clone())),
+        );
+    }
+
+    Ok(HotkeyBypassRules {
+        fullscreen: config.hotkeys.bypass.fullscreen
+            || (config.game_mode.enabled
+                && config.game_mode.disable_keyboard_hooks
+                && config.game_mode.pause_on_fullscreen),
+        class_names: text_matchers_from_config(&config.hotkeys.bypass.class)?,
+        executable_paths: text_matchers_from_config(&config.hotkeys.bypass.executable_path)?,
+        process_names,
     })
 }
 
@@ -2746,8 +3068,33 @@ fn apply_tile_assignments_once(assignments: &[TileAssignment], operation: &'stat
     }
 }
 
-fn is_fullscreen_window(window: &WindowInfo, monitors: &[MonitorInfo]) -> bool {
-    monitors.iter().any(|monitor| window.rect == monitor.rect)
+fn game_mode_reason_label(reason: &GameModeReason) -> String {
+    match reason {
+        GameModeReason::ConfiguredExecutable(exe) => format!("configured executable {exe}"),
+        GameModeReason::WindowRule {
+            mode,
+            matched_rules,
+        } => {
+            format!("window rule mode {mode:?} via {}", matched_rules.join(", "))
+        }
+        GameModeReason::Fullscreen { monitor, area } => {
+            format!("fullscreen {area:?} on monitor {monitor}")
+        }
+    }
+}
+
+fn game_mode_layout_pause_scope_for(active: &GameModeActivation) -> &'static str {
+    if !active.actions.pause_layouts {
+        "none"
+    } else if active.actions.pause_focused_monitor_only && active.monitor.is_some() {
+        "focused-monitor"
+    } else {
+        "global"
+    }
+}
+
+fn is_fullscreen_window(window: &WindowInfo, monitors: &[MonitorInfo], tolerance_px: i32) -> bool {
+    detect_fullscreen_window(window, monitors, tolerance_px).is_fullscreen
 }
 
 fn monitor_owns_rect(monitor: &MonitorInfo, rect: Rect, monitors: &[MonitorInfo]) -> bool {
@@ -2834,7 +3181,7 @@ fn nearest_assignment(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use winland_core::{MonitorId, Rect, WindowStyles};
+    use winland_core::{FullscreenArea, MonitorId, Rect, WindowStyles};
 
     #[test]
     fn config_hotkey_commands_route_without_real_hotkeys() {
@@ -3770,7 +4117,7 @@ mod tests {
     }
 
     #[test]
-    fn work_area_sized_window_on_inactive_workspace_is_hidden() {
+    fn work_area_sized_window_on_inactive_workspace_is_not_hidden() {
         let mut state = daemon_state([window(1, "One", primary_test_monitor().work_area)]);
         state
             .workspaces
@@ -3782,7 +4129,7 @@ mod tests {
             &[primary_test_monitor()],
         );
 
-        assert_eq!(plan.hide, vec![WindowHandle(1)]);
+        assert_eq!(plan.hide, Vec::<WindowHandle>::new());
         assert!(plan.moves.is_empty());
     }
 
@@ -3988,6 +4335,119 @@ mod tests {
         assert!(candidates.is_empty());
     }
 
+    #[test]
+    fn game_mode_activates_for_focused_fullscreen_window_and_pauses_layout() {
+        let monitor = primary_test_monitor();
+        let mut state = daemon_state([
+            window(1, "Fullscreen Game", monitor.rect),
+            window(2, "Editor", Rect::from_size(200, 0, 100, 100)),
+        ]);
+        state.foreground = Some(WindowHandle(1));
+
+        let transition = state
+            .update_game_mode(std::slice::from_ref(&monitor), "test")
+            .unwrap();
+        let assignments = state.tile_assignments(std::slice::from_ref(&monitor));
+
+        assert!(transition.activated);
+        assert!(state.game_mode.active.is_some());
+        assert!(assignments.is_empty());
+    }
+
+    #[test]
+    fn focused_monitor_game_mode_keeps_other_monitors_tiling() {
+        let monitors = [primary_test_monitor(), secondary_test_monitor()];
+        let mut state = daemon_state([
+            window(1, "Fullscreen Game", monitors[0].rect),
+            window(2, "Secondary Editor", Rect::from_size(1100, 0, 100, 100)),
+        ]);
+        state.foreground = Some(WindowHandle(1));
+        state.config.game_mode.pause_focused_monitor_only = true;
+
+        let transition = state.update_game_mode(&monitors, "test").unwrap();
+        let assignments = state.tile_assignments(&monitors);
+
+        assert!(transition.activated);
+        assert_eq!(
+            state
+                .game_mode
+                .active
+                .as_ref()
+                .and_then(|active| active.monitor),
+            Some(monitors[0].id)
+        );
+        assert_eq!(
+            assignments,
+            vec![TileAssignment {
+                window: WindowHandle(2),
+                rect: monitors[1].work_area,
+            }]
+        );
+    }
+
+    #[test]
+    fn configured_game_executable_is_not_manageable_or_tiled() {
+        let monitor = primary_test_monitor();
+        let mut game = window(1, "Configured Game", Rect::from_size(0, 0, 100, 100));
+        game.executable_path = Some(r"C:\Games\cs2.exe".to_owned());
+        let mut state =
+            daemon_state([game, window(2, "Editor", Rect::from_size(200, 0, 100, 100))]);
+        state.config.game_mode.policy.game_exes = vec!["cs2.exe".to_owned()];
+        state.tile_order = state.manageable_handles_sorted();
+        state.sync_workspace_state(std::slice::from_ref(&monitor));
+
+        let assignments = state
+            .plan_command(DaemonCommand::Retile, std::slice::from_ref(&monitor))
+            .moves;
+
+        assert!(!state.is_manageable_window(WindowHandle(1)));
+        assert_eq!(
+            assignments,
+            vec![TileAssignment {
+                window: WindowHandle(2),
+                rect: monitor.work_area,
+            }]
+        );
+    }
+
+    #[test]
+    fn game_mode_exit_requests_one_retile() {
+        let monitor = primary_test_monitor();
+        let mut state = daemon_state([
+            window(1, "Former Game", Rect::from_size(0, 0, 100, 100)),
+            window(2, "Editor", Rect::from_size(200, 0, 100, 100)),
+        ]);
+        state.foreground = Some(WindowHandle(1));
+        state.game_mode.active = Some(GameModeActivation {
+            window: WindowHandle(1),
+            title: "Former Game".to_owned(),
+            executable_path: Some(r"C:\Games\game.exe".to_owned()),
+            monitor: Some(monitor.id),
+            reason: GameModeReason::Fullscreen {
+                monitor: monitor.id,
+                area: FullscreenArea::MonitorBounds,
+            },
+            actions: GameModeActions {
+                pause_layouts: true,
+                hide_borders: true,
+                ..GameModeActions::default()
+            },
+            fullscreen: FullscreenDetection {
+                is_fullscreen: true,
+                monitor: Some(monitor.id),
+                area: Some(FullscreenArea::MonitorBounds),
+            },
+        });
+
+        let transition = state
+            .update_game_mode(std::slice::from_ref(&monitor), "test")
+            .unwrap();
+        let assignments = state.tile_assignments(std::slice::from_ref(&monitor));
+
+        assert!(transition.deactivated);
+        assert_eq!(assignments.len(), 2);
+    }
+
     fn daemon_state<const N: usize>(windows: [WindowInfo; N]) -> DaemonState {
         let windows: BTreeMap<_, _> = windows
             .into_iter()
@@ -4009,6 +4469,7 @@ mod tests {
             config: RuntimeConfig::default(),
             hotkey_commands: HotkeyCommandMap::default(),
             border_manager: None,
+            game_mode: GameModeRuntimeState::default(),
         };
         state.tile_order = state.manageable_handles_sorted();
         state.sync_workspace_state(&[primary_test_monitor()]);

@@ -5,6 +5,7 @@ mod platform {
     use std::ffi::c_void;
     use std::mem::size_of;
     use std::os::windows::ffi::OsStringExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{self, Receiver, Sender};
     use std::sync::{Mutex, OnceLock};
     use std::thread::{self, JoinHandle};
@@ -79,6 +80,7 @@ mod platform {
     static HOTKEY_SENDER: OnceLock<Mutex<Option<HotkeySenderState>>> = OnceLock::new();
     static HOTKEY_OVERRIDE: OnceLock<Mutex<Option<HotkeyOverrideState>>> = OnceLock::new();
     static MOUSE_DRAG: OnceLock<Mutex<Option<MouseDragState>>> = OnceLock::new();
+    static INPUT_HOOKS_PAUSED: AtomicBool = AtomicBool::new(false);
     const BORDER_CLASS_NAME: &str = "WinlandBorderOverlay";
     const BORDER_COMMAND_MESSAGE: u32 = WM_APP + 0x57;
     const MINMAXINFO_TIMEOUT_MS: u32 = 50;
@@ -225,6 +227,11 @@ mod platform {
     pub fn focus_window(handle: WindowHandle) -> Result<()> {
         let hwnd = hwnd_from_handle(handle);
         activate_window(hwnd)
+    }
+
+    pub fn set_input_hooks_paused(paused: bool) {
+        INPUT_HOOKS_PAUSED.store(paused, Ordering::Relaxed);
+        debug!(paused, "updated low-level input hook pause state");
     }
 
     fn activate_window(hwnd: HWND) -> Result<()> {
@@ -1046,6 +1053,11 @@ mod platform {
             return unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) };
         }
 
+        if INPUT_HOOKS_PAUSED.load(Ordering::Relaxed) {
+            // SAFETY: See the forwarding note above.
+            return unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) };
+        }
+
         // SAFETY: For HC_ACTION keyboard events, lparam points to a
         // KBDLLHOOKSTRUCT owned by Windows for the duration of this callback.
         let keyboard = unsafe { *(lparam.0 as *const KBDLLHOOKSTRUCT) };
@@ -1111,6 +1123,11 @@ mod platform {
 
         let message = wparam.0 as u32;
         if !matches!(message, WM_LBUTTONDOWN | WM_MOUSEMOVE | WM_LBUTTONUP) {
+            // SAFETY: See the forwarding note above.
+            return unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) };
+        }
+
+        if INPUT_HOOKS_PAUSED.load(Ordering::Relaxed) {
             // SAFETY: See the forwarding note above.
             return unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) };
         }
@@ -2179,6 +2196,8 @@ mod platform {
         Err(Win32Error::UnsupportedPlatform)
     }
 
+    pub fn set_input_hooks_paused(_paused: bool) {}
+
     pub fn hide_window(_handle: WindowHandle) -> Result<()> {
         Err(Win32Error::UnsupportedPlatform)
     }
@@ -2283,6 +2302,7 @@ pub use platform::register_hotkeys;
 pub use platform::request_message_loop_stop;
 pub use platform::run_message_loop;
 pub use platform::send_ipc_request;
+pub use platform::set_input_hooks_paused;
 pub use platform::show_window_without_activate;
 pub use platform::spawn_ipc_server;
 pub use platform::subscribe_window_events;
@@ -2307,7 +2327,7 @@ pub use shell::uninstall_elevated_daemon_task;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
-use winland_core::{MonitorInfo, Rect, TextMatcher, WindowHandle};
+use winland_core::{MonitorInfo, Rect, TextMatcher, WindowHandle, detect_fullscreen_rect};
 
 pub const DEFAULT_IPC_PIPE_NAME: &str = r"\\.\pipe\winland-ipc";
 const IPC_BUFFER_SIZE: u32 = 64 * 1024;
@@ -2600,7 +2620,7 @@ fn process_name(path: &str) -> Option<String> {
 }
 
 fn rect_covers_any_monitor(rect: Rect, monitors: &[MonitorInfo]) -> bool {
-    monitors.iter().any(|monitor| rect == monitor.rect)
+    detect_fullscreen_rect(rect, monitors, 4).is_fullscreen
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2851,7 +2871,7 @@ mod tests {
     }
 
     #[test]
-    fn work_area_rect_is_not_fullscreen_for_hotkey_bypass() {
+    fn work_area_rect_is_fullscreen_for_hotkey_bypass() {
         let monitors = [MonitorInfo {
             id: winland_core::MonitorId(1),
             is_primary: true,
@@ -2860,7 +2880,7 @@ mod tests {
         }];
 
         assert!(rect_covers_any_monitor(monitors[0].rect, &monitors));
-        assert!(!rect_covers_any_monitor(monitors[0].work_area, &monitors));
+        assert!(rect_covers_any_monitor(monitors[0].work_area, &monitors));
     }
 
     #[cfg(windows)]

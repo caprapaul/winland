@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{ArgAction, Args, Parser, Subcommand};
 use slint::ComponentHandle;
-use slint_interpreter::Value;
+use slint_interpreter::{ComponentDefinition, ComponentInstance, Value};
 use tracing::debug;
 use tracing_subscriber::EnvFilter;
 use winland_core::{
@@ -14,6 +14,9 @@ use winland_ipc::{
     DaemonStateSnapshot, IpcRequest, IpcResponseResult, ReloadConfigReport,
     WindowParticipationSnapshot, decode_response, encode_request,
 };
+
+const TASKBAR_WIDGET_SOURCE: &str = include_str!("../widgets/taskbar.slint");
+const TASKBAR_WIDGET_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/widgets/taskbar.slint");
 
 #[derive(Debug, Parser)]
 #[command(name = "winland")]
@@ -43,36 +46,6 @@ enum Command {
     Shell(ShellArgs),
     /// Run custom Winland UI widgets.
     Widget(WidgetArgs),
-}
-
-slint::slint! {
-    export component TaskbarWidget inherits Window {
-        in property <string> label;
-        in property <bool> topmost;
-        no-frame: true;
-        always-on-top: root.topmost;
-        title: "Winland Taskbar";
-        preferred-width: 800px;
-        preferred-height: 40px;
-        background: #20242a;
-
-        Rectangle {
-            width: 100%;
-            height: 100%;
-            background: #20242a;
-        }
-
-        Text {
-            x: 16px;
-            y: 0px;
-            height: parent.height;
-            text: root.label;
-            color: #f5f7fb;
-            vertical-alignment: center;
-            font-size: 14px;
-            font-weight: 600;
-        }
-    }
 }
 
 #[derive(Debug, Args)]
@@ -504,30 +477,17 @@ fn configure_default_widget_backend() {
 }
 
 fn run_taskbar_widget(height: u32, all_monitors: bool, topmost: bool) -> Result<()> {
-    let monitors = widget_target_monitors(all_monitors)?;
-    let height = height.max(1);
-    let mut widgets = Vec::new();
+    let definition = compile_slint_source(
+        TASKBAR_WIDGET_SOURCE,
+        &PathBuf::from(TASKBAR_WIDGET_PATH),
+        "TaskbarWidget",
+    )?;
 
-    for monitor in monitors {
-        let rect = bottom_widget_rect(&monitor, height);
-        let widget = TaskbarWidget::new()?;
-        widget.set_label("Winland workspace".into());
-        widget.set_topmost(topmost);
-        widget
-            .window()
-            .set_position(slint::PhysicalPosition::new(rect.left, rect.top));
-        widget.window().set_size(slint::PhysicalSize::new(
-            rect.width() as u32,
-            rect.height() as u32,
-        ));
-        widget.show()?;
-        configure_slint_widget_window(rect, topmost)?;
-        widgets.push(widget);
-    }
-
-    slint::run_event_loop()?;
-    drop(widgets);
-    Ok(())
+    run_slint_widget_instances(definition, height, all_monitors, topmost, |instance| {
+        instance.set_property("label", Value::String("Winland workspace".into()))?;
+        instance.set_property("topmost", Value::Bool(topmost))?;
+        Ok(())
+    })
 }
 
 fn run_slint_file_widget(
@@ -537,26 +497,83 @@ fn run_slint_file_widget(
     all_monitors: bool,
     topmost: bool,
 ) -> Result<()> {
-    let monitors = widget_target_monitors(all_monitors)?;
+    let definition = compile_slint_path(path, component)?;
+
+    run_slint_widget_instances(definition, height, all_monitors, topmost, |instance| {
+        instance.set_property("always-on-top", Value::Bool(topmost))?;
+        Ok(())
+    })
+}
+
+fn compile_slint_path(path: &std::path::Path, component: &str) -> Result<ComponentDefinition> {
     let compiler = slint_interpreter::Compiler::default();
     let result = spin_on::spin_on(compiler.build_from_path(path));
-    let diagnostics: Vec<_> = result.diagnostics().collect();
-    if !diagnostics.is_empty() {
-        slint_interpreter::print_diagnostics(&diagnostics);
+    print_slint_diagnostics(&result);
+
+    if result.has_errors() {
+        return Err(anyhow::anyhow!(
+            "failed to compile Slint widget {}",
+            path.display()
+        ));
     }
-    let definition = result.component(component).ok_or_else(|| {
+
+    result.component(component).ok_or_else(|| {
         anyhow::anyhow!(
             "component '{component}' was not exported by {}",
             path.display()
         )
-    })?;
+    })
+}
 
+fn compile_slint_source(
+    source: &str,
+    path: &std::path::Path,
+    component: &str,
+) -> Result<ComponentDefinition> {
+    let compiler = slint_interpreter::Compiler::default();
+    let result = spin_on::spin_on(compiler.build_from_source(source.to_owned(), path.to_owned()));
+    print_slint_diagnostics(&result);
+
+    if result.has_errors() {
+        return Err(anyhow::anyhow!(
+            "failed to compile built-in Slint widget {}",
+            path.display()
+        ));
+    }
+
+    result.component(component).ok_or_else(|| {
+        anyhow::anyhow!(
+            "component '{component}' was not exported by built-in widget {}",
+            path.display()
+        )
+    })
+}
+
+fn print_slint_diagnostics(result: &slint_interpreter::CompilationResult) {
+    let diagnostics: Vec<_> = result.diagnostics().collect();
+    if !diagnostics.is_empty() {
+        slint_interpreter::print_diagnostics(&diagnostics);
+    }
+}
+
+fn run_slint_widget_instances<F>(
+    definition: ComponentDefinition,
+    height: u32,
+    all_monitors: bool,
+    topmost: bool,
+    configure_instance: F,
+) -> Result<()>
+where
+    F: Fn(&ComponentInstance) -> Result<()>,
+{
+    let monitors = widget_target_monitors(all_monitors)?;
     let height = height.max(1);
     let mut instances = Vec::new();
+
     for monitor in monitors {
         let rect = bottom_widget_rect(&monitor, height);
         let instance = definition.create()?;
-        instance.set_property("always-on-top", Value::Bool(topmost))?;
+        configure_instance(&instance)?;
         instance
             .window()
             .set_position(slint::PhysicalPosition::new(rect.left, rect.top));
@@ -1337,6 +1354,18 @@ mod tests {
         assert!(output.contains("v2 from <defaults>"));
         assert!(output.contains("hotkeys, window-rules"));
         assert!(output.contains("3 total, 2 manageable"));
+    }
+
+    #[test]
+    fn built_in_taskbar_slint_source_compiles() {
+        let definition = compile_slint_source(
+            TASKBAR_WIDGET_SOURCE,
+            &PathBuf::from(TASKBAR_WIDGET_PATH),
+            "TaskbarWidget",
+        )
+        .unwrap();
+
+        assert_eq!(definition.name(), "TaskbarWidget");
     }
 
     fn test_performance() -> winland_ipc::DaemonPerformanceSnapshot {

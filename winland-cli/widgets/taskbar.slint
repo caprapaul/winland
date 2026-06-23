@@ -1,0 +1,28 @@
+export component TaskbarWidget inherits Window {
+    in property <string> label;
+    in property <bool> topmost;
+
+    no-frame: true;
+    always-on-top: root.topmost;
+    title: "Winland Taskbar";
+    preferred-width: 800px;
+    preferred-height: 40px;
+    background: #20242a;
+
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #20242a;
+    }
+
+    Text {
+        x: 16px;
+        y: 0px;
+        height: parent.height;
+        text: root.label;
+        color: #f5f7fb;
+        vertical-alignment: center;
+        font-size: 14px;
+        font-weight: 600;
+    }
+}

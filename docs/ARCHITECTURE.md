@@ -70,7 +70,7 @@ For a retile:
 
 Widgets are separate user processes started from CLI commands such as `winland widget run taskbar`. They do not participate in layout state or workspace state. Tiling cooperates with widgets only through explicit user configuration: `[layout].offset` reserves screen-edge space, and normal `[[window_rules]]` entries can ignore widget windows.
 
-The first widget backend uses Slint for declarative UI. Runtime-loaded `.slint` files are supported by the CLI. Frameless widgets should use Slint's `no-frame: true` root `Window` property so the titlebar is absent from creation. Topmost behavior is requested through Slint's `always-on-top` property, while Win32-specific panel behavior such as no-activate/tool-window shaping stays in `winland-win32`.
+The first widget backend uses Slint for declarative UI. The built-in taskbar is authored as `winland-cli/widgets/taskbar.slint` and embedded by the CLI at compile time. Runtime-loaded `.slint` files are also supported by the CLI. Frameless widgets should use Slint's `no-frame: true` root `Window` property so the titlebar is absent from creation. Topmost behavior is requested through Slint's `always-on-top` property, while Win32-specific panel behavior such as no-activate/tool-window shaping stays in `winland-win32`.
 
 ## Config And Rule Pipeline
 

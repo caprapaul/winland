@@ -11,7 +11,7 @@ Winland is a Rust workspace with narrow crate boundaries. The important rule is 
 | `winland-win32` | Window/monitor enumeration, WinEvent hooks, hotkeys, low-level hooks, movement, focus, borders, IPC transport, and experimental shell helpers. |
 | `winland-ipc` | Versioned JSON-line request/response structs and encode/decode helpers. |
 | `winland-daemon` | Long-running event processor that connects config, core state, Win32 events, hotkeys, IPC, and border updates. |
-| `winland-cli` | Human-facing diagnostics and daemon IPC client. |
+| `winland-cli` | Human-facing diagnostics, daemon IPC client, and separate widget runner commands. |
 | `winland-shell` | Experimental VM-only user shell entrypoint that starts the daemon. |
 
 ## Core vs Win32 Boundary
@@ -57,13 +57,20 @@ For a retile:
 2. Sync workspace state.
 3. Skip all layout if global game-mode pause is active.
 4. For each monitor, pick the active workspace.
-5. Select tiled windows owned by that monitor and visible on that monitor's workspace.
-6. Resolve overflow by promoting windows to floating until assignments fit the work area.
-7. Compute core layout assignments.
-8. Move windows through `SetWindowPos`.
-9. Read accepted rectangles and learn constraints if Windows refused requested sizes.
-10. Repeat feedback passes up to three times.
-11. Sync borders.
+5. Apply configured layout offsets to the monitor work area.
+6. Select tiled windows owned by that monitor and visible on that monitor's workspace.
+7. Resolve overflow by promoting windows to floating until assignments fit the offset work area.
+8. Compute core layout assignments.
+9. Move windows through `SetWindowPos`.
+10. Read accepted rectangles and learn constraints if Windows refused requested sizes.
+11. Repeat feedback passes up to three times.
+12. Sync borders.
+
+## Widget Runner
+
+Widgets are separate user processes started from CLI commands such as `winland widget run taskbar`. They do not participate in layout state or workspace state. Tiling cooperates with widgets only through explicit user configuration: `[layout].offset` reserves screen-edge space, and normal `[[window_rules]]` entries can ignore widget windows.
+
+The first widget backend uses Slint for declarative UI. Runtime-loaded `.slint` files are supported by the CLI. Frameless widgets should use Slint's `no-frame: true` root `Window` property so the titlebar is absent from creation. Topmost behavior is requested through Slint's `always-on-top` property, while Win32-specific panel behavior such as no-activate/tool-window shaping stays in `winland-win32`.
 
 ## Config And Rule Pipeline
 

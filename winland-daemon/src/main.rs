@@ -18,9 +18,9 @@ use winland_config::{
 };
 use winland_core::{
     DwindleSplit, FullscreenDetection, GameModeDetection, GameModePolicy, GameModeReason,
-    LayoutConfig, LayoutKind, MonitorId, MonitorInfo, Point, Rect, TileAssignment, WindowHandle,
-    WindowInfo, WindowLayoutInfo, WindowParticipation, WindowRule, WindowRuleDecision,
-    WindowRuleMode, WindowSizeConstraints, WorkspaceId, WorkspaceManager,
+    LayoutConfig, LayoutKind, LayoutOffset, MonitorId, MonitorInfo, Point, Rect, TileAssignment,
+    WindowHandle, WindowInfo, WindowLayoutInfo, WindowParticipation, WindowRule,
+    WindowRuleDecision, WindowRuleMode, WindowSizeConstraints, WorkspaceId, WorkspaceManager,
     WorkspaceVisibilityChange, detect_fullscreen_window, detect_game_mode, evaluate_window_rules,
     game_mode_executable_matches, split_direction_for_point, tile_assignments_fit_work_area,
     tile_layout_windows_with_config, tile_layout_windows_with_state,
@@ -98,6 +98,7 @@ fn main() -> Result<()> {
     state.border_manager = Some(BorderManager::new().context("start border overlay manager")?);
     state.apply_startup_retile()?;
     state.sync_borders("startup border sync")?;
+    state.launch_startup_commands();
     let processor = thread::Builder::new()
         .name("winland-daemon-events".to_owned())
         .spawn(move || process_daemon_events(daemon_receiver, state, processor_sender))
@@ -231,8 +232,11 @@ fn log_loaded_config(loaded: &winland_config::LoadedConfig) {
 
 #[derive(Debug, Clone)]
 struct RuntimeConfig {
+    startup_commands: Vec<String>,
     layout: LayoutConfig,
+    layout_offset: LayoutOffset,
     layout_per_monitor: BTreeMap<String, LayoutConfig>,
+    layout_offset_per_monitor: BTreeMap<String, LayoutOffset>,
     layout_per_workspace: BTreeMap<WorkspaceId, LayoutConfig>,
     workspace_count: u16,
     window_rules: Vec<WindowRule>,
@@ -249,8 +253,11 @@ struct RuntimeConfig {
 impl RuntimeConfig {
     fn from_config(config: &Config) -> Result<Self> {
         Ok(Self {
+            startup_commands: config.ui.startup_commands.clone(),
             layout: config.layout_config(),
+            layout_offset: config.layout_offset(),
             layout_per_monitor: layout_per_monitor_from_config(config),
+            layout_offset_per_monitor: layout_offset_per_monitor_from_config(config),
             layout_per_workspace: layout_per_workspace_from_config(config),
             workspace_count: config.workspace_count(),
             window_rules: config.window_rules().context("convert window rules")?,
@@ -273,6 +280,11 @@ impl RuntimeConfig {
             monitor,
             workspace,
         )
+    }
+
+    fn work_area_for_monitor(&self, monitor: &MonitorInfo) -> Rect {
+        layout_offset_for_monitor(self.layout_offset, &self.layout_offset_per_monitor, monitor)
+            .apply_to(monitor.work_area)
     }
 }
 
@@ -363,6 +375,22 @@ fn layout_per_monitor_from_config(config: &Config) -> BTreeMap<String, LayoutCon
         .collect()
 }
 
+fn layout_offset_per_monitor_from_config(config: &Config) -> BTreeMap<String, LayoutOffset> {
+    config
+        .layout
+        .per_monitor
+        .iter()
+        .filter_map(|(monitor, override_config)| {
+            override_config.offset.map(|offset| {
+                (
+                    monitor.clone(),
+                    offset.merge_with(config.layout.offset).to_core(),
+                )
+            })
+        })
+        .collect()
+}
+
 fn layout_per_workspace_from_config(config: &Config) -> BTreeMap<WorkspaceId, LayoutConfig> {
     config
         .layout
@@ -426,6 +454,27 @@ fn layout_config_for_monitor(
         .copied()
         .unwrap_or(layout)
         .normalized()
+}
+
+fn layout_offset_for_monitor(
+    default_offset: LayoutOffset,
+    per_monitor: &BTreeMap<String, LayoutOffset>,
+    monitor: &MonitorInfo,
+) -> LayoutOffset {
+    let mut offset = default_offset;
+
+    if let Some(primary_offset) = monitor
+        .is_primary
+        .then(|| per_monitor.get("primary").copied())
+        .flatten()
+    {
+        offset = primary_offset;
+    }
+
+    per_monitor
+        .get(&monitor.id.to_string())
+        .copied()
+        .unwrap_or(offset)
 }
 
 fn spawn_window_bridge(
@@ -974,6 +1023,24 @@ impl DaemonState {
             "completed startup retile request"
         );
         Ok(())
+    }
+
+    fn launch_startup_commands(&self) {
+        for command in &self.config.startup_commands {
+            let resolved_command = resolve_startup_command(command);
+            match winland_win32::launch_app(&resolved_command) {
+                Ok(()) => info!(
+                    command,
+                    resolved_command, "launched configured startup command"
+                ),
+                Err(error) => warn!(
+                    command,
+                    resolved_command,
+                    %error,
+                    "failed to launch configured startup command"
+                ),
+            }
+        }
     }
 
     fn update_game_mode(
@@ -1634,6 +1701,11 @@ impl DaemonState {
     }
 
     fn start_modifier_drag(&mut self, event: MouseDragEvent) -> Result<()> {
+        if !self.should_start_modifier_drag(event.window) {
+            debug!(window = %event.window, "ignored modifier drag for unknown window");
+            return Ok(());
+        }
+
         self.foreground = Some(event.window);
         if let Err(error) = winland_win32::focus_window(event.window) {
             debug!(
@@ -1681,6 +1753,25 @@ impl DaemonState {
             "drag.start"
         );
         Ok(())
+    }
+
+    fn should_start_modifier_drag(&self, window: WindowHandle) -> bool {
+        let Some(info) = self.windows.get(&window) else {
+            return false;
+        };
+        let decision = self.rule_decision(info);
+        let should_start = self.is_manageable_by_rules(info, &decision);
+        if !should_start {
+            debug!(
+                window = %window,
+                title = %info.title,
+                class_name = %info.class_name,
+                manageability = ?info.manageable_reason(),
+                decision = ?decision,
+                "ignored modifier drag for unmanaged window"
+            );
+        }
+        should_start
     }
 
     fn move_modifier_drag(&mut self, event: MouseDragEvent) -> Result<()> {
@@ -2524,7 +2615,7 @@ impl DaemonState {
         let local_index = self.drop_insert_index_at_point(window, drop_point, &handles, monitor);
         handles.insert(local_index, window);
         let assignments = self.preview_tile_assignments(monitor, &handles, layout, cursor_position);
-        tile_assignments_fit_work_area(monitor.work_area, &assignments)
+        tile_assignments_fit_work_area(self.config.work_area_for_monitor(monitor), &assignments)
     }
 
     fn dwindle_drop_would_fit(
@@ -2545,8 +2636,9 @@ impl DaemonState {
             .cloned()
             .unwrap_or_default();
         let layout_windows = self.layout_windows_for_handles(target_handles);
+        let work_area = self.config.work_area_for_monitor(monitor);
         let assignments = tile_layout_windows_with_state(
-            monitor.work_area,
+            work_area,
             &layout_windows,
             layout,
             None,
@@ -2575,13 +2667,13 @@ impl DaemonState {
         });
         let layout_windows = self.layout_windows_for_handles(&handles);
         let assignments = tile_layout_windows_with_state(
-            monitor.work_area,
+            work_area,
             &layout_windows,
             layout,
             None,
             Some(&mut preview_splits),
         );
-        tile_assignments_fit_work_area(monitor.work_area, &assignments)
+        tile_assignments_fit_work_area(work_area, &assignments)
     }
 
     fn start_interactive_drag_from_moved_events(
@@ -2840,8 +2932,9 @@ impl DaemonState {
             .cloned()
             .unwrap_or_default();
         let layout_windows = self.layout_windows_for_handles(target_handles);
+        let work_area = self.config.work_area_for_monitor(monitor);
         let assignments = tile_layout_windows_with_state(
-            monitor.work_area,
+            work_area,
             &layout_windows,
             layout,
             None,
@@ -2888,8 +2981,9 @@ impl DaemonState {
                     self.workspaces.active_workspace_for_monitor(monitor.id),
                 );
                 let layout_windows = self.layout_windows_for_handles(&handles);
+                let work_area = self.config.work_area_for_monitor(monitor);
                 let assignment =
-                    tile_layout_windows_with_config(monitor.work_area, &layout_windows, layout)
+                    tile_layout_windows_with_config(work_area, &layout_windows, layout)
                         .into_iter()
                         .find(|assignment| assignment.window == window)?;
                 let center = assignment.rect.center();
@@ -3156,6 +3250,7 @@ impl DaemonState {
 
             let handles = self.tiled_handles_for_monitor(monitor, monitors);
             let layout = self.config.layout_for_monitor(monitor, active_workspace);
+            let work_area = self.config.work_area_for_monitor(monitor);
             let overflow_plan =
                 self.resolve_overflow_for_monitor(monitor, &handles, layout, cursor_position);
             for window in &overflow_plan.overflow_windows {
@@ -3171,7 +3266,7 @@ impl DaemonState {
                     .entry((active_workspace, monitor.id))
                     .or_default();
                 tile_layout_windows_with_state(
-                    monitor.work_area,
+                    work_area,
                     &layout_windows,
                     layout,
                     cursor_position,
@@ -3179,7 +3274,7 @@ impl DaemonState {
                 )
             } else {
                 self.dwindle_splits.remove(&(active_workspace, monitor.id));
-                tile_layout_windows_with_config(monitor.work_area, &layout_windows, layout)
+                tile_layout_windows_with_config(work_area, &layout_windows, layout)
             };
 
             assignments.extend(monitor_assignments);
@@ -3208,7 +3303,8 @@ impl DaemonState {
         loop {
             let assignments =
                 self.preview_tile_assignments(monitor, &tiled_windows, layout, cursor_position);
-            if tile_assignments_fit_work_area(monitor.work_area, &assignments) {
+            let work_area = self.config.work_area_for_monitor(monitor);
+            if tile_assignments_fit_work_area(work_area, &assignments) {
                 return MonitorOverflowPlan {
                     tiled_windows,
                     overflow_windows,
@@ -3235,6 +3331,7 @@ impl DaemonState {
         cursor_position: Option<winland_core::Point>,
     ) -> Vec<TileAssignment> {
         let layout_windows = self.layout_windows_for_handles(handles);
+        let work_area = self.config.work_area_for_monitor(monitor);
         if layout.kind == LayoutKind::Dwindle {
             let mut splits = self
                 .dwindle_splits
@@ -3245,14 +3342,14 @@ impl DaemonState {
                 .cloned()
                 .unwrap_or_default();
             tile_layout_windows_with_state(
-                monitor.work_area,
+                work_area,
                 &layout_windows,
                 layout,
                 cursor_position,
                 Some(&mut splits),
             )
         } else {
-            tile_layout_windows_with_config(monitor.work_area, &layout_windows, layout)
+            tile_layout_windows_with_config(work_area, &layout_windows, layout)
         }
     }
 
@@ -4768,7 +4865,10 @@ impl ConfigDiff {
         {
             changed_sections.push("layout".to_owned());
         }
-        if old.layout.gap != new.layout.gap || old.layout.border != new.layout.border {
+        if old.layout.gap != new.layout.gap
+            || old.layout.border != new.layout.border
+            || old.layout.offset != new.layout.offset
+        {
             changed_sections.push("gaps".to_owned());
         }
         if old.borders != new.borders {
@@ -4788,6 +4888,9 @@ impl ConfigDiff {
         }
         if old.general != new.general {
             changed_sections.push("general".to_owned());
+        }
+        if old.ui != new.ui {
+            changed_sections.push("ui".to_owned());
         }
         if changed_sections.is_empty() {
             changed_sections.push("none".to_owned());
@@ -5533,10 +5636,80 @@ fn nearest_assignment(
     })
 }
 
+fn resolve_startup_command(command: &str) -> String {
+    let command = command.trim();
+    let Some(rest) = winland_cli_alias_rest(command) else {
+        return command.to_owned();
+    };
+
+    let Some(cli_path) = sibling_executable_path("winland-cli") else {
+        return command.to_owned();
+    };
+
+    format!(
+        "{}{}",
+        winland_win32::quote_windows_arg(&cli_path.display().to_string()),
+        rest
+    )
+}
+
+fn winland_cli_alias_rest(command: &str) -> Option<&str> {
+    for alias in ["winland-cli.exe", "winland-cli", "winland.exe", "winland"] {
+        if command.eq_ignore_ascii_case(alias) {
+            return Some("");
+        }
+
+        if command.len() > alias.len()
+            && command[..alias.len()].eq_ignore_ascii_case(alias)
+            && command.as_bytes()[alias.len()].is_ascii_whitespace()
+        {
+            return Some(&command[alias.len()..]);
+        }
+    }
+
+    None
+}
+
+fn sibling_executable_path(stem: &str) -> Option<PathBuf> {
+    let current = std::env::current_exe().ok()?;
+    let extension = current.extension().and_then(|value| value.to_str());
+    let file_name = match extension {
+        Some(extension) if !extension.is_empty() => format!("{stem}.{extension}"),
+        _ => stem.to_owned(),
+    };
+
+    Some(current.with_file_name(file_name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use winland_core::{FullscreenArea, MonitorId, Rect, WindowSizeConstraints, WindowStyles};
+    use winland_core::{
+        FullscreenArea, MonitorId, Rect, WindowRuleAction, WindowSizeConstraints, WindowStyles,
+    };
+
+    #[test]
+    fn startup_command_aliases_match_winland_cli_commands() {
+        assert_eq!(
+            winland_cli_alias_rest("winland widget run taskbar"),
+            Some(" widget run taskbar")
+        );
+        assert_eq!(
+            winland_cli_alias_rest("winland-cli.exe widget run taskbar"),
+            Some(" widget run taskbar")
+        );
+        assert_eq!(winland_cli_alias_rest("winland"), Some(""));
+        assert_eq!(
+            winland_cli_alias_rest("winlandish widget run taskbar"),
+            None
+        );
+        assert_eq!(winland_cli_alias_rest("wt.exe"), None);
+    }
+
+    #[test]
+    fn startup_command_resolution_keeps_non_winland_commands_unchanged() {
+        assert_eq!(resolve_startup_command(" wt.exe "), "wt.exe");
+    }
 
     #[test]
     fn config_hotkey_commands_route_without_real_hotkeys() {
@@ -6313,6 +6486,32 @@ mod tests {
             state.previous_rects.get(&WindowHandle(1)).copied(),
             Some(Rect::from_size(0, 0, 100, 100))
         );
+    }
+
+    #[test]
+    fn modifier_drag_refuses_unmanageable_and_ignored_windows() {
+        let mut taskbar = window(1, "Winland Taskbar", Rect::from_size(0, 760, 1000, 40));
+        taskbar.is_tool_window = true;
+        let mut state = daemon_state([
+            taskbar,
+            window(2, "Ignored", Rect::from_size(0, 0, 100, 100)),
+            window(3, "Normal", Rect::from_size(200, 0, 100, 100)),
+        ]);
+        state.config.window_rules = vec![WindowRule {
+            name: "ignore window".to_owned(),
+            matcher: winland_core::WindowRuleMatch {
+                title: Some(winland_core::TextMatcher::Exact("Ignored".to_owned())),
+                ..winland_core::WindowRuleMatch::default()
+            },
+            action: WindowRuleAction {
+                manage: Some(false),
+                ..WindowRuleAction::default()
+            },
+        }];
+
+        assert!(!state.should_start_modifier_drag(WindowHandle(1)));
+        assert!(!state.should_start_modifier_drag(WindowHandle(2)));
+        assert!(state.should_start_modifier_drag(WindowHandle(3)));
     }
 
     #[test]
@@ -7722,6 +7921,39 @@ mod tests {
                 window: WindowHandle(2),
                 rect: monitors[1].work_area,
             }]
+        );
+    }
+
+    #[test]
+    fn layout_offset_reserves_bottom_space_on_each_monitor() {
+        let monitors = [primary_test_monitor(), secondary_test_monitor()];
+        let mut state = daemon_state([
+            window(1, "Primary Editor", Rect::from_size(0, 0, 100, 100)),
+            window(2, "Secondary Editor", Rect::from_size(1100, 0, 100, 100)),
+        ]);
+        state.config.layout_offset = LayoutOffset::new(0, 0, 40, 0);
+        state.sync_workspace_state(&monitors);
+        state
+            .workspaces
+            .move_window_to_workspace(WindowHandle(2), WorkspaceId(2));
+        state
+            .window_monitor_overrides
+            .insert(WindowHandle(2), monitors[1].id);
+
+        let assignments = state.tile_assignments(&monitors);
+
+        assert_eq!(
+            assignments,
+            vec![
+                TileAssignment {
+                    window: WindowHandle(1),
+                    rect: Rect::from_size(0, 0, 1000, 720),
+                },
+                TileAssignment {
+                    window: WindowHandle(2),
+                    rect: Rect::from_size(1000, 0, 800, 520),
+                },
+            ]
         );
     }
 

@@ -20,6 +20,7 @@ Most desktop commands require Windows because they call `winland-win32`.
 | `tile-once` | No | Tile manageable windows on the primary monitor once. |
 | `config validate [--path <FILE>]` | No | Parse and validate config. |
 | `shell ...` | No IPC | Experimental VM-only shell replacement helpers. |
+| `widget run ...` | No IPC | Run a built-in or user-provided Slint widget. |
 
 If the daemon is not running, IPC commands print:
 
@@ -162,6 +163,30 @@ cargo run -p winland-cli -- config validate
 ```
 
 With no path, validation uses discovery paths or built-in defaults. Success output summarizes the effective base layout and game-mode counts.
+
+## Widgets
+
+```powershell
+cargo run -p winland-cli -- widget run taskbar
+cargo run -p winland-cli -- widget run taskbar --no-topmost
+cargo run -p winland-cli -- widget run --file .\widgets\bar.slint --component MainWindow
+```
+
+`widget run taskbar` starts the built-in Slint taskbar widget. By default it creates a 40px bottom widget on every monitor. The built-in taskbar declares Slint `no-frame: true` and `always-on-top` so it is created without the normal Windows titlebar/frame and stays above normal app windows, then `winland-win32` keeps it as a no-activate top-level panel. Pass `--no-topmost` to keep the widget in the normal z-order band.
+
+Custom widgets can be authored as `.slint` files and loaded at runtime with `--file`. Put `no-frame: true` on the exported root `Window` when the widget should be frameless from creation. The widget process is separate from tiling; reserve space for it explicitly with `[layout].offset`, and ignore it through normal `window_rules` when needed, for example:
+
+```toml
+[[window_rules]]
+name = "ignore winland taskbar"
+[window_rules.match]
+title = "Winland Taskbar"
+[window_rules.action]
+manage = false
+
+[layout]
+offset = { bottom = 40 }
+```
 
 ## Experimental Shell Commands
 

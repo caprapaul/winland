@@ -28,13 +28,46 @@ cargo run -p winland-cli -- reload-config
 
 There is no automatic file watcher yet.
 
+## UI Startup Commands
+
+`[ui].startup_commands` is a list of command lines launched by the daemon after startup retile. This works whether the daemon is started directly, through `winland shell test`, or as the experimental shell.
+
+Example:
+
+```toml
+[ui]
+startup_commands = ["winland widget run taskbar"]
+```
+
+Commands are best-effort: failures are logged but do not stop the daemon.
+
+Widgets are separate processes. Reserve screen space with `[layout].offset`, and
+use ordinary `[[window_rules]]` when a widget should be ignored by tiling:
+
+```toml
+[[window_rules]]
+name = "ignore winland taskbar"
+[window_rules.match]
+title = "Winland Taskbar"
+[window_rules.action]
+manage = false
+```
+
 ## Full Example
 
 ```toml
-window_rules = []
+[[window_rules]]
+name = "ignore winland taskbar"
+[window_rules.match]
+title = "Winland Taskbar"
+[window_rules.action]
+manage = false
 
 [general]
 log_level = "info"
+
+[ui]
+startup_commands = ["winland widget run taskbar"]
 
 [hotkeys]
 mode = "advanced-interception"
@@ -60,12 +93,13 @@ bindings = [
 default = "dwindle"
 gap = 8
 border = 1
+offset = { top = 0, right = 0, bottom = 40, left = 0 }
 master_ratio_percent = 50
 smart_split = true
 preserve_split = true
 
 [layout.per_monitor]
-primary = { layout = "dwindle", gap = 8, border = 1, smart_split = true }
+primary = { layout = "dwindle", gap = 8, border = 1, smart_split = true, offset = { bottom = 40 } }
 
 [layout.per_workspace]
 "1" = { layout = "master-stack", gap = 6, master_ratio_percent = 55 }
@@ -127,6 +161,7 @@ The root [winland.toml](../winland.toml) has a larger annotated sample.
 | Key | Default |
 | --- | --- |
 | `general.log_level` | `"info"` |
+| `ui.startup_commands` | `[]` |
 | `hotkeys.mode` | `"advanced-interception"` |
 | `hotkeys.panic_hotkey` | `"Ctrl+Alt+Shift+P"` |
 | `hotkeys.override_latency_budget_micros` | `250` |
@@ -136,6 +171,7 @@ The root [winland.toml](../winland.toml) has a larger annotated sample.
 | `layout.default` | `"master-stack"` |
 | `layout.gap` | `0` |
 | `layout.border` | `0` |
+| `layout.offset` | `{ top = 0, right = 0, bottom = 0, left = 0 }` |
 | `layout.master_ratio_percent` | `50` |
 | `layout.smart_split` | `false` |
 | `layout.preserve_split` | `false` |
@@ -203,6 +239,8 @@ Supported layout names:
 | `horizontal-stack` | Windows are split into columns. |
 
 `gap` and `border` are geometry reservations used by layout math. They are not the same as the optional visual border overlay. Both must be `<= 256`.
+
+`offset` reserves screen-edge space before layout math runs. It is intended for widgets such as a taskbar, but it is deliberately config-only: Winland does not infer offsets from widget processes. Set `bottom = 40` to reserve a 40px bottom taskbar on every monitor, or use `layout.per_monitor` overrides for monitor-specific reservations.
 
 `master_ratio_percent` applies to `master-stack` and must be `10..=90`.
 

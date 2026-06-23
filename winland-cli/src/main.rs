@@ -1,11 +1,13 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgAction, Args, Parser, Subcommand};
+use slint::ComponentHandle;
+use slint_interpreter::Value;
 use tracing::debug;
 use tracing_subscriber::EnvFilter;
 use winland_core::{
-    GameModeReason, Manageability, MonitorInfo, WindowHandle, WindowInfo, WorkspaceId,
+    GameModeReason, Manageability, MonitorInfo, Rect, WindowHandle, WindowInfo, WorkspaceId,
     detect_game_mode, tile_windows_with_config,
 };
 use winland_ipc::{
@@ -39,6 +41,38 @@ enum Command {
     Config(ConfigArgs),
     /// Experimental per-user shell replacement commands.
     Shell(ShellArgs),
+    /// Run custom Winland UI widgets.
+    Widget(WidgetArgs),
+}
+
+slint::slint! {
+    export component TaskbarWidget inherits Window {
+        in property <string> label;
+        in property <bool> topmost;
+        no-frame: true;
+        always-on-top: root.topmost;
+        title: "Winland Taskbar";
+        preferred-width: 800px;
+        preferred-height: 40px;
+        background: #20242a;
+
+        Rectangle {
+            width: 100%;
+            height: 100%;
+            background: #20242a;
+        }
+
+        Text {
+            x: 16px;
+            y: 0px;
+            height: parent.height;
+            text: root.label;
+            color: #f5f7fb;
+            vertical-alignment: center;
+            font-size: 14px;
+            font-weight: 600;
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -79,6 +113,39 @@ struct ConfigArgs {
 struct ShellArgs {
     #[command(subcommand)]
     command: ShellCommand,
+}
+
+#[derive(Debug, Args)]
+struct WidgetArgs {
+    #[command(subcommand)]
+    command: WidgetCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum WidgetCommand {
+    /// Run a built-in widget or a user-provided .slint widget.
+    Run(WidgetRunArgs),
+}
+
+#[derive(Debug, Args)]
+struct WidgetRunArgs {
+    /// Built-in widget name. Currently: taskbar.
+    widget: Option<String>,
+    /// Path to a user-defined .slint widget.
+    #[arg(long)]
+    file: Option<PathBuf>,
+    /// Exported component name for --file widgets.
+    #[arg(long, default_value = "MainWindow")]
+    component: String,
+    /// Widget height in physical pixels.
+    #[arg(long, default_value_t = 40)]
+    height: u32,
+    /// Run on every monitor instead of only the primary monitor.
+    #[arg(long, default_value_t = true)]
+    all_monitors: bool,
+    /// Do not keep the widget above normal application windows.
+    #[arg(long = "no-topmost", default_value_t = true, action = ArgAction::SetFalse)]
+    topmost: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -182,6 +249,7 @@ fn main() -> Result<()> {
         Command::TileOnce => tile_once(),
         Command::Config(args) => handle_config(args),
         Command::Shell(args) => handle_shell(args),
+        Command::Widget(args) => handle_widget(args),
     }
 }
 
@@ -393,6 +461,175 @@ fn handle_shell(args: ShellArgs) -> Result<()> {
         ShellCommand::ElevatedTaskStatus => shell_elevated_task_status(),
         ShellCommand::Explorer => shell_explorer(),
     }
+}
+
+fn handle_widget(args: WidgetArgs) -> Result<()> {
+    match args.command {
+        WidgetCommand::Run(args) => run_widget(args),
+    }
+}
+
+fn run_widget(args: WidgetRunArgs) -> Result<()> {
+    configure_default_widget_backend();
+
+    if let Some(file) = args.file {
+        return run_slint_file_widget(
+            &file,
+            &args.component,
+            args.height,
+            args.all_monitors,
+            args.topmost,
+        );
+    }
+
+    match args.widget.as_deref().unwrap_or("taskbar") {
+        "taskbar" => run_taskbar_widget(args.height, args.all_monitors, args.topmost),
+        name => Err(anyhow::anyhow!(
+            "unknown built-in widget '{name}'; use --file to run a custom .slint widget"
+        )),
+    }
+}
+
+fn configure_default_widget_backend() {
+    if std::env::var_os("SLINT_BACKEND").is_some() {
+        return;
+    }
+
+    // SAFETY: Widget backend selection happens before any Slint windows are
+    // created and before this command starts worker threads. Users can still
+    // override this with SLINT_BACKEND when they want a GPU renderer.
+    unsafe {
+        std::env::set_var("SLINT_BACKEND", "winit-software");
+    }
+}
+
+fn run_taskbar_widget(height: u32, all_monitors: bool, topmost: bool) -> Result<()> {
+    let monitors = widget_target_monitors(all_monitors)?;
+    let height = height.max(1);
+    let mut widgets = Vec::new();
+
+    for monitor in monitors {
+        let rect = bottom_widget_rect(&monitor, height);
+        let widget = TaskbarWidget::new()?;
+        widget.set_label("Winland workspace".into());
+        widget.set_topmost(topmost);
+        widget
+            .window()
+            .set_position(slint::PhysicalPosition::new(rect.left, rect.top));
+        widget.window().set_size(slint::PhysicalSize::new(
+            rect.width() as u32,
+            rect.height() as u32,
+        ));
+        widget.show()?;
+        configure_slint_widget_window(rect, topmost)?;
+        widgets.push(widget);
+    }
+
+    slint::run_event_loop()?;
+    drop(widgets);
+    Ok(())
+}
+
+fn run_slint_file_widget(
+    path: &std::path::Path,
+    component: &str,
+    height: u32,
+    all_monitors: bool,
+    topmost: bool,
+) -> Result<()> {
+    let monitors = widget_target_monitors(all_monitors)?;
+    let compiler = slint_interpreter::Compiler::default();
+    let result = spin_on::spin_on(compiler.build_from_path(path));
+    let diagnostics: Vec<_> = result.diagnostics().collect();
+    if !diagnostics.is_empty() {
+        slint_interpreter::print_diagnostics(&diagnostics);
+    }
+    let definition = result.component(component).ok_or_else(|| {
+        anyhow::anyhow!(
+            "component '{component}' was not exported by {}",
+            path.display()
+        )
+    })?;
+
+    let height = height.max(1);
+    let mut instances = Vec::new();
+    for monitor in monitors {
+        let rect = bottom_widget_rect(&monitor, height);
+        let instance = definition.create()?;
+        instance.set_property("always-on-top", Value::Bool(topmost))?;
+        instance
+            .window()
+            .set_position(slint::PhysicalPosition::new(rect.left, rect.top));
+        instance.window().set_size(slint::PhysicalSize::new(
+            rect.width() as u32,
+            rect.height() as u32,
+        ));
+        instance.show()?;
+        configure_slint_widget_window(rect, topmost)?;
+        instances.push(instance);
+    }
+
+    slint::run_event_loop()?;
+    drop(instances);
+    Ok(())
+}
+
+fn widget_target_monitors(all_monitors: bool) -> Result<Vec<MonitorInfo>> {
+    let monitors = winland_win32::enumerate_monitors()?;
+    if all_monitors {
+        return Ok(monitors);
+    }
+
+    monitors
+        .iter()
+        .find(|monitor| monitor.is_primary)
+        .or_else(|| monitors.first())
+        .cloned()
+        .map(|monitor| vec![monitor])
+        .ok_or_else(|| anyhow::anyhow!("no monitors were discovered"))
+}
+
+fn bottom_widget_rect(monitor: &MonitorInfo, height: u32) -> Rect {
+    let height = i32::try_from(height).unwrap_or(i32::MAX);
+    let height = height.min(monitor.rect.height().max(1));
+    Rect {
+        left: monitor.rect.left,
+        top: monitor.rect.bottom.saturating_sub(height),
+        right: monitor.rect.right,
+        bottom: monitor.rect.bottom,
+    }
+}
+
+fn configure_slint_widget_window(rect: Rect, topmost: bool) -> Result<()> {
+    let handle = widget_window_for_current_process(rect)?;
+    winland_win32::configure_widget_window(handle, rect, topmost)?;
+    Ok(())
+}
+
+fn widget_window_for_current_process(target: Rect) -> Result<WindowHandle> {
+    let process_id = std::process::id();
+    let windows = winland_win32::enumerate_windows()?;
+
+    windows
+        .into_iter()
+        .filter(|window| window.process_id == process_id)
+        .min_by_key(|window| rect_distance_score(window.rect, target))
+        .map(|window| window.handle)
+        .ok_or_else(|| anyhow::anyhow!("could not find the Slint widget window for this process"))
+}
+
+fn rect_distance_score(actual: Rect, target: Rect) -> i64 {
+    let actual_center = actual.center();
+    let target_center = target.center();
+    let dx = i64::from(actual_center.x.saturating_sub(target_center.x));
+    let dy = i64::from(actual_center.y.saturating_sub(target_center.y));
+    let dw = i64::from(actual.width().saturating_sub(target.width()).abs());
+    let dh = i64::from(actual.height().saturating_sub(target.height()).abs());
+
+    dx.saturating_mul(dx)
+        .saturating_add(dy.saturating_mul(dy))
+        .saturating_add(dw.saturating_mul(1024))
+        .saturating_add(dh.saturating_mul(1024))
 }
 
 fn shell_status() -> Result<()> {

@@ -66,6 +66,73 @@ impl Rect {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LayoutOffset {
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+    pub left: i32,
+}
+
+impl LayoutOffset {
+    pub const ZERO: Self = Self {
+        top: 0,
+        right: 0,
+        bottom: 0,
+        left: 0,
+    };
+
+    pub fn new(top: i32, right: i32, bottom: i32, left: i32) -> Self {
+        Self {
+            top: top.max(0),
+            right: right.max(0),
+            bottom: bottom.max(0),
+            left: left.max(0),
+        }
+    }
+
+    pub fn apply_to(self, rect: Rect) -> Rect {
+        let offset = self.normalized_for(rect);
+        Rect {
+            left: rect.left.saturating_add(offset.left),
+            top: rect.top.saturating_add(offset.top),
+            right: rect.right.saturating_sub(offset.right),
+            bottom: rect.bottom.saturating_sub(offset.bottom),
+        }
+    }
+
+    fn normalized_for(self, rect: Rect) -> Self {
+        let offset = Self::new(self.top, self.right, self.bottom, self.left);
+        let width = rect.width().max(0);
+        let height = rect.height().max(0);
+        let horizontal_total = offset.left.saturating_add(offset.right);
+        let vertical_total = offset.top.saturating_add(offset.bottom);
+
+        Self {
+            top: clamp_leading_offset(offset.top, vertical_total, height),
+            right: clamp_trailing_offset(offset.right, horizontal_total, width),
+            bottom: clamp_trailing_offset(offset.bottom, vertical_total, height),
+            left: clamp_leading_offset(offset.left, horizontal_total, width),
+        }
+    }
+}
+
+fn clamp_leading_offset(value: i32, total: i32, available: i32) -> i32 {
+    if total <= available {
+        value
+    } else {
+        value.min(available / 2)
+    }
+}
+
+fn clamp_trailing_offset(value: i32, total: i32, available: i32) -> i32 {
+    if total <= available {
+        value
+    } else {
+        value.min(available.saturating_sub(available / 2))
+    }
+}
+
 impl fmt::Display for Rect {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -2669,6 +2736,30 @@ mod tests {
                 rect: work_area,
             }]
         );
+    }
+
+    #[test]
+    fn layout_offset_reserves_each_edge_of_work_area() {
+        let work_area = Rect::from_size(10, 20, 800, 600);
+        let offset = LayoutOffset::new(5, 10, 40, 15);
+
+        assert_eq!(
+            offset.apply_to(work_area),
+            Rect {
+                left: 25,
+                top: 25,
+                right: 800,
+                bottom: 580,
+            }
+        );
+    }
+
+    #[test]
+    fn layout_offset_keeps_rect_non_negative_when_offsets_are_too_large() {
+        let work_area = Rect::from_size(0, 0, 100, 40);
+        let offset = LayoutOffset::new(30, 90, 30, 90);
+
+        assert_eq!(offset.apply_to(work_area), Rect::from_size(50, 20, 0, 0));
     }
 
     #[test]

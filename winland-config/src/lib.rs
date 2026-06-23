@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use winland_core::{
-    GameModePolicy, LayoutConfig, LayoutKind, MonitorId, TextMatcher, WindowRule, WindowRuleAction,
-    WindowRuleMatch, WindowRuleMode, WorkspaceId,
+    GameModePolicy, LayoutConfig, LayoutKind, LayoutOffset, MonitorId, TextMatcher, WindowRule,
+    WindowRuleAction, WindowRuleMatch, WindowRuleMode, WorkspaceId,
 };
 
 pub const DEFAULT_FILE_NAME: &str = "winland.toml";
@@ -21,6 +21,7 @@ pub const SUPPORTED_LAYOUTS: &[&str] = &[
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub general: GeneralConfig,
+    pub ui: UiConfig,
     pub hotkeys: HotkeysConfig,
     pub layout: LayoutSection,
     pub workspaces: WorkspacesConfig,
@@ -36,6 +37,7 @@ impl Config {
         let mut errors = Vec::new();
 
         validate_general(&self.general, &mut errors);
+        validate_ui(&self.ui, &mut errors);
         validate_layout(&self.layout, &mut errors);
         validate_workspaces(&self.workspaces, &mut errors);
         validate_hotkeys(&self.hotkeys, self.workspaces.count, &mut errors);
@@ -67,6 +69,10 @@ impl Config {
         .normalized()
     }
 
+    pub fn layout_offset(&self) -> LayoutOffset {
+        self.layout.offset.to_core()
+    }
+
     pub fn layout_config_for_monitor(
         &self,
         monitor: MonitorId,
@@ -90,6 +96,25 @@ impl Config {
             .map(|override_config| merge_layout_override(self.layout_config(), override_config))
             .unwrap_or(layout)
             .normalized()
+    }
+
+    pub fn layout_offset_for_monitor(&self, monitor: MonitorId, is_primary: bool) -> LayoutOffset {
+        let mut offset = self.layout.offset;
+
+        if is_primary
+            && let Some(override_config) = self.layout.per_monitor.get("primary")
+            && let Some(override_offset) = override_config.offset
+        {
+            offset = override_offset.merge_with(offset);
+        }
+
+        if let Some(override_config) = self.layout.per_monitor.get(&monitor.to_string())
+            && let Some(override_offset) = override_config.offset
+        {
+            offset = override_offset.merge_with(offset);
+        }
+
+        offset.to_core()
     }
 
     pub fn workspace_count(&self) -> u16 {
@@ -146,6 +171,12 @@ impl Default for GeneralConfig {
             log_level: "info".to_owned(),
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct UiConfig {
+    pub startup_commands: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -238,6 +269,7 @@ pub struct LayoutSection {
     pub default: String,
     pub gap: u16,
     pub border: u16,
+    pub offset: LayoutOffsetConfig,
     pub master_ratio_percent: u8,
     pub smart_split: bool,
     pub preserve_split: bool,
@@ -251,6 +283,7 @@ impl Default for LayoutSection {
             default: LayoutKind::MasterStack.name().to_owned(),
             gap: 0,
             border: 0,
+            offset: LayoutOffsetConfig::default(),
             master_ratio_percent: 50,
             smart_split: false,
             preserve_split: false,
@@ -266,9 +299,50 @@ pub struct LayoutOverride {
     pub layout: Option<String>,
     pub gap: Option<u16>,
     pub border: Option<u16>,
+    pub offset: Option<LayoutOffsetOverride>,
     pub master_ratio_percent: Option<u8>,
     pub smart_split: Option<bool>,
     pub preserve_split: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct LayoutOffsetConfig {
+    pub top: u16,
+    pub right: u16,
+    pub bottom: u16,
+    pub left: u16,
+}
+
+impl LayoutOffsetConfig {
+    pub fn to_core(self) -> LayoutOffset {
+        LayoutOffset::new(
+            i32::from(self.top),
+            i32::from(self.right),
+            i32::from(self.bottom),
+            i32::from(self.left),
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct LayoutOffsetOverride {
+    pub top: Option<u16>,
+    pub right: Option<u16>,
+    pub bottom: Option<u16>,
+    pub left: Option<u16>,
+}
+
+impl LayoutOffsetOverride {
+    pub fn merge_with(self, base: LayoutOffsetConfig) -> LayoutOffsetConfig {
+        LayoutOffsetConfig {
+            top: self.top.unwrap_or(base.top),
+            right: self.right.unwrap_or(base.right),
+            bottom: self.bottom.unwrap_or(base.bottom),
+            left: self.left.unwrap_or(base.left),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -845,10 +919,27 @@ fn validate_general(general: &GeneralConfig, errors: &mut Vec<String>) {
     }
 }
 
+fn validate_ui(ui: &UiConfig, errors: &mut Vec<String>) {
+    let mut seen = BTreeSet::new();
+    for (index, command) in ui.startup_commands.iter().enumerate() {
+        let command = command.trim();
+        if command.is_empty() {
+            errors.push(format!("ui.startup_commands[{index}] must not be empty"));
+            continue;
+        }
+        if !seen.insert(command.to_ascii_lowercase()) {
+            errors.push(format!(
+                "ui.startup_commands[{index}] duplicates an earlier startup command"
+            ));
+        }
+    }
+}
+
 fn validate_layout(layout: &LayoutSection, errors: &mut Vec<String>) {
     validate_layout_name("layout.default", &layout.default, errors);
     validate_gap("layout.gap", layout.gap, errors);
     validate_gap("layout.border", layout.border, errors);
+    validate_layout_offset("layout.offset", layout.offset, errors);
     validate_ratio(
         "layout.master_ratio_percent",
         layout.master_ratio_percent,
@@ -955,6 +1046,9 @@ fn validate_layout_override(
     if let Some(border) = value.border {
         validate_gap(&format!("{context}.border"), border, errors);
     }
+    if let Some(offset) = value.offset {
+        validate_layout_offset_override(&format!("{context}.offset"), offset, errors);
+    }
     if let Some(ratio) = value.master_ratio_percent {
         validate_ratio(&format!("{context}.master_ratio_percent"), ratio, errors);
     }
@@ -994,6 +1088,38 @@ fn validate_dwindle_flags(
 fn validate_gap(context: &str, value: u16, errors: &mut Vec<String>) {
     if value > 256 {
         errors.push(format!("{context} must be <= 256"));
+    }
+}
+
+fn validate_layout_offset(context: &str, value: LayoutOffsetConfig, errors: &mut Vec<String>) {
+    validate_layout_offset_edge(&format!("{context}.top"), value.top, errors);
+    validate_layout_offset_edge(&format!("{context}.right"), value.right, errors);
+    validate_layout_offset_edge(&format!("{context}.bottom"), value.bottom, errors);
+    validate_layout_offset_edge(&format!("{context}.left"), value.left, errors);
+}
+
+fn validate_layout_offset_override(
+    context: &str,
+    value: LayoutOffsetOverride,
+    errors: &mut Vec<String>,
+) {
+    if let Some(top) = value.top {
+        validate_layout_offset_edge(&format!("{context}.top"), top, errors);
+    }
+    if let Some(right) = value.right {
+        validate_layout_offset_edge(&format!("{context}.right"), right, errors);
+    }
+    if let Some(bottom) = value.bottom {
+        validate_layout_offset_edge(&format!("{context}.bottom"), bottom, errors);
+    }
+    if let Some(left) = value.left {
+        validate_layout_offset_edge(&format!("{context}.left"), left, errors);
+    }
+}
+
+fn validate_layout_offset_edge(context: &str, value: u16, errors: &mut Vec<String>) {
+    if value > 2048 {
+        errors.push(format!("{context} must be <= 2048"));
     }
 }
 
@@ -1372,8 +1498,10 @@ mod tests {
         config.validate().unwrap();
 
         assert_eq!(config.general.log_level, "info");
+        assert!(config.ui.startup_commands.is_empty());
         assert_eq!(config.workspace_count(), 9);
         assert_eq!(config.layout_config().master_ratio_percent, 50);
+        assert_eq!(config.layout_offset(), LayoutOffset::ZERO);
         assert_eq!(config.hotkeys.mode, HotkeyMode::AdvancedInterception);
         assert_eq!(config.hotkeys.panic_hotkey, "Ctrl+Alt+Shift+P");
         assert_eq!(config.hotkeys.override_latency_budget_micros, 250);
@@ -1427,6 +1555,9 @@ mod tests {
             [general]
             log_level = "debug"
 
+            [ui]
+            startup_commands = ["winland widget run taskbar"]
+
             [hotkeys]
             mode = "advanced-interception"
             panic_hotkey = "Ctrl+Alt+Shift+P"
@@ -1443,8 +1574,12 @@ mod tests {
             default = "dwindle"
             gap = 8
             border = 1
+            offset = { bottom = 40 }
             master_ratio_percent = 60
             smart_split = true
+
+            [layout.per_monitor]
+            primary = { offset = { bottom = 48 } }
 
             [workspaces]
             count = 2
@@ -1495,6 +1630,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.general.log_level, "debug");
+        assert_eq!(
+            config.ui.startup_commands,
+            vec!["winland widget run taskbar"]
+        );
         assert_eq!(config.hotkeys.mode, HotkeyMode::AdvancedInterception);
         assert!(config.hotkeys.bindings[0].override_app);
         assert_eq!(config.hotkeys.bindings[1].launch.as_deref(), Some("wt.exe"));
@@ -1503,6 +1642,11 @@ mod tests {
         assert_eq!(config.hotkeys.modifier_drag.modifiers, "Alt+Shift");
         assert_eq!(config.layout_config().kind, LayoutKind::Dwindle);
         assert_eq!(config.layout_config().gap, 8);
+        assert_eq!(config.layout_offset(), LayoutOffset::new(0, 0, 40, 0));
+        assert_eq!(
+            config.layout_offset_for_monitor(MonitorId(9), true),
+            LayoutOffset::new(0, 0, 48, 0)
+        );
         assert!(config.layout_config().smart_split);
         assert!(config.layout_config().preserve_split);
         assert_eq!(config.workspace_count(), 2);
@@ -1559,8 +1703,8 @@ mod tests {
             "2" = { layout = "vertical-stack", gap = 5 }
 
             [layout.per_monitor]
-            primary = { layout = "horizontal-stack", gap = 7 }
-            "0x2" = { layout = "dwindle", gap = 9 }
+            primary = { layout = "horizontal-stack", gap = 7, offset = { bottom = 40 } }
+            "0x2" = { layout = "dwindle", gap = 9, offset = { bottom = 0, left = 12 } }
             "#,
         )
         .unwrap();
@@ -1589,6 +1733,14 @@ mod tests {
                 ..LayoutConfig::default()
             }
         );
+        assert_eq!(
+            config.layout_offset_for_monitor(MonitorId(3), true),
+            LayoutOffset::new(0, 0, 40, 0)
+        );
+        assert_eq!(
+            config.layout_offset_for_monitor(MonitorId(2), true),
+            LayoutOffset::new(0, 0, 0, 12)
+        );
     }
 
     #[test]
@@ -1600,6 +1752,7 @@ mod tests {
 
             [layout]
             master_ratio_percent = 95
+            offset = { bottom = 4096 }
 
             [borders]
             width = 0
@@ -1635,6 +1788,7 @@ mod tests {
 
         assert!(output.contains("general.log_level"));
         assert!(output.contains("layout.master_ratio_percent"));
+        assert!(output.contains("layout.offset.bottom"));
         assert!(output.contains("borders.width"));
         assert!(output.contains("borders.active_color"));
         assert!(output.contains("game_mode.fullscreen_tolerance_px"));

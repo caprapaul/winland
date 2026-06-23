@@ -57,8 +57,8 @@ mod platform {
         HWND_NOTOPMOST, HWND_TOPMOST, IsIconic, IsWindowVisible, KBDLLHOOKSTRUCT, MINMAXINFO,
         MONITORINFOF_PRIMARY, MSG, MSLLHOOKSTRUCT, OBJID_WINDOW, PM_NOREMOVE, PeekMessageW,
         PostThreadMessageW, RegisterClassW, SMTO_ABORTIFHUNG, SW_HIDE, SW_SHOWNOACTIVATE,
-        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
-        SendMessageTimeoutW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
+        SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
+        SWP_SHOWWINDOW, SendMessageTimeoutW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
         SetWindowsHookExW, ShowWindow, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL,
         WH_MOUSE_LL, WINEVENT_OUTOFCONTEXT, WM_APP, WM_GETMINMAXINFO, WM_HOTKEY, WM_KEYDOWN,
         WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WM_QUIT, WM_SYSKEYDOWN,
@@ -206,6 +206,43 @@ mod platform {
             )
             .map_err(|source| Win32Error::Windows {
                 context: "SetWindowPos(HWND_NOTOPMOST)",
+                source,
+            })
+        }
+    }
+
+    pub fn configure_widget_window(handle: WindowHandle, rect: Rect, topmost: bool) -> Result<()> {
+        let hwnd = hwnd_from_handle(handle);
+
+        // SAFETY: hwnd belongs to a window created by the current widget process.
+        // Slint is responsible for creating frameless widget windows. These
+        // documented style bits keep the window panel-like and out of Alt-Tab;
+        // SetWindowPos applies the requested z-order and geometry.
+        unsafe {
+            let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+            let next_style = style & !(WS_CAPTION.0 as isize) & !(WS_THICKFRAME.0 as isize);
+            SetWindowLongPtrW(hwnd, GWL_STYLE, next_style);
+
+            let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            let next_ex_style =
+                ex_style | WS_EX_TOOLWINDOW.0 as isize | WS_EX_NOACTIVATE.0 as isize;
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, next_ex_style);
+
+            SetWindowPos(
+                hwnd,
+                if topmost {
+                    HWND_TOPMOST
+                } else {
+                    HWND_NOTOPMOST
+                },
+                rect.left,
+                rect.top,
+                rect.width(),
+                rect.height(),
+                SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW,
+            )
+            .map_err(|source| Win32Error::Windows {
+                context: "SetWindowPos(widget)",
                 source,
             })
         }
@@ -1690,6 +1727,15 @@ mod platform {
         if !unsafe { IsWindowVisible(hwnd).as_bool() } {
             return false;
         }
+        // SAFETY: hwnd is a candidate returned by WindowFromPoint/GetAncestor.
+        // Tool and no-activate windows are panel/utility surfaces, not app
+        // windows that modifier-drag should move.
+        let ex_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
+        if ex_style & WS_EX_TOOLWINDOW.0 as isize != 0
+            || ex_style & WS_EX_NOACTIVATE.0 as isize != 0
+        {
+            return false;
+        }
         if dwm_cloaked(hwnd) {
             return false;
         }
@@ -2544,6 +2590,14 @@ mod platform {
         Err(Win32Error::UnsupportedPlatform)
     }
 
+    pub fn configure_widget_window(
+        _handle: WindowHandle,
+        _rect: Rect,
+        _topmost: bool,
+    ) -> Result<()> {
+        Err(Win32Error::UnsupportedPlatform)
+    }
+
     pub fn window_rect_for_handle(_handle: WindowHandle) -> Result<Rect> {
         Err(Win32Error::UnsupportedPlatform)
     }
@@ -2657,6 +2711,7 @@ pub use platform::HotkeyRegistration;
 pub use platform::IpcServer;
 pub use platform::ModifierDragRegistration;
 pub use platform::WindowEventSubscription;
+pub use platform::configure_widget_window;
 pub use platform::cursor_position;
 pub use platform::enumerate_monitors;
 pub use platform::enumerate_windows;

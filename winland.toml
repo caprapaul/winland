@@ -7,7 +7,12 @@
 
 # Window rules are evaluated in order. Later matching rules override earlier
 # action fields, so put broad rules first and specific exceptions later.
-window_rules = []
+[[window_rules]]
+name = "ignore winland taskbar"
+[window_rules.match]
+title = "Winland Taskbar"
+[window_rules.action]
+manage = false
 
 # Example rule:
 # [[window_rules]]
@@ -33,6 +38,13 @@ window_rules = []
 [general]
 # One of: trace, debug, info, warn, error, off.
 log_level = "info"
+
+[ui]
+# Startup commands are launched by the daemon after its initial retile, whether
+# the daemon was started directly or through winland-shell.
+startup_commands = [
+  "winland widget run taskbar",
+]
 
 [hotkeys]
 # Advanced interception is the custom-shell default because Win-key shortcuts
@@ -117,6 +129,12 @@ default = "dwindle"
 # Geometry options are applied to tiling calculations.
 gap = 0
 border = 0
+
+# Reserve screen-edge space before tiling. This is separate from the widget
+# system itself: widgets are just processes; offsets are explicit layout input.
+# The taskbar starter slice reserves 40px at the bottom of every monitor.
+offset = { top = 0, right = 0, bottom = 40, left = 0 }
+
 master_ratio_percent = 50
 
 # Dwindle-only options. Smart split uses the cursor position inside the

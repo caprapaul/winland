@@ -10,6 +10,9 @@ clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 serde_json.workspace = true
+slint.workspace = true
+slint-interpreter.workspace = true
+spin_on.workspace = true
 winland-config = { path = "../winland-config" }
 winland-core = { path = "../winland-core" }
 winland-ipc = { path = "../winland-ipc" }

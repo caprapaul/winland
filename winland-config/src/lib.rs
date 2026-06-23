@@ -307,6 +307,7 @@ pub struct BehaviorConfig {
     pub drag_to_float: bool,
     pub retile_on_drag_end: bool,
     pub overflow_focus_policy: OverflowFocusPolicy,
+    pub overflow_float_persistence: OverflowFloatPersistence,
     pub focus_follows_mouse: bool,
     pub restore_previous_placement: bool,
     pub manage_minimized_windows: bool,
@@ -321,6 +322,7 @@ impl Default for BehaviorConfig {
             drag_to_float: true,
             retile_on_drag_end: true,
             overflow_focus_policy: OverflowFocusPolicy::TileFocused,
+            overflow_float_persistence: OverflowFloatPersistence::Permanent,
             focus_follows_mouse: false,
             restore_previous_placement: true,
             manage_minimized_windows: false,
@@ -393,6 +395,14 @@ pub enum OverflowFocusPolicy {
     #[default]
     TileFocused,
     FloatFocused,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum OverflowFloatPersistence {
+    #[default]
+    Permanent,
+    RetileOnDragEnd,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -1403,6 +1413,10 @@ mod tests {
             config.behavior.overflow_focus_policy,
             OverflowFocusPolicy::TileFocused
         );
+        assert_eq!(
+            config.behavior.overflow_float_persistence,
+            OverflowFloatPersistence::Permanent
+        );
         assert!(config.window_rules.is_empty());
     }
 
@@ -1443,6 +1457,7 @@ mod tests {
             drag_to_float = true
             retile_on_drag_end = false
             overflow_focus_policy = "float-focused"
+            overflow_float_persistence = "retile-on-drag-end"
 
             [borders]
             enabled = true
@@ -1498,6 +1513,10 @@ mod tests {
         assert_eq!(
             config.behavior.overflow_focus_policy,
             OverflowFocusPolicy::FloatFocused
+        );
+        assert_eq!(
+            config.behavior.overflow_float_persistence,
+            OverflowFloatPersistence::RetileOnDragEnd
         );
         assert!(config.borders.enabled);
         assert_eq!(config.borders.width, 4);

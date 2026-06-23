@@ -13,8 +13,8 @@ use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::MakeWriter;
 use winland_config::{
-    Config, HotkeyBindingConfig, HotkeyKey, HotkeyMode, HotkeyModifier, OverflowFocusPolicy,
-    TextMatcherConfig,
+    Config, HotkeyBindingConfig, HotkeyKey, HotkeyMode, HotkeyModifier, OverflowFloatPersistence,
+    OverflowFocusPolicy, TextMatcherConfig,
 };
 use winland_core::{
     DwindleSplit, FullscreenDetection, GameModeDetection, GameModePolicy, GameModeReason,
@@ -241,6 +241,7 @@ struct RuntimeConfig {
     drag_to_float: bool,
     retile_on_drag_end: bool,
     overflow_focus_policy: OverflowFocusPolicy,
+    overflow_float_persistence: OverflowFloatPersistence,
     borders: RuntimeBorderConfig,
     game_mode: RuntimeGameModeConfig,
 }
@@ -258,6 +259,7 @@ impl RuntimeConfig {
             drag_to_float: config.behavior.drag_to_float,
             retile_on_drag_end: config.behavior.retile_on_drag_end,
             overflow_focus_policy: config.behavior.overflow_focus_policy,
+            overflow_float_persistence: config.behavior.overflow_float_persistence,
             borders: RuntimeBorderConfig::from_config(&config.borders)?,
             game_mode: RuntimeGameModeConfig::from_config(config),
         })
@@ -802,7 +804,7 @@ struct DaemonState {
     previous_rects: BTreeMap<WindowHandle, Rect>,
     learned_size_constraints: BTreeMap<WindowHandle, WindowSizeConstraints>,
     window_monitor_overrides: BTreeMap<WindowHandle, MonitorId>,
-    overflow_floating: BTreeSet<WindowHandle>,
+    overflow_promoted_floating: BTreeSet<WindowHandle>,
     workspaces: WorkspaceManager,
     active_modifier_drag: Option<ActiveModifierDrag>,
     active_interactive_drag: Option<ActiveInteractiveDrag>,
@@ -927,7 +929,7 @@ impl DaemonState {
             previous_rects: BTreeMap::new(),
             learned_size_constraints: BTreeMap::new(),
             window_monitor_overrides: BTreeMap::new(),
-            overflow_floating: BTreeSet::new(),
+            overflow_promoted_floating: BTreeSet::new(),
             workspaces: WorkspaceManager::new(config.workspace_count),
             active_modifier_drag: None,
             active_interactive_drag: None,
@@ -1720,16 +1722,14 @@ impl DaemonState {
             "drag.end"
         );
 
-        if drag.started_temporary_float {
+        if drag.started_temporary_float || self.should_try_overflow_float_drop(event.window) {
             let monitors = winland_win32::enumerate_monitors()
                 .context("enumerate monitors after modifier drag end")?;
             let drop_context = DropContext {
                 rect: dropped_rect,
                 cursor: Some(event.cursor),
             };
-            if self.handle_movesize_end(event.window, &monitors, Some(drop_context))
-                && self.config.retile_on_drag_end
-            {
+            if self.handle_movesize_end(event.window, &monitors, Some(drop_context)) {
                 self.suppressed_modifier_drag_events.insert(event.window);
                 let assignments = self.tile_assignments(&monitors);
                 info!(
@@ -1921,10 +1921,6 @@ impl DaemonState {
     }
 
     fn window_snapshot_participation(&self, window: WindowHandle) -> WindowParticipationSnapshot {
-        if self.overflow_floating.contains(&window) {
-            return WindowParticipationSnapshot::OverflowFloating;
-        }
-
         match self.window_participation(window) {
             WindowParticipation::Tiled => WindowParticipationSnapshot::Tiled,
             WindowParticipation::Floating => WindowParticipationSnapshot::Floating,
@@ -2371,9 +2367,7 @@ impl DaemonState {
                     }
                 }
                 WindowEventKind::MoveSizeEnd => {
-                    if self.handle_movesize_end(event.window, monitors, None)
-                        && self.config.retile_on_drag_end
-                    {
+                    if self.handle_movesize_end(event.window, monitors, None) {
                         should_retile = true;
                     }
                 }
@@ -2430,24 +2424,164 @@ impl DaemonState {
     ) -> bool {
         self.finish_interactive_drag(window);
 
-        if !self.config.drag_to_float {
-            return false;
-        }
-
+        let mut temporary_float_cleared = false;
         if self.window_participation(window) == WindowParticipation::TemporarilyFloating {
             if let Some(drop_context) = drop_context {
-                self.reorder_temporary_float_by_drop_at(
+                self.reorder_window_by_drop_at(
                     window,
                     monitors,
                     drop_context.rect,
                     drop_context.cursor,
                 );
             } else {
-                self.reorder_temporary_float_by_drop(window, monitors);
+                self.reorder_window_by_drop(window, monitors);
             }
+            temporary_float_cleared = self.clear_temporary_float(window);
         }
 
-        self.clear_temporary_float(window)
+        let overflow_float_reabsorbed =
+            self.reabsorb_overflow_float_by_drop(window, monitors, drop_context);
+
+        overflow_float_reabsorbed || temporary_float_cleared && self.config.retile_on_drag_end
+    }
+
+    fn should_try_overflow_float_drop(&self, window: WindowHandle) -> bool {
+        self.config.overflow_float_persistence == OverflowFloatPersistence::RetileOnDragEnd
+            && self.overflow_promoted_floating.contains(&window)
+            && self.window_participation(window) == WindowParticipation::Floating
+    }
+
+    fn reabsorb_overflow_float_by_drop(
+        &mut self,
+        window: WindowHandle,
+        monitors: &[MonitorInfo],
+        drop_context: Option<DropContext>,
+    ) -> bool {
+        if !self.should_try_overflow_float_drop(window) {
+            return false;
+        }
+
+        let Some(drop_context) = drop_context.or_else(|| {
+            self.windows.get(&window).map(|window| DropContext {
+                rect: window.rect,
+                cursor: None,
+            })
+        }) else {
+            return false;
+        };
+
+        if !self.overflow_float_drop_would_fit(
+            window,
+            monitors,
+            drop_context.rect,
+            drop_context.cursor,
+        ) {
+            debug!(
+                window = %window,
+                "kept overflow-promoted floating window floating after drop because layout still would not fit"
+            );
+            return false;
+        }
+
+        self.set_window_participation(window, WindowParticipation::Tiled);
+        self.reorder_window_by_drop_at(window, monitors, drop_context.rect, drop_context.cursor);
+        info!(
+            window = %window,
+            "reabsorbed overflow-promoted floating window after drop"
+        );
+        true
+    }
+
+    fn overflow_float_drop_would_fit(
+        &self,
+        window: WindowHandle,
+        monitors: &[MonitorInfo],
+        dropped_rect: Rect,
+        cursor_position: Option<Point>,
+    ) -> bool {
+        let Some(monitor) = self.drop_target_monitor(dropped_rect, cursor_position, monitors)
+        else {
+            return false;
+        };
+        let mut handles = self.drop_target_handles(window, monitor, monitors);
+        let layout = self.config.layout_for_monitor(
+            monitor,
+            self.workspaces.active_workspace_for_monitor(monitor.id),
+        );
+
+        if layout.kind == LayoutKind::Dwindle && !handles.is_empty() {
+            return self.dwindle_drop_would_fit(
+                window,
+                dropped_rect,
+                cursor_position,
+                &handles,
+                monitor,
+                layout,
+            );
+        }
+
+        let drop_point = cursor_position.unwrap_or_else(|| dropped_rect.center());
+        let local_index = self.drop_insert_index_at_point(window, drop_point, &handles, monitor);
+        handles.insert(local_index, window);
+        let assignments = self.preview_tile_assignments(monitor, &handles, layout, cursor_position);
+        tile_assignments_fit_work_area(monitor.work_area, &assignments)
+    }
+
+    fn dwindle_drop_would_fit(
+        &self,
+        window: WindowHandle,
+        dropped_rect: Rect,
+        cursor_position: Option<Point>,
+        target_handles: &[WindowHandle],
+        monitor: &MonitorInfo,
+        layout: LayoutConfig,
+    ) -> bool {
+        let drop_point = cursor_position.unwrap_or_else(|| dropped_rect.center());
+        let workspace = self.workspaces.active_workspace_for_monitor(monitor.id);
+        let split_key = (workspace, monitor.id);
+        let mut preview_splits = self
+            .dwindle_splits
+            .get(&split_key)
+            .cloned()
+            .unwrap_or_default();
+        let layout_windows = self.layout_windows_for_handles(target_handles);
+        let assignments = tile_layout_windows_with_state(
+            monitor.work_area,
+            &layout_windows,
+            layout,
+            None,
+            Some(&mut preview_splits),
+        );
+        let Some(target_assignment) = assignments
+            .iter()
+            .find(|assignment| assignment.rect.contains(drop_point))
+            .or_else(|| nearest_assignment(drop_point, &assignments))
+        else {
+            return false;
+        };
+
+        let direction = split_direction_for_point(target_assignment.rect, drop_point);
+        let mut handles = target_handles.to_vec();
+        let insert_at = handles
+            .iter()
+            .position(|handle| *handle == target_assignment.window)
+            .map(|index| index + 1)
+            .unwrap_or(handles.len());
+        handles.insert(insert_at, window);
+        preview_splits.push(DwindleSplit {
+            target: target_assignment.window,
+            new_window: window,
+            direction,
+        });
+        let layout_windows = self.layout_windows_for_handles(&handles);
+        let assignments = tile_layout_windows_with_state(
+            monitor.work_area,
+            &layout_windows,
+            layout,
+            None,
+            Some(&mut preview_splits),
+        );
+        tile_assignments_fit_work_area(monitor.work_area, &assignments)
     }
 
     fn start_interactive_drag_from_moved_events(
@@ -2604,53 +2738,28 @@ impl DaemonState {
         true
     }
 
-    fn reorder_temporary_float_by_drop(
-        &mut self,
-        window: WindowHandle,
-        monitors: &[MonitorInfo],
-    ) -> bool {
+    fn reorder_window_by_drop(&mut self, window: WindowHandle, monitors: &[MonitorInfo]) -> bool {
         let Some(window_info) = self.windows.get(&window) else {
             return false;
         };
-        self.reorder_temporary_float_by_drop_at(window, monitors, window_info.rect, None)
+        self.reorder_window_by_drop_at(window, monitors, window_info.rect, None)
     }
 
-    fn reorder_temporary_float_by_drop_at(
+    fn reorder_window_by_drop_at(
         &mut self,
         window: WindowHandle,
         monitors: &[MonitorInfo],
         dropped_rect: Rect,
         cursor_position: Option<Point>,
     ) -> bool {
-        let Some(target_monitor) = cursor_position
-            .and_then(|point| monitor_for_point(point, monitors))
-            .or_else(|| monitor_for_rect(dropped_rect, monitors))
+        let Some(monitor) = self.drop_target_monitor(dropped_rect, cursor_position, monitors)
         else {
             return false;
         };
-        let Some(monitor) = monitors.iter().find(|monitor| monitor.id == target_monitor) else {
-            return false;
-        };
+        let target_monitor = monitor.id;
         self.window_monitor_overrides.insert(window, target_monitor);
 
-        let target_handles: Vec<_> = self
-            .tile_order
-            .iter()
-            .copied()
-            .filter(|handle| *handle != window)
-            .filter(|handle| self.window_participation(*handle).is_tiled())
-            .filter(|handle| {
-                self.windows.get(handle).is_some_and(|candidate| {
-                    self.is_tilable_window_on_monitor(*handle, monitor.id)
-                        && self.monitor_owns_window_rect(
-                            *handle,
-                            monitor,
-                            self.window_layout_rect(*handle, candidate),
-                            monitors,
-                        )
-                })
-            })
-            .collect();
+        let target_handles = self.drop_target_handles(window, monitor, monitors);
         let layout = self.config.layout_for_monitor(
             monitor,
             self.workspaces.active_workspace_for_monitor(monitor.id),
@@ -2674,6 +2783,43 @@ impl DaemonState {
             self.drop_insert_index_at_point(window, drop_point, &target_handles, monitor);
 
         self.reinsert_window_at_local_index(window, &target_handles, local_index)
+    }
+
+    fn drop_target_monitor<'a>(
+        &self,
+        dropped_rect: Rect,
+        cursor_position: Option<Point>,
+        monitors: &'a [MonitorInfo],
+    ) -> Option<&'a MonitorInfo> {
+        let target_monitor = cursor_position
+            .and_then(|point| monitor_for_point(point, monitors))
+            .or_else(|| monitor_for_rect(dropped_rect, monitors))?;
+        monitors.iter().find(|monitor| monitor.id == target_monitor)
+    }
+
+    fn drop_target_handles(
+        &self,
+        window: WindowHandle,
+        monitor: &MonitorInfo,
+        monitors: &[MonitorInfo],
+    ) -> Vec<WindowHandle> {
+        self.tile_order
+            .iter()
+            .copied()
+            .filter(|handle| *handle != window)
+            .filter(|handle| self.window_participation(*handle).is_tiled())
+            .filter(|handle| {
+                self.windows.get(handle).is_some_and(|candidate| {
+                    self.is_tilable_window_on_monitor(*handle, monitor.id)
+                        && self.monitor_owns_window_rect(
+                            *handle,
+                            monitor,
+                            self.window_layout_rect(*handle, candidate),
+                            monitors,
+                        )
+                })
+            })
+            .collect()
     }
 
     fn retarget_dwindle_drop(
@@ -2996,7 +3142,7 @@ impl DaemonState {
 
         let cursor_position = winland_win32::cursor_position().ok();
         let mut assignments = Vec::new();
-        let mut next_overflow_floating = BTreeSet::new();
+        let mut promoted_overflow_windows = 0usize;
 
         for monitor in monitors {
             let active_workspace = self.workspaces.active_workspace_for_monitor(monitor.id);
@@ -3012,7 +3158,12 @@ impl DaemonState {
             let layout = self.config.layout_for_monitor(monitor, active_workspace);
             let overflow_plan =
                 self.resolve_overflow_for_monitor(monitor, &handles, layout, cursor_position);
-            next_overflow_floating.extend(overflow_plan.overflow_windows.iter().copied());
+            for window in &overflow_plan.overflow_windows {
+                if self.window_participation(*window).is_tiled() {
+                    self.promote_overflow_window_to_floating(*window);
+                    promoted_overflow_windows += 1;
+                }
+            }
             let layout_windows = self.layout_windows_for_handles(&overflow_plan.tiled_windows);
             let monitor_assignments = if layout.kind == LayoutKind::Dwindle {
                 let splits = self
@@ -3034,14 +3185,12 @@ impl DaemonState {
             assignments.extend(monitor_assignments);
         }
 
-        if self.overflow_floating != next_overflow_floating {
+        if promoted_overflow_windows > 0 {
             debug!(
-                old_count = self.overflow_floating.len(),
-                new_count = next_overflow_floating.len(),
-                "updated automatic overflow floating windows"
+                promoted_overflow_windows,
+                "promoted overflow windows to persistent floating"
             );
         }
-        self.overflow_floating = next_overflow_floating;
 
         assignments
     }
@@ -3820,8 +3969,8 @@ impl DaemonState {
             })
             .map(|(handle, monitor)| (*handle, *monitor))
             .collect();
-        refreshed.overflow_floating = self
-            .overflow_floating
+        refreshed.overflow_promoted_floating = self
+            .overflow_promoted_floating
             .iter()
             .copied()
             .filter(|handle| known_workspace_windows.contains(handle))
@@ -3904,7 +4053,7 @@ impl DaemonState {
                 if self.participation.remove(&handle).is_some() {
                     stats.set_tiled += 1;
                 }
-                self.overflow_floating.remove(&handle);
+                self.overflow_promoted_floating.remove(&handle);
                 continue;
             }
 
@@ -4093,6 +4242,7 @@ impl DaemonState {
         window: WindowHandle,
         participation: WindowParticipation,
     ) {
+        self.overflow_promoted_floating.remove(&window);
         match participation {
             WindowParticipation::Tiled => {
                 self.participation.remove(&window);
@@ -4101,6 +4251,12 @@ impl DaemonState {
                 self.participation.insert(window, participation);
             }
         }
+    }
+
+    fn promote_overflow_window_to_floating(&mut self, window: WindowHandle) {
+        self.remember_previous_rect(window);
+        self.set_window_participation(window, WindowParticipation::Floating);
+        self.overflow_promoted_floating.insert(window);
     }
 
     fn remember_previous_rect(&mut self, window: WindowHandle) {
@@ -4290,7 +4446,7 @@ impl DaemonState {
 
     fn is_floating_z_order_window(&self, handle: WindowHandle, monitors: &[MonitorInfo]) -> bool {
         let participation = self.window_participation(handle);
-        if !participation.is_floating() && !self.overflow_floating.contains(&handle) {
+        if !participation.is_floating() {
             return false;
         }
 
@@ -4354,12 +4510,10 @@ impl DaemonState {
             .filter_map(|(handle, window)| {
                 let participation = self.window_participation(*handle);
                 let focused = self.foreground == Some(*handle);
-                let floating =
-                    participation.is_floating() || self.overflow_floating.contains(handle);
 
                 let color = if focused {
                     config.active_color
-                } else if floating {
+                } else if participation.is_floating() {
                     config.floating_color
                 } else if config.show_inactive {
                     config.inactive_color
@@ -4371,6 +4525,8 @@ impl DaemonState {
                     window: *handle,
                     rect: window.rect,
                     color,
+                    focused,
+                    floating: participation.is_floating(),
                 })
             })
             .collect()
@@ -4383,7 +4539,8 @@ impl DaemonState {
             .map(|candidate| (candidate.window, candidate))
             .collect();
 
-        self.border_retention_candidates(monitors)
+        let mut updates: Vec<_> = self
+            .border_retention_candidates(monitors)
             .into_iter()
             .map(|candidate| {
                 let visible = visible_candidates.contains_key(&candidate.window);
@@ -4404,7 +4561,20 @@ impl DaemonState {
                     visible,
                 }
             })
-            .collect()
+            .collect();
+        updates.sort_by_key(|update| {
+            let visible = visible_candidates.get(&update.window);
+            let layer = visible
+                .map(|candidate| match (candidate.floating, candidate.focused) {
+                    (true, true) => 4,
+                    (true, false) => 3,
+                    (false, true) => 2,
+                    (false, false) => 1,
+                })
+                .unwrap_or(0);
+            (update.visible, layer)
+        });
+        updates
     }
 
     fn border_retention_candidates(&self, monitors: &[MonitorInfo]) -> Vec<BorderCandidate> {
@@ -4428,12 +4598,10 @@ impl DaemonState {
             .map(|(handle, window)| {
                 let participation = self.window_participation(*handle);
                 let focused = self.foreground == Some(*handle);
-                let floating =
-                    participation.is_floating() || self.overflow_floating.contains(handle);
 
                 let color = if focused {
                     config.active_color
-                } else if floating {
+                } else if participation.is_floating() {
                     config.floating_color
                 } else {
                     config.inactive_color
@@ -4443,6 +4611,8 @@ impl DaemonState {
                     window: *handle,
                     rect: window.rect,
                     color,
+                    focused,
+                    floating: participation.is_floating(),
                 }
             })
             .collect()
@@ -4649,6 +4819,8 @@ struct BorderCandidate {
     window: WindowHandle,
     rect: Rect,
     color: BorderColor,
+    focused: bool,
+    floating: bool,
 }
 
 fn count_events(batch: &[WindowEvent], kind: WindowEventKind) -> usize {
@@ -5594,7 +5766,14 @@ mod tests {
                 rect: work_area,
             }]
         );
-        assert_eq!(state.overflow_floating, BTreeSet::from([WindowHandle(2)]));
+        assert_eq!(
+            state.window_participation(WindowHandle(2)),
+            WindowParticipation::Floating
+        );
+        assert_eq!(
+            state.overflow_promoted_floating,
+            BTreeSet::from([WindowHandle(2)])
+        );
         assert_eq!(
             state.floating_z_order_windows(std::slice::from_ref(&monitor)),
             vec![WindowHandle(2)]
@@ -5622,7 +5801,14 @@ mod tests {
                 rect: work_area,
             }]
         );
-        assert_eq!(state.overflow_floating, BTreeSet::from([WindowHandle(1)]));
+        assert_eq!(
+            state.window_participation(WindowHandle(1)),
+            WindowParticipation::Floating
+        );
+        assert_eq!(
+            state.overflow_promoted_floating,
+            BTreeSet::from([WindowHandle(1)])
+        );
     }
 
     #[test]
@@ -5649,7 +5835,7 @@ mod tests {
             }]
         );
         assert_eq!(
-            state.overflow_floating,
+            state.overflow_promoted_floating,
             BTreeSet::from([WindowHandle(2), WindowHandle(3)])
         );
     }
@@ -5668,11 +5854,18 @@ mod tests {
         let plan = state.plan_command(DaemonCommand::Retile, &[monitor]);
 
         assert!(plan.moves.is_empty());
-        assert_eq!(state.overflow_floating, BTreeSet::from([WindowHandle(1)]));
+        assert_eq!(
+            state.window_participation(WindowHandle(1)),
+            WindowParticipation::Floating
+        );
+        assert_eq!(
+            state.overflow_promoted_floating,
+            BTreeSet::from([WindowHandle(1)])
+        );
     }
 
     #[test]
-    fn overflow_windows_are_reconsidered_on_next_retile() {
+    fn overflow_windows_stay_floating_after_they_can_fit_by_default() {
         let monitor = primary_test_monitor();
         let mut first = window(1, "One", Rect::from_size(0, 0, 100, 100));
         first.size_constraints = winland_core::WindowSizeConstraints::minimum(700, 0);
@@ -5682,7 +5875,10 @@ mod tests {
         state.foreground = Some(WindowHandle(1));
 
         let _ = state.plan_command(DaemonCommand::Retile, std::slice::from_ref(&monitor));
-        assert_eq!(state.overflow_floating, BTreeSet::from([WindowHandle(2)]));
+        assert_eq!(
+            state.overflow_promoted_floating,
+            BTreeSet::from([WindowHandle(2)])
+        );
 
         state
             .windows
@@ -5691,8 +5887,84 @@ mod tests {
             .size_constraints = winland_core::WindowSizeConstraints::NONE;
         let plan = state.plan_command(DaemonCommand::Retile, &[monitor]);
 
-        assert_eq!(state.overflow_floating, BTreeSet::new());
-        assert_eq!(plan.moves.len(), 2);
+        assert_eq!(
+            state.window_participation(WindowHandle(2)),
+            WindowParticipation::Floating
+        );
+        assert_eq!(
+            state.overflow_promoted_floating,
+            BTreeSet::from([WindowHandle(2)])
+        );
+        assert_eq!(plan.moves.len(), 1);
+    }
+
+    #[test]
+    fn overflow_promoted_window_retiles_after_explicit_drop_when_configured() {
+        let monitor = primary_test_monitor();
+        let mut first = window(1, "One", Rect::from_size(0, 0, 100, 100));
+        first.size_constraints = winland_core::WindowSizeConstraints::minimum(700, 0);
+        let mut second = window(2, "Two", Rect::from_size(200, 0, 100, 100));
+        second.size_constraints = winland_core::WindowSizeConstraints::minimum(700, 0);
+        let mut state = daemon_state([first, second]);
+        state.config.overflow_float_persistence = OverflowFloatPersistence::RetileOnDragEnd;
+        state.foreground = Some(WindowHandle(1));
+
+        let _ = state.plan_command(DaemonCommand::Retile, std::slice::from_ref(&monitor));
+        assert_eq!(
+            state.window_participation(WindowHandle(2)),
+            WindowParticipation::Floating
+        );
+
+        state
+            .windows
+            .get_mut(&WindowHandle(2))
+            .unwrap()
+            .size_constraints = winland_core::WindowSizeConstraints::NONE;
+
+        assert!(state.handle_movesize_end(
+            WindowHandle(2),
+            std::slice::from_ref(&monitor),
+            Some(DropContext {
+                rect: Rect::from_size(800, 0, 100, 100),
+                cursor: Some(Point { x: 850, y: 50 }),
+            }),
+        ));
+        assert_eq!(
+            state.window_participation(WindowHandle(2)),
+            WindowParticipation::Tiled
+        );
+        assert_eq!(state.overflow_promoted_floating, BTreeSet::new());
+    }
+
+    #[test]
+    fn overflow_promoted_window_stays_floating_after_drop_when_layout_still_will_not_fit() {
+        let monitor = primary_test_monitor();
+        let mut first = window(1, "One", Rect::from_size(0, 0, 100, 100));
+        first.size_constraints = winland_core::WindowSizeConstraints::minimum(700, 0);
+        let mut second = window(2, "Two", Rect::from_size(200, 0, 100, 100));
+        second.size_constraints = winland_core::WindowSizeConstraints::minimum(700, 0);
+        let mut state = daemon_state([first, second]);
+        state.config.overflow_float_persistence = OverflowFloatPersistence::RetileOnDragEnd;
+        state.foreground = Some(WindowHandle(1));
+
+        let _ = state.plan_command(DaemonCommand::Retile, std::slice::from_ref(&monitor));
+
+        assert!(!state.handle_movesize_end(
+            WindowHandle(2),
+            std::slice::from_ref(&monitor),
+            Some(DropContext {
+                rect: Rect::from_size(800, 0, 100, 100),
+                cursor: Some(Point { x: 850, y: 50 }),
+            }),
+        ));
+        assert_eq!(
+            state.window_participation(WindowHandle(2)),
+            WindowParticipation::Floating
+        );
+        assert_eq!(
+            state.overflow_promoted_floating,
+            BTreeSet::from([WindowHandle(2)])
+        );
     }
 
     #[test]
@@ -6080,7 +6352,7 @@ mod tests {
         ]);
         state.set_window_participation(WindowHandle(1), WindowParticipation::TemporarilyFloating);
 
-        assert!(state.reorder_temporary_float_by_drop_at(
+        assert!(state.reorder_window_by_drop_at(
             WindowHandle(1),
             &[primary_test_monitor()],
             Rect::from_size(850, 500, 100, 100),
@@ -6102,7 +6374,7 @@ mod tests {
         ]);
         state.set_window_participation(WindowHandle(1), WindowParticipation::TemporarilyFloating);
 
-        assert!(state.reorder_temporary_float_by_drop_at(
+        assert!(state.reorder_window_by_drop_at(
             WindowHandle(1),
             &[primary_test_monitor()],
             Rect::from_size(0, 0, 100, 100),
@@ -6801,7 +7073,7 @@ mod tests {
         ]);
         state.set_window_participation(WindowHandle(2), WindowParticipation::Floating);
         state.set_window_participation(WindowHandle(3), WindowParticipation::TemporarilyFloating);
-        state.overflow_floating.insert(WindowHandle(4));
+        state.promote_overflow_window_to_floating(WindowHandle(4));
         state.foreground = Some(WindowHandle(3));
 
         let windows = state.floating_z_order_windows(&[primary_test_monitor()]);
@@ -6821,7 +7093,7 @@ mod tests {
         ]);
         state.foreground = Some(WindowHandle(1));
         state.set_window_participation(WindowHandle(2), WindowParticipation::Floating);
-        state.overflow_floating.insert(WindowHandle(3));
+        state.promote_overflow_window_to_floating(WindowHandle(3));
 
         let windows = state.floating_z_order_windows(&[primary_test_monitor()]);
 
@@ -7108,14 +7380,14 @@ mod tests {
     }
 
     #[test]
-    fn state_snapshot_reports_constrained_overflow_and_hidden_workspace_status() {
+    fn state_snapshot_reports_constrained_floating_and_hidden_workspace_status() {
         let mut constrained = window(1, "Constrained", Rect::from_size(0, 0, 100, 100));
         constrained.size_constraints = WindowSizeConstraints::minimum(500, 300);
         let mut state = daemon_state([
             constrained,
             window(2, "Overflow", Rect::from_size(200, 0, 100, 100)),
         ]);
-        state.overflow_floating.insert(WindowHandle(2));
+        state.promote_overflow_window_to_floating(WindowHandle(2));
         state
             .workspaces
             .move_window_to_workspace(WindowHandle(2), WorkspaceId(2));
@@ -7126,7 +7398,7 @@ mod tests {
         assert!(snapshot.windows[0].constrained);
         assert_eq!(
             snapshot.windows[1].participation,
-            WindowParticipationSnapshot::OverflowFloating
+            WindowParticipationSnapshot::Floating
         );
         assert!(!snapshot.windows[1].visible_on_active_workspace);
     }
@@ -7327,6 +7599,50 @@ mod tests {
     }
 
     #[test]
+    fn border_updates_layer_floating_borders_above_focused_tiled_borders() {
+        let mut state = daemon_state([
+            window(1, "Focused Tiled", Rect::from_size(0, 0, 300, 300)),
+            window(2, "Floating", Rect::from_size(200, 0, 300, 300)),
+        ]);
+        state.config.borders.enabled = true;
+        state.foreground = Some(WindowHandle(1));
+        state.set_window_participation(WindowHandle(2), WindowParticipation::Floating);
+
+        let updates = state.border_updates(&[primary_test_monitor()]);
+
+        assert_eq!(
+            updates
+                .iter()
+                .map(|update| update.window)
+                .collect::<Vec<_>>(),
+            vec![WindowHandle(1), WindowHandle(2)]
+        );
+    }
+
+    #[test]
+    fn border_updates_layer_focused_floating_border_above_other_floating_borders() {
+        let mut state = daemon_state([
+            window(1, "Floating", Rect::from_size(0, 0, 300, 300)),
+            window(2, "Focused Floating", Rect::from_size(200, 0, 300, 300)),
+            window(3, "Tiled", Rect::from_size(400, 0, 300, 300)),
+        ]);
+        state.config.borders.enabled = true;
+        state.foreground = Some(WindowHandle(2));
+        state.set_window_participation(WindowHandle(1), WindowParticipation::Floating);
+        state.set_window_participation(WindowHandle(2), WindowParticipation::Floating);
+
+        let updates = state.border_updates(&[primary_test_monitor()]);
+
+        assert_eq!(
+            updates
+                .iter()
+                .map(|update| update.window)
+                .collect::<Vec<_>>(),
+            vec![WindowHandle(3), WindowHandle(1), WindowHandle(2)]
+        );
+    }
+
+    #[test]
     fn border_candidates_hide_all_for_focused_fullscreen_window() {
         let mut state = daemon_state([
             window(1, "Fullscreen", primary_test_monitor().rect),
@@ -7492,7 +7808,7 @@ mod tests {
             previous_rects: BTreeMap::new(),
             learned_size_constraints: BTreeMap::new(),
             window_monitor_overrides: BTreeMap::new(),
-            overflow_floating: BTreeSet::new(),
+            overflow_promoted_floating: BTreeSet::new(),
             workspaces: WorkspaceManager::new(9),
             active_modifier_drag: None,
             active_interactive_drag: None,

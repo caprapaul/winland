@@ -15,7 +15,7 @@ The project is an early prototype focused on correctness, safety, and recoverabi
 - `RegisterHotKey` mode, plus opt-in advanced low-level keyboard interception.
 - Modifier-drag window movement through a low-level mouse hook.
 - Window rules for manage/ignore, float/tile, workspace assignment, always-on-workspace, and game/fullscreen behavior.
-- Constraint-aware tiling that learns fixed or minimum window sizes and floats overflow windows when needed.
+- Constraint-aware tiling that learns fixed or minimum window sizes and promotes overflow windows to floating when needed.
 - Optional lightweight Win32 border overlay feedback.
 - Game-mode hardening for fullscreen windows and configured game executables.
 - Local named-pipe IPC for state queries and explicit config reload.

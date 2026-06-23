@@ -82,6 +82,7 @@ dynamic_retile = true
 drag_to_float = true
 retile_on_drag_end = true
 overflow_focus_policy = "tile-focused"
+overflow_float_persistence = "permanent"
 focus_follows_mouse = false
 restore_previous_placement = true
 manage_minimized_windows = false
@@ -145,6 +146,7 @@ The root [winland.toml](../winland.toml) has a larger annotated sample.
 | `behavior.drag_to_float` | `true` |
 | `behavior.retile_on_drag_end` | `true` |
 | `behavior.overflow_focus_policy` | `"tile-focused"` |
+| `behavior.overflow_float_persistence` | `"permanent"` |
 | `borders.enabled` | `false` |
 | `borders.width` | `3` |
 | `game_mode.enabled` | `true` |
@@ -227,6 +229,7 @@ Implemented:
 | `drag_to_float` | Temporarily float a tiled window while the user moves/resizes it. |
 | `retile_on_drag_end` | Return temporary floats to the layout after the drag ends. |
 | `overflow_focus_policy` | `tile-focused` floats other overflow windows first; `float-focused` floats the focused window first. |
+| `overflow_float_persistence` | `permanent` keeps overflow-floated windows floating until `toggle-float`; `retile-on-drag-end` lets a user drag/drop the window back into tiling when the resulting layout fits. |
 
 Parsed but currently reserved or only partially represented in state: `focus_follows_mouse`, `restore_previous_placement`, `manage_minimized_windows`, and `avoid_fullscreen_windows`. Minimized and fullscreen-like windows are still handled conservatively by the current filtering and game-mode paths.
 
@@ -238,6 +241,8 @@ Colors must use `#RRGGBB`. Width must be `1..=64`.
 
 Borders are cleared when disabled, when game mode says to hide them, and when `disable_when_fullscreen = true` and the focused window is fullscreen or not manageable.
 
+Border overlays are layered behind their own target windows. Floating target windows are raised before border sync, so floating borders sit above tiled windows but below their associated floating windows.
+
 ## Game Mode
 
 See [GAME_MODE.md](GAME_MODE.md). Executable entries are process file names only, not paths, and are case-insensitive. Both `game_exes` and `ignored_exes` make matching windows unmanageable and can activate game mode when focused.
@@ -245,4 +250,3 @@ See [GAME_MODE.md](GAME_MODE.md). Executable entries are process file names only
 ## Window Rules
 
 See [RULES.md](RULES.md). Rules are evaluated in order; later matching rules override earlier action fields.
-

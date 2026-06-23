@@ -48,7 +48,7 @@ The daemon stores:
 - learned size constraints
 - per-workspace/per-monitor state
 - monitor ownership overrides
-- overflow-floating state
+- overflow-promoted floating state
 - game-mode activation
 
 For a retile:
@@ -58,7 +58,7 @@ For a retile:
 3. Skip all layout if global game-mode pause is active.
 4. For each monitor, pick the active workspace.
 5. Select tiled windows owned by that monitor and visible on that monitor's workspace.
-6. Resolve overflow by floating windows until assignments fit the work area.
+6. Resolve overflow by promoting windows to floating until assignments fit the work area.
 7. Compute core layout assignments.
 8. Move windows through `SetWindowPos`.
 9. Read accepted rectangles and learn constraints if Windows refused requested sizes.
@@ -96,6 +96,8 @@ Current commands:
 ## Border Manager
 
 The border manager runs a separate Win32 message-loop thread. It creates transparent, no-activate overlay windows around managed windows. The daemon sends sync/clear commands to that worker and posts a thread message.
+
+Border overlays are restacked on every visible sync. The daemon raises floating target windows before syncing border geometry, then the worker inserts each border immediately behind its own target window. The intended z-order is tiled border, tiled window, inactive floating border, inactive floating window, focused floating border, focused floating window.
 
 Border candidates are filtered by:
 

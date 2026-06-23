@@ -48,7 +48,7 @@ Likely causes:
 - You toggled it with `toggle-float`.
 - A rule sets `float = true`.
 - It is temporarily floating during drag/resize.
-- It became `overflow-floating` because its constraints made the layout not fit.
+- It was promoted to floating because its constraints made the layout not fit.
 
 Diagnose:
 
@@ -69,11 +69,18 @@ process_name = "app.exe"
 float = false
 ```
 
-If it is overflow-floating, reduce `gap`/`border`, reduce window count on that monitor/workspace, or set:
+If it was promoted by overflow, reduce `gap`/`border`, reduce window count on that monitor/workspace, or set:
 
 ```toml
 [behavior]
 overflow_focus_policy = "float-focused"
+```
+
+By default overflow-promoted windows remain normal floating until `toggle-float`. To allow manual drag/drop retiling when the target layout fits:
+
+```toml
+[behavior]
+overflow_float_persistence = "retile-on-drag-end"
 ```
 
 ## A Window Is Ignored
@@ -200,4 +207,3 @@ Try `retile`, reload config, or restart the daemon to clear transient state.
 ## Elevated Windows Do Not Move
 
 Windows can block lower-integrity processes from moving elevated windows. Run the daemon elevated only when you need to tile elevated windows and understand the security tradeoff. The experimental shell docs include an elevated-daemon VM path, but normal Winland usage does not require shell replacement.
-

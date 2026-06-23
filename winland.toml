@@ -163,6 +163,16 @@ drag_to_float = true
 # Reabsorb temporarily floating windows into the tiled layout when drag/resize ends.
 retile_on_drag_end = true
 
+# When constraints make a layout impossible, keep the focused window tiled by
+# floating other windows first. Use "float-focused" to float the focused window
+# before other candidates.
+overflow_focus_policy = "tile-focused"
+
+# Overflow-floated windows become normal floating windows by default. Set to
+# "retile-on-drag-end" to let an explicit drag/drop reinsert them once the
+# target layout can fit.
+overflow_float_persistence = "permanent"
+
 # Reserved for behavior policy. Kept explicit so config can grow without
 # changing the shape users already edit.
 focus_follows_mouse = false

@@ -1862,16 +1862,17 @@ mod platform {
                 debug!(window = %self.window, ?color, "updated border focus state");
             }
 
-            if self.rect != Some(rect) || self.width != width || !self.visible {
-                let side_rects = border_side_rects(rect, width);
-                for (hwnd, side_rect) in self.sides.into_iter().zip(side_rects) {
-                    position_border_side(hwnd, hwnd_from_handle(self.window), side_rect);
-                }
-                debug!(window = %self.window, rect = %rect, width, "repositioned border overlay");
-                self.rect = Some(rect);
-                self.width = width;
-                self.visible = true;
+            let geometry_changed = self.rect != Some(rect) || self.width != width;
+            let side_rects = border_side_rects(rect, width);
+            for (hwnd, side_rect) in self.sides.into_iter().zip(side_rects) {
+                position_border_side(hwnd, hwnd_from_handle(self.window), side_rect);
             }
+            if geometry_changed || !self.visible {
+                debug!(window = %self.window, rect = %rect, width, "repositioned border overlay");
+            }
+            self.rect = Some(rect);
+            self.width = width;
+            self.visible = true;
         }
 
         fn hide(&mut self) {
@@ -1989,8 +1990,10 @@ mod platform {
 
     fn position_border_side(hwnd: HWND, target: HWND, rect: Rect) {
         // SAFETY: hwnd is a border side HWND owned by the overlay worker.
-        // Inserting just behind the target keeps borders from drawing above a
-        // window the user drags across them while still avoiding activation.
+        // The daemon raises floating target windows before border sync. Inserting
+        // each border immediately behind its own target gives the intended stack:
+        // tiled border/window, inactive floating border/window, focused floating
+        // border/window, while keeping border overlays non-activating.
         if let Err(error) = unsafe {
             SetWindowPos(
                 hwnd,

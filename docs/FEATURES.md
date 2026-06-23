@@ -36,7 +36,7 @@ Gaps and layout border reservation are applied in layout math. `dwindle` keeps a
 
 Winland reads minimum/maximum sizing information through `WM_GETMINMAXINFO` when plausible. It also learns minimum sizes from windows that refuse a requested tile size. The daemon retries layout feedback passes and marks windows as constrained in `state --json`.
 
-When assignments cannot fit inside a monitor work area without overlap or empty rectangles, Winland automatically treats one or more windows as `overflow-floating`. By default it keeps the focused window tiled and floats other windows first. Set:
+When assignments cannot fit inside a monitor work area without overlap or empty rectangles, Winland automatically promotes one or more windows to normal floating. By default it keeps the focused window tiled and floats other windows first. Set:
 
 ```toml
 [behavior]
@@ -44,6 +44,15 @@ overflow_focus_policy = "float-focused"
 ```
 
 to float the focused window first.
+
+Overflow-floated windows stay floating until the user toggles them tiled again. Set:
+
+```toml
+[behavior]
+overflow_float_persistence = "retile-on-drag-end"
+```
+
+to let an explicit drag/drop reinsert an overflow-floated window when the resulting layout can fit.
 
 ## Floating Windows
 
@@ -107,7 +116,7 @@ See [RULES.md](RULES.md).
 
 ## Borders
 
-Optional border feedback uses lightweight Win32 overlay windows. Borders can show active, inactive, and floating colors. They are disabled by default and cleared for fullscreen or game mode when configured.
+Optional border feedback uses lightweight Win32 overlay windows. Borders can show active, inactive, and floating colors. They are disabled by default and cleared for fullscreen or game mode when configured. Floating borders are layered with their floating target windows, so tiled windows should not cover floating-window border feedback.
 
 No blur, shadows, animation, custom compositing, DirectComposition effects, or DWM patching are implemented.
 
@@ -151,4 +160,3 @@ $env:WINLAND_LOG_FILE = "C:\Temp\winland-daemon.log"
 - Elevated windows may reject movement unless the daemon is elevated.
 - Some applications ignore or adjust Win32 move/resize requests.
 - Non-Windows platforms expose stubs for most Win32 operations.
-

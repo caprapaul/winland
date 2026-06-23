@@ -79,7 +79,7 @@ JSON output matches the current IPC snapshot shape:
 }
 ```
 
-`participation` can be `tiled`, `floating`, `temporary-floating`, or `overflow-floating`.
+`participation` is normally `tiled`, `floating`, or `temporary-floating`. The IPC schema still accepts `overflow-floating` for compatibility, but overflow promotion now reports as normal `floating`.
 
 ## Reload Config
 

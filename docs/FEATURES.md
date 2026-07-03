@@ -120,6 +120,26 @@ Optional border feedback uses lightweight Win32 overlay windows. Borders can sho
 
 No blur, shadows, animation, custom compositing, DirectComposition effects, or DWM patching are implemented.
 
+## Widgets
+
+Winland widgets are normal `winland-cli` child processes that render Slint windows and subscribe to daemon state when they need workspace/window data. Widgets do not reserve desktop space automatically; use `[layout].offset` and window rules when a widget should occupy a screen edge.
+
+The built-in taskbar lives at `winland-cli/widgets/taskbar.slint` and is loaded from disk at runtime. It currently renders a bottom bar with:
+
+- a left-side power button with a placeholder, non-functional power menu
+- centered workspace pills
+- a right-side local clock
+
+The widget runner still exposes workspace rows, window rows, plugin blocks, local time, and a generic `run-command` callback to custom widgets. The built-in taskbar intentionally does not display open-window buttons or plugin badges; those can be implemented by separate widgets later.
+
+Widget lifecycle commands can stop or restart widgets regardless of whether they were started manually or from `[ui].startup_commands`:
+
+```powershell
+winland widget stop taskbar
+winland widget restart taskbar
+winland widget stop --title "My Winland Bar"
+```
+
 ## Game Mode
 
 Game mode detects configured executable names, rule modes, and fullscreen/borderless fullscreen geometry. When active it can pause layout globally or on the focused monitor, hide borders, and pause low-level input hook handling.
@@ -156,7 +176,7 @@ $env:WINLAND_LOG_FILE = "C:\Temp\winland-daemon.log"
 - Automatic config file watching is not implemented.
 - IPC mutation commands beyond reload are not implemented.
 - Workspace names and startup assignment fields are parsed but not fully user-visible.
-- Visual feedback is limited to optional borders.
+- Visual feedback is limited to optional borders and standalone Slint widgets.
 - Elevated windows may reject movement unless the daemon is elevated.
 - Some applications ignore or adjust Win32 move/resize requests.
 - Non-Windows platforms expose stubs for most Win32 operations.

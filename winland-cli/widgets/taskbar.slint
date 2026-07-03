@@ -24,92 +24,89 @@ export struct PluginBlock {
     text: string,
 }
 
+global Theme {
+    out property <length> space-xs: 4px;
+    out property <length> space-s: 8px;
+    out property <length> space-m: 12px;
+    out property <length> space-l: 16px;
+    out property <length> radius-s: 4px;
+    out property <length> radius-m: 6px;
+    out property <length> control-h: 24px;
+    out property <length> font-s: 10px;
+    out property <length> font-m: 12px;
+    out property <int> weight-normal: 500;
+    out property <int> weight-bold: 700;
+    out property <brush> bar: #c6ccd8;
+    out property <brush> bar-border: #f4f7fb;
+    out property <brush> surface: #f5f7fb;
+    out property <brush> surface-soft: #edf1f7;
+    out property <brush> surface-hover: #eef1f7;
+    out property <brush> surface-active: #edf2ff;
+    out property <brush> control-border: #d4dbe8;
+    out property <brush> control-border-hover: #c8d1df;
+    out property <brush> text-primary: #434760;
+    out property <brush> text-muted: #9aa3b2;
+    out property <brush> power: #ef4158;
+    out property <brush> power-hover: #f25b70;
+    out property <brush> workspace-active: #2f47bc;
+    out property <brush> workspace-1: #ef3f55;
+    out property <brush> workspace-2: #f06128;
+    out property <brush> workspace-3: #f49a21;
+    out property <brush> workspace-4: #19a35b;
+    out property <brush> workspace-default: #2d76f2;
+}
+
+global TaskbarLayout {
+    out property <length> window-w: 800px;
+    out property <length> window-h: 40px;
+    out property <length> bar-h: 32px;
+    out property <length> border-none: 0px;
+    out property <length> border-w: 1px;
+    out property <length> bar-border-w: 2px;
+    out property <length> pill-w: 30px;
+    out property <length> pill-h: 22px;
+    out property <length> power-w: 36px;
+    out property <length> icon: 18px;
+    out property <length> icon-x: 9px;
+    out property <length> icon-y: 3px;
+    out property <length> workspace-gap: 6px;
+    out property <length> content-pad: 10px;
+    out property <length> menu-x: 54px;
+}
+
 component WorkspacePill inherits Rectangle {
     in property <WorkspaceRow> item;
     callback activated(string);
 
-    height: 28px;
-    width: 46px;
-    border-radius: 4px;
-    background: item.active ? #3d6fb6 : #2b3038;
-    border-width: item.window-count > 0 && !item.active ? 1px : 0px;
-    border-color: #55606d;
+    height: TaskbarLayout.pill-h;
+    width: TaskbarLayout.pill-w;
+    border-radius: Theme.radius-s;
+    background: item.active ? Theme.surface-active : (touch.has-hover ? Theme.surface-hover : transparent);
+    border-width: item.window-count > 0 && !item.active ? TaskbarLayout.border-w : (touch.has-hover ? TaskbarLayout.border-w : TaskbarLayout.border-none);
+    border-color: touch.has-hover ? Theme.control-border-hover : Theme.control-border;
 
     Text {
         text: item.name;
-        color: item.active ? #ffffff : #d7dce3;
-        font-size: 13px;
-        font-weight: item.active ? 700 : 500;
+        color: item.active ? Theme.workspace-active : (
+            item.id == 1 ? Theme.workspace-1 : (
+                item.id == 2 ? Theme.workspace-2 : (
+                    item.id == 3 ? Theme.workspace-3 : (
+                        item.id == 4 ? Theme.workspace-4 : Theme.workspace-default
+                    )
+                )
+            )
+        );
+        font-size: Theme.font-m;
+        font-weight: item.active ? Theme.weight-bold : Theme.weight-normal;
         horizontal-alignment: center;
         vertical-alignment: center;
     }
 
-    TouchArea {
+    touch := TouchArea {
         width: 100%;
         height: 100%;
         clicked => {
             root.activated(item.command);
-        }
-    }
-}
-
-component WindowItem inherits Rectangle {
-    in property <WindowRow> item;
-    callback activated(string);
-
-    height: 28px;
-    width: 180px;
-    border-radius: 4px;
-    background: item.focused ? #36544a : (item.visible ? #252b33 : #1c2026);
-    border-width: item.focused ? 1px : 0px;
-    border-color: #72c89b;
-
-    Text {
-        x: 10px;
-        width: parent.width - 20px;
-        height: parent.height;
-        text: item.is-minimized ? "[min] " + item.title : item.title;
-        color: item.visible ? #eef2f7 : #9aa3ad;
-        font-size: 12px;
-        vertical-alignment: center;
-        overflow: elide;
-    }
-
-    TouchArea {
-        width: 100%;
-        height: 100%;
-        clicked => {
-            root.activated(item.command);
-        }
-    }
-}
-
-component PluginBadge inherits Rectangle {
-    in property <PluginBlock> block;
-
-    height: 28px;
-    min-width: 72px;
-    border-radius: 4px;
-    background: #2a2f37;
-
-    HorizontalLayout {
-        padding-left: 9px;
-        padding-right: 9px;
-        spacing: 6px;
-
-        Text {
-            text: block.label;
-            color: #aeb7c2;
-            font-size: 11px;
-            vertical-alignment: center;
-        }
-
-        Text {
-            text: block.text;
-            color: #f4f7fb;
-            font-size: 12px;
-            font-weight: 600;
-            vertical-alignment: center;
         }
     }
 }
@@ -121,65 +118,138 @@ export component TaskbarWidget inherits Window {
     in property <[WindowRow]> windows;
     in property <[PluginBlock]> plugin-blocks;
     in property <string> time-text;
+    property <bool> power-menu-open: false;
     callback run-command(string);
 
     no-frame: true;
     always-on-top: root.topmost;
     title: "Winland Taskbar";
-    preferred-width: 800px;
-    preferred-height: 40px;
-    background: #20242a;
+    preferred-width: TaskbarLayout.window-w;
+    preferred-height: TaskbarLayout.window-h;
+    background: transparent;
 
     Rectangle {
         width: 100%;
         height: 100%;
-        background: #20242a;
+        background: transparent;
 
-        HorizontalLayout {
-            padding-left: 10px;
-            padding-right: 10px;
-            spacing: 8px;
-            alignment: start;
+        Rectangle {
+            x: Theme.space-s;
+            y: Theme.space-xs;
+            width: parent.width - Theme.space-l;
+            height: TaskbarLayout.bar-h;
+            border-radius: Theme.radius-m;
+            background: Theme.bar;
+            border-width: TaskbarLayout.bar-border-w;
+            border-color: Theme.bar-border;
+        }
 
-            for workspace in root.workspaces: WorkspacePill {
-                item: workspace;
-                activated(command) => {
-                    root.run-command(command);
+        Rectangle {
+            x: Theme.space-m;
+            y: Theme.space-s;
+            width: TaskbarLayout.power-w;
+            height: Theme.control-h;
+            border-radius: Theme.radius-s;
+            background: power-touch.has-hover ? Theme.power-hover : Theme.power;
+
+            Image {
+                x: TaskbarLayout.icon-x;
+                y: TaskbarLayout.icon-y;
+                width: TaskbarLayout.icon;
+                height: TaskbarLayout.icon;
+                source: @image-url("icons/power.svg");
+                image-fit: contain;
+            }
+
+            power-touch := TouchArea {
+                width: 100%;
+                height: 100%;
+                clicked => {
+                    root.power-menu-open = !root.power-menu-open;
                 }
             }
+        }
 
-            Rectangle {
-                width: 1px;
-                height: 24px;
-                background: #3a414c;
-            }
+        Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: Theme.space-s;
+            width: workspace-row.preferred-width;
+            height: Theme.control-h;
+            border-radius: Theme.radius-s;
+            background: Theme.surface;
 
-            for window in root.windows: WindowItem {
-                item: window;
-                activated(command) => {
-                    root.run-command(command);
+            workspace-row := HorizontalLayout {
+                padding-left: TaskbarLayout.content-pad;
+                padding-right: TaskbarLayout.content-pad;
+                spacing: TaskbarLayout.workspace-gap;
+                alignment: center;
+
+                for workspace in root.workspaces: WorkspacePill {
+                    item: workspace;
+                    activated(command) => {
+                        root.run-command(command);
+                    }
                 }
             }
+        }
 
-            Rectangle {
-                min-width: 8px;
-                horizontal-stretch: 1;
-                background: transparent;
-            }
+        Rectangle {
+            x: parent.width - self.width - Theme.space-m;
+            y: Theme.space-s;
+            width: clock-text.preferred-width + (TaskbarLayout.content-pad * 2);
+            height: Theme.control-h;
+            border-radius: Theme.radius-s;
+            background: Theme.surface-soft;
 
-            for block in root.plugin-blocks: PluginBadge {
-                block: block;
-            }
-
-            Text {
-                min-width: 54px;
-                height: 28px;
+            clock-text := Text {
+                x: TaskbarLayout.content-pad;
+                height: parent.height;
                 text: root.time-text;
-                color: #ffffff;
-                font-size: 13px;
-                font-weight: 700;
+                color: Theme.text-primary;
+                font-size: Theme.font-m;
+                font-weight: Theme.weight-bold;
                 horizontal-alignment: right;
                 vertical-alignment: center;
+            }
+        }
+
+        Rectangle {
+            x: TaskbarLayout.menu-x;
+            y: Theme.space-s;
+            width: menu-row.preferred-width;
+            height: Theme.control-h;
+            visible: root.power-menu-open;
+            border-radius: Theme.radius-s;
+            background: Theme.surface;
+            border-width: TaskbarLayout.border-w;
+            border-color: Theme.control-border;
+
+            menu-row := HorizontalLayout {
+                padding-left: Theme.space-s;
+                padding-right: Theme.space-s;
+                spacing: Theme.space-s;
+                alignment: center;
+
+                Text {
+                    text: "Shutdown";
+                    color: Theme.text-muted;
+                    font-size: Theme.font-s;
+                    vertical-alignment: center;
+                }
+
+                Text {
+                    text: "Restart";
+                    color: Theme.text-muted;
+                    font-size: Theme.font-s;
+                    vertical-alignment: center;
+                }
+
+                Text {
+                    text: "Lock";
+                    color: Theme.text-muted;
+                    font-size: Theme.font-s;
+                    vertical-alignment: center;
+                }
             }
         }
     }

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, Stdio};
@@ -5,7 +6,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{ArgAction, Args, Parser, Subcommand};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use slint::{ComponentHandle, ModelRc, VecModel};
@@ -21,8 +22,8 @@ use winland_ipc::{
     WindowParticipationSnapshot, decode_response, encode_request,
 };
 
-const TASKBAR_WIDGET_SOURCE: &str = include_str!("../widgets/taskbar.slint");
 const TASKBAR_WIDGET_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/widgets/taskbar.slint");
+const TASKBAR_WIDGET_TITLE: &str = "Winland Taskbar";
 
 #[derive(Debug, Parser)]
 #[command(name = "winland")]
@@ -114,6 +115,10 @@ struct WidgetArgs {
 enum WidgetCommand {
     /// Run a built-in widget or a user-provided .slint widget.
     Run(WidgetRunArgs),
+    /// Stop running Winland widget processes.
+    Stop(WidgetStopArgs),
+    /// Stop and relaunch a Winland widget.
+    Restart(WidgetRestartArgs),
 }
 
 #[derive(Debug, Args)]
@@ -141,6 +146,24 @@ struct WidgetRunArgs {
     /// Run an external widget plugin as a JSON-line event stream.
     #[arg(long = "plugin-stream")]
     plugin_stream: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct WidgetStopArgs {
+    /// Built-in widget name to stop. Omit to stop all Winland widgets.
+    widget: Option<String>,
+    /// Stop widgets whose window title exactly matches this value.
+    #[arg(long)]
+    title: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct WidgetRestartArgs {
+    #[command(flatten)]
+    run: WidgetRunArgs,
+    /// Stop widgets whose window title exactly matches this value before restart.
+    #[arg(long)]
+    title: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -462,6 +485,12 @@ fn handle_shell(args: ShellArgs) -> Result<()> {
 fn handle_widget(args: WidgetArgs) -> Result<()> {
     match args.command {
         WidgetCommand::Run(args) => run_widget(args),
+        WidgetCommand::Stop(args) => {
+            let stopped = stop_widgets(args)?;
+            println!("Stopped {stopped} widget process(es)");
+            Ok(())
+        }
+        WidgetCommand::Restart(args) => restart_widget(args),
     }
 }
 
@@ -489,6 +518,176 @@ fn run_widget(args: WidgetRunArgs) -> Result<()> {
     }
 }
 
+fn restart_widget(args: WidgetRestartArgs) -> Result<()> {
+    let stop_args = WidgetStopArgs {
+        widget: args.run.widget.clone().filter(|_| args.run.file.is_none()),
+        title: args.title.clone(),
+    };
+    let stopped = stop_widgets(stop_args)?;
+    start_widget_process(&args.run)?;
+    println!("Restarted widget; stopped {stopped} previous process(es)");
+    Ok(())
+}
+
+fn stop_widgets(args: WidgetStopArgs) -> Result<usize> {
+    let target = widget_stop_target(args.widget.as_deref(), args.title.as_deref())?;
+    let processes = running_widget_processes(&target)?;
+    let current_process_id = std::process::id();
+    let mut stopped = 0;
+
+    for process in processes {
+        if process.process_id == current_process_id {
+            continue;
+        }
+        winland_win32::terminate_process(process.process_id).map_err(|error| {
+            anyhow::anyhow!(
+                "failed to stop widget process {} ({}) with title(s) {}: {error}",
+                process.process_id,
+                process
+                    .executable_path
+                    .as_deref()
+                    .unwrap_or("unknown executable"),
+                process.titles.join(", ")
+            )
+        })?;
+        stopped += 1;
+    }
+
+    Ok(stopped)
+}
+
+fn start_widget_process(args: &WidgetRunArgs) -> Result<()> {
+    let command_line = widget_run_command_line(args)?;
+    winland_win32::launch_app(&command_line)
+        .map_err(|error| anyhow::anyhow!("failed to start widget process: {error}"))
+}
+
+fn widget_run_command_line(args: &WidgetRunArgs) -> Result<String> {
+    let executable = std::env::current_exe().context("resolve current winland-cli executable")?;
+    let mut command = winland_win32::quote_windows_arg(&executable.display().to_string());
+    command.push_str(" widget run");
+
+    if let Some(widget) = &args.widget {
+        command.push(' ');
+        command.push_str(&winland_win32::quote_windows_arg(widget));
+    }
+
+    if let Some(file) = &args.file {
+        command.push_str(" --file ");
+        command.push_str(&winland_win32::quote_windows_arg(
+            &file.display().to_string(),
+        ));
+        command.push_str(" --component ");
+        command.push_str(&winland_win32::quote_windows_arg(&args.component));
+    }
+
+    command.push_str(" --height ");
+    command.push_str(&args.height.to_string());
+
+    if !args.topmost {
+        command.push_str(" --no-topmost");
+    }
+
+    for plugin in &args.plugin_once {
+        command.push_str(" --plugin-once ");
+        command.push_str(&winland_win32::quote_windows_arg(plugin));
+    }
+
+    for plugin in &args.plugin_stream {
+        command.push_str(" --plugin-stream ");
+        command.push_str(&winland_win32::quote_windows_arg(plugin));
+    }
+
+    Ok(command)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WidgetStopTarget {
+    All,
+    Title(String),
+}
+
+fn widget_stop_target(widget: Option<&str>, title: Option<&str>) -> Result<WidgetStopTarget> {
+    if widget.is_some() && title.is_some() {
+        return Err(anyhow::anyhow!(
+            "choose either a built-in widget name or --title, not both"
+        ));
+    }
+
+    if let Some(title) = title {
+        let title = title.trim();
+        if title.is_empty() {
+            return Err(anyhow::anyhow!("widget title must not be empty"));
+        }
+        return Ok(WidgetStopTarget::Title(title.to_owned()));
+    }
+
+    match widget.map(str::trim).filter(|widget| !widget.is_empty()) {
+        Some("taskbar") => Ok(WidgetStopTarget::Title(TASKBAR_WIDGET_TITLE.to_owned())),
+        Some(name) => Err(anyhow::anyhow!(
+            "unknown built-in widget '{name}'; use --title to stop a custom widget"
+        )),
+        None => Ok(WidgetStopTarget::All),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RunningWidgetProcess {
+    process_id: u32,
+    executable_path: Option<String>,
+    titles: Vec<String>,
+}
+
+fn running_widget_processes(target: &WidgetStopTarget) -> Result<Vec<RunningWidgetProcess>> {
+    let current_exe = std::env::current_exe()
+        .ok()
+        .map(|path| path.display().to_string().to_ascii_lowercase());
+    let mut processes: BTreeMap<u32, RunningWidgetProcess> = BTreeMap::new();
+
+    for window in winland_win32::enumerate_windows()? {
+        if window.process_id == 0 || window.process_id == std::process::id() {
+            continue;
+        }
+
+        let executable_matches = match (&current_exe, &window.executable_path) {
+            (Some(current_exe), Some(path)) => path.eq_ignore_ascii_case(current_exe),
+            _ => false,
+        };
+        if !executable_matches {
+            continue;
+        }
+
+        if !widget_window_matches_target(&window.title, target) {
+            continue;
+        }
+
+        let title = if window.title.trim().is_empty() {
+            "<untitled>".to_owned()
+        } else {
+            window.title.clone()
+        };
+        let entry = processes
+            .entry(window.process_id)
+            .or_insert_with(|| RunningWidgetProcess {
+                process_id: window.process_id,
+                executable_path: window.executable_path.clone(),
+                titles: Vec::new(),
+            });
+        if !entry.titles.iter().any(|candidate| candidate == &title) {
+            entry.titles.push(title);
+        }
+    }
+
+    Ok(processes.into_values().collect())
+}
+
+fn widget_window_matches_target(title: &str, target: &WidgetStopTarget) -> bool {
+    match target {
+        WidgetStopTarget::All => true,
+        WidgetStopTarget::Title(expected) => title == expected,
+    }
+}
+
 fn configure_default_widget_backend() {
     if std::env::var_os("SLINT_BACKEND").is_some() {
         return;
@@ -508,11 +707,8 @@ fn run_taskbar_widget(
     topmost: bool,
     plugins: WidgetPluginCommands,
 ) -> Result<()> {
-    let definition = compile_slint_source(
-        TASKBAR_WIDGET_SOURCE,
-        &PathBuf::from(TASKBAR_WIDGET_PATH),
-        "TaskbarWidget",
-    )?;
+    let definition =
+        compile_slint_path(std::path::Path::new(TASKBAR_WIDGET_PATH), "TaskbarWidget")?;
 
     run_slint_widget_instances(definition, height, all_monitors, topmost, plugins)
 }
@@ -545,30 +741,6 @@ fn compile_slint_path(path: &std::path::Path, component: &str) -> Result<Compone
     result.component(component).ok_or_else(|| {
         anyhow::anyhow!(
             "component '{component}' was not exported by {}",
-            path.display()
-        )
-    })
-}
-
-fn compile_slint_source(
-    source: &str,
-    path: &std::path::Path,
-    component: &str,
-) -> Result<ComponentDefinition> {
-    let compiler = slint_interpreter::Compiler::default();
-    let result = spin_on::spin_on(compiler.build_from_source(source.to_owned(), path.to_owned()));
-    print_slint_diagnostics(&result);
-
-    if result.has_errors() {
-        return Err(anyhow::anyhow!(
-            "failed to compile built-in Slint widget {}",
-            path.display()
-        ));
-    }
-
-    result.component(component).ok_or_else(|| {
-        anyhow::anyhow!(
-            "component '{component}' was not exported by built-in widget {}",
             path.display()
         )
     })
@@ -2104,14 +2276,50 @@ mod tests {
 
     #[test]
     fn built_in_taskbar_slint_source_compiles() {
-        let definition = compile_slint_source(
-            TASKBAR_WIDGET_SOURCE,
-            &PathBuf::from(TASKBAR_WIDGET_PATH),
-            "TaskbarWidget",
-        )
-        .unwrap();
+        let definition =
+            compile_slint_path(std::path::Path::new(TASKBAR_WIDGET_PATH), "TaskbarWidget").unwrap();
 
         assert_eq!(definition.name(), "TaskbarWidget");
+    }
+
+    #[test]
+    fn widget_stop_target_defaults_to_all_and_maps_taskbar_title() {
+        assert_eq!(
+            widget_stop_target(None, None).unwrap(),
+            WidgetStopTarget::All
+        );
+        assert_eq!(
+            widget_stop_target(Some("taskbar"), None).unwrap(),
+            WidgetStopTarget::Title(TASKBAR_WIDGET_TITLE.to_owned())
+        );
+        assert_eq!(
+            widget_stop_target(None, Some("Custom Widget")).unwrap(),
+            WidgetStopTarget::Title("Custom Widget".to_owned())
+        );
+        assert!(widget_stop_target(Some("taskbar"), Some("Winland Taskbar")).is_err());
+        assert!(widget_stop_target(Some("unknown"), None).is_err());
+    }
+
+    #[test]
+    fn widget_restart_command_line_preserves_run_options() {
+        let args = WidgetRunArgs {
+            widget: Some("taskbar".to_owned()),
+            file: None,
+            component: "MainWindow".to_owned(),
+            height: 44,
+            all_monitors: true,
+            topmost: false,
+            plugin_once: vec!["battery-status.exe".to_owned()],
+            plugin_stream: vec!["cpu status.exe".to_owned()],
+        };
+
+        let command = widget_run_command_line(&args).unwrap();
+
+        assert!(command.contains(" widget run taskbar"));
+        assert!(command.contains(" --height 44"));
+        assert!(command.contains(" --no-topmost"));
+        assert!(command.contains(" --plugin-once battery-status.exe"));
+        assert!(command.contains(r#" --plugin-stream "cpu status.exe""#));
     }
 
     #[test]

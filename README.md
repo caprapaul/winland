@@ -20,10 +20,11 @@ The project is an early prototype focused on correctness, safety, and recoverabi
 - Game-mode hardening for fullscreen windows and configured game executables.
 - Local named-pipe IPC for state queries and explicit config reload.
 - CLI diagnostics for windows, monitors, config validation, game-mode diagnosis, daemon state, config reload, and one-shot tiling.
+- Optional Slint widgets, including a built-in taskbar process with centered workspaces, clock, and widget stop/restart commands.
 
 ## Current Limitations
 
-Winland does not replace DWM, replace Explorer by default, manage wallpaper, provide a bar, or implement blur, shadows, animations, DirectComposition effects, graphics API hooks, or custom compositing.
+Winland does not replace DWM, replace Explorer by default, manage wallpaper, reserve widget space automatically, or implement blur, shadows, animations, DirectComposition effects, graphics API hooks, or custom compositing.
 
 Configuration reload is explicit; automatic file watching is not implemented. IPC is intentionally small and currently covers state queries and reload. Experimental shell replacement helpers exist for VM testing only and are not the normal startup path.
 
@@ -111,6 +112,8 @@ During local development, use `cargo run -p winland-cli -- <command>`.
 | `winland state --json` | Print daemon state JSON. |
 | `winland reload-config` | Ask the running daemon to reload config from disk. |
 | `winland config validate --path winland.toml` | Parse and validate a config file. |
+| `winland widget run taskbar` | Run the built-in Slint taskbar widget. |
+| `winland widget restart taskbar` | Restart the taskbar widget without restarting the daemon. |
 
 ## Testing
 
@@ -137,6 +140,7 @@ See [docs/GAME_MODE.md](docs/GAME_MODE.md) before using advanced interception or
 - [Features](docs/FEATURES.md)
 - [Configuration](docs/CONFIG.md)
 - [CLI](docs/CLI.md)
+- [Widgets](docs/WIDGETS.md)
 - [Window Rules](docs/RULES.md)
 - [Troubleshooting](docs/TROUBLESHOOTING.md)
 - [Architecture](docs/ARCHITECTURE.md)

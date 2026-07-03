@@ -6,9 +6,10 @@ Winland widgets are normal user processes launched by the CLI. They are not part
 cargo run -p winland-cli -- widget run taskbar
 cargo run -p winland-cli -- widget run --file .\widgets\my-bar.slint --component MyBar
 cargo run -p winland-cli -- widget run taskbar --plugin-stream "my-status.exe"
+cargo run -p winland-cli -- widget restart taskbar
 ```
 
-The built-in taskbar is just a Slint widget at `winland-cli/widgets/taskbar.slint`. Use it as the reference implementation for custom bars.
+The built-in taskbar is a Slint widget at `winland-cli/widgets/taskbar.slint`. It is loaded from disk at widget process startup, so Slint-only taskbar edits can be tested by restarting the widget process instead of rebuilding Rust.
 
 ## Runtime Model
 
@@ -24,6 +25,41 @@ Data sources are event-driven:
 - `--plugin-stream` reads newline-delimited JSON objects from an executable
 
 When any source produces an update, the CLI schedules a Slint event-loop update immediately.
+
+Widgets run as separate processes. Use `winland widget stop` to stop all detected Winland widgets, `winland widget stop taskbar` to stop the built-in taskbar, or `winland widget restart taskbar` to stop and relaunch the taskbar. These commands work for widgets launched manually or through `[ui].startup_commands`. Custom widgets can be stopped by exact title with `winland widget stop --title "My Winland Bar"`.
+
+## Built-In Taskbar
+
+The built-in taskbar is intentionally small and operational:
+
+- left: a power button that opens a placeholder menu
+- center: workspace pills
+- right: a local clock
+
+The power menu is non-functional for now. It must not run shutdown, restart, lock, shell replacement, or daemon commands until those actions are explicitly designed and made reversible.
+
+The built-in taskbar does not show open-window buttons or plugin status badges. The CLI still feeds `windows` and `plugin-blocks` to all widgets, so a future launcher/window switcher or status bar can use those data sources without changing the runner.
+
+To iterate on the built-in taskbar after the CLI has been built once:
+
+```powershell
+winland widget restart taskbar
+```
+
+Use `cargo build -p winland-cli` only after Rust changes. Taskbar Slint and referenced asset edits are picked up by restarting the widget.
+
+## Styling Rules
+
+Taskbar styling should start from simple shared rules and grow only when needed:
+
+- Use small theme scales such as `space-s`, `space-m`, `radius-s`, and `font-m` for common spacing, radius, and typography.
+- Keep taskbar-specific dimensions grouped separately from general theme values.
+- Avoid hardcoded `px` values inside component bodies; put them in the theme/layout globals near the top of the Slint file.
+- Prefer content-sized containers: let rows, menus, clock pills, and trays use child `preferred-width` plus padding.
+- Put padding on the content/layout inside a container instead of giving the container a fixed width.
+- Fixed widths are acceptable for the outer widget/bar and atomic controls such as a square icon button or workspace pill.
+- Use real icon assets for icons. Do not build common icons from ad hoc rectangles.
+- Keep hover states on clickable elements visible but subtle.
 
 ## Slint Surface
 
@@ -97,7 +133,7 @@ $env:TEMP\winland-widget-commands.log
 
 This logging is intentionally small and local to the widget process. It is useful when a widget is launched by the daemon's `[ui].startup_commands` and does not have a visible console.
 
-The built-in taskbar uses `TouchArea` handlers to call `root.run-command(...)` for workspace pills and window buttons. Custom widgets can use the same callback for any command:
+The built-in taskbar uses `TouchArea` handlers to call `root.run-command(...)` for workspace pills. Custom widgets can use the same callback for any command:
 
 ```slint
 TouchArea {

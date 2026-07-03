@@ -38,7 +38,8 @@ mod platform {
     use windows::Win32::System::SystemInformation::GetLocalTime;
     use windows::Win32::System::Threading::{
         AttachThreadInput, GetCurrentThreadId, OpenProcess, PROCESS_NAME_FORMAT,
-        PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, QueryFullProcessImageNameW,
+        TerminateProcess,
     };
     use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
     use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -132,6 +133,17 @@ mod platform {
 
         debug!(count = monitors.len(), "enumerated display monitors");
         Ok(monitors)
+    }
+
+    pub fn terminate_process(process_id: u32) -> Result<()> {
+        // SAFETY: process_id comes from Win32 process/window enumeration. The
+        // returned handle is owned by this function and closed by OwnedHandle.
+        let handle = unsafe { OpenProcess(PROCESS_TERMINATE, false, process_id) }
+            .map_err(Win32Error::from)?;
+        let process = OwnedHandle(handle);
+
+        // SAFETY: process.0 is a live handle opened with PROCESS_TERMINATE.
+        unsafe { TerminateProcess(process.0, 0).map_err(Win32Error::from) }
     }
 
     pub fn move_resize_window(handle: WindowHandle, rect: Rect) -> Result<()> {
@@ -2684,6 +2696,10 @@ mod platform {
         Err(Win32Error::UnsupportedPlatform)
     }
 
+    pub fn terminate_process(_process_id: u32) -> Result<()> {
+        Err(Win32Error::UnsupportedPlatform)
+    }
+
     pub fn move_resize_window(_handle: WindowHandle, _rect: Rect) -> Result<()> {
         Err(Win32Error::UnsupportedPlatform)
     }
@@ -2852,6 +2868,7 @@ pub use platform::show_window_without_activate;
 pub use platform::spawn_ipc_response_stream;
 pub use platform::spawn_ipc_server;
 pub use platform::subscribe_window_events;
+pub use platform::terminate_process;
 pub use platform::window_rect_for_handle;
 pub use shell::ShellReplacementChange;
 pub use shell::ShellReplacementStatus;

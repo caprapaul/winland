@@ -22,6 +22,7 @@ Most desktop commands require Windows because they call `winland-win32`.
 | `config validate [--path <FILE>]` | No | Parse and validate config. |
 | `shell ...` | No IPC | Experimental VM-only shell replacement helpers. |
 | `widget run ...` | Optional | Run a built-in or user-provided Slint widget. The built-in taskbar subscribes to daemon state IPC. |
+| `widget stop ...` / `widget restart ...` | No | Stop or restart running Winland widget processes, including daemon-started widgets. |
 
 If the daemon is not running, IPC commands print:
 
@@ -93,7 +94,7 @@ cargo run -p winland-cli -- command focus-window 0x123456
 
 `command` sends a named daemon command through IPC and prints a short success line when the daemon accepts it. It reuses the same command names as hotkey bindings where possible. `focus-window <HWND>` focuses a tracked app window; if the tracked window is minimized, the daemon restores it first with documented Win32 restore APIs. Invalid, unsafe, or untracked handles are rejected by the daemon.
 
-The built-in taskbar uses this command surface for workspace pills and window buttons. Widgets still launch ordinary command lines; they do not talk named-pipe IPC directly unless they choose to.
+The built-in taskbar uses this command surface for workspace pills. Widgets still launch ordinary command lines; they do not talk named-pipe IPC directly unless they choose to.
 
 ## Reload Config
 
@@ -187,11 +188,13 @@ cargo run -p winland-cli -- widget run taskbar --no-topmost
 cargo run -p winland-cli -- widget run --file .\widgets\bar.slint --component MainWindow
 cargo run -p winland-cli -- widget run taskbar --plugin-once "my-status.exe"
 cargo run -p winland-cli -- widget run taskbar --plugin-stream "my-events.exe"
+cargo run -p winland-cli -- widget stop taskbar
+cargo run -p winland-cli -- widget restart taskbar
 ```
 
-`widget run taskbar` starts the built-in Slint taskbar widget from `winland-cli/widgets/taskbar.slint`. By default it creates a 40px bottom widget on every monitor. The built-in taskbar declares Slint `no-frame: true` and `always-on-top` so it is created without the normal Windows titlebar/frame and stays above normal app windows. Pass `--no-topmost` to keep the widget in the normal z-order band.
+`widget run taskbar` starts the built-in Slint taskbar widget from `winland-cli/widgets/taskbar.slint`. The built-in widget is loaded from disk at process startup, not embedded into the binary, so Slint-only edits require restarting the widget process rather than rebuilding Rust. By default it creates a 40px bottom widget on every monitor. The built-in taskbar declares Slint `no-frame: true` and `always-on-top` so it is created without the normal Windows titlebar/frame and stays above normal app windows. Pass `--no-topmost` to keep the widget in the normal z-order band.
 
-The built-in taskbar subscribes to daemon state events through IPC. It displays workspace rows, active workspace state, tracked windows on the active workspace, minimized tracked windows from that workspace, focused window state, external plugin blocks, and local time. Custom Slint widgets can use the same properties:
+The built-in taskbar subscribes to daemon state events through IPC. It currently displays a left-side placeholder power button, centered workspace pills, and a local clock on the right. It intentionally does not render open-window buttons or plugin badges; those data sources remain available for future or custom widgets. Custom Slint widgets can use the same properties:
 
 | Property | Type | Meaning |
 | --- | --- | --- |
@@ -201,9 +204,17 @@ The built-in taskbar subscribes to daemon state events through IPC. It displays 
 | `time-text` | `string` | Local `HH:MM` clock text. |
 | `label` | `string` | Compatibility summary for simple widgets. |
 
-Widgets may declare `callback run-command(string);`. The CLI runner registers it and launches the supplied command line as a normal child process. The callback is generic; custom widgets can run any CLI or program. The built-in taskbar happens to use it for `winland command switch-workspace ...` and `winland command focus-window ...`.
+Widgets may declare `callback run-command(string);`. The CLI runner registers it and launches the supplied command line as a normal child process. The callback is generic; custom widgets can run any CLI or program. The built-in taskbar uses it for `winland command switch-workspace ...` from workspace pills. The built-in power menu is a local placeholder and does not run shutdown, restart, lock, shell, or daemon commands.
 
 Widget command attempts, exit status, stdout, and stderr are logged to `%TEMP%\winland-widget-commands.log`. This is useful when a widget was launched by daemon startup commands and has no visible console.
+
+`widget stop` stops running Winland widget processes owned by the current `winland-cli.exe`, regardless of whether they were started manually, by the daemon, or by shell startup. With no argument it stops all detected Winland widgets. `widget stop taskbar` targets the built-in taskbar by its `Winland Taskbar` window title. For custom widgets, use an exact title match:
+
+```powershell
+cargo run -p winland-cli -- widget stop --title "My Winland Bar"
+```
+
+`widget restart taskbar` stops the existing taskbar process and launches a fresh `widget run taskbar` process, then returns immediately. This is the fastest way to pick up edits to `winland-cli/widgets/taskbar.slint` and its referenced assets; rebuild only when Rust code changes.
 
 External widget plugins are ordinary programs. `--plugin-once` runs a command once and reads one JSON object from stdout. `--plugin-stream` runs a command and reads newline-delimited JSON objects from stdout. Objects may contain `label` or `name`, and `text`, `value`, or `status`, for example:
 

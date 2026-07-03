@@ -44,6 +44,9 @@ Commands are best-effort: failures are logged but do not stop the daemon.
 Widgets are separate processes. Reserve screen space with `[layout].offset`, and
 use ordinary `[[window_rules]]` when a widget should be ignored by tiling. See
 [WIDGETS.md](WIDGETS.md) for the Slint widget API and external plugin protocol.
+Startup commands run when the daemon starts; config reload does not relaunch
+them. Use `winland widget restart taskbar` to restart a daemon-started taskbar
+without restarting the daemon.
 
 ```toml
 [[window_rules]]

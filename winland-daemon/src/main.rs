@@ -37,7 +37,7 @@ use winland_win32::{
     WindowEventKind,
 };
 
-const RECONCILE_DEBOUNCE: Duration = Duration::from_millis(50);
+const RECONCILE_DEBOUNCE: Duration = Duration::from_millis(16);
 const LOW_LATENCY_MOVE_DEBOUNCE: Duration = Duration::from_millis(8);
 const INTERACTIVE_DRAG_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const MAX_BATCH_SIZE: usize = 512;
@@ -563,6 +563,7 @@ fn process_daemon_events(
                         &sender,
                         &[first_event],
                     )?;
+                    state.publish_state_event();
                 } else if first_event.kind == WindowEventKind::Moved {
                     let Some(batch) = receive_window_batch_with_timeout(
                         &receiver,
@@ -579,6 +580,7 @@ fn process_daemon_events(
                         &sender,
                         &batch,
                     )?;
+                    state.publish_state_event();
                 } else if should_process_window_event_immediately(first_event) {
                     process_window_batch(
                         &mut state,
@@ -586,6 +588,7 @@ fn process_daemon_events(
                         &sender,
                         &[first_event],
                     )?;
+                    state.publish_state_event();
                 } else {
                     let Some(batch) = receive_window_batch(&receiver, &mut state, first_event)?
                     else {
@@ -597,9 +600,13 @@ fn process_daemon_events(
                         &sender,
                         &batch,
                     )?;
+                    state.publish_state_event();
                 }
             }
-            DaemonEvent::Hotkey(event) => state.handle_hotkey_event(event),
+            DaemonEvent::Hotkey(event) => {
+                state.handle_hotkey_event(event);
+                state.publish_state_event();
+            }
             DaemonEvent::MouseDrag(event) => {
                 state.handle_mouse_drag(event)?;
                 sync_interactive_drag_tracker(
@@ -608,10 +615,12 @@ fn process_daemon_events(
                     state.active_interactive_drag_window(),
                     &[],
                 );
+                state.publish_state_event();
             }
             DaemonEvent::Ipc(request) => state.handle_ipc(request),
             DaemonEvent::InteractiveDragTick { window, cursor } => {
-                state.handle_interactive_drag_tick(window, cursor)?
+                state.handle_interactive_drag_tick(window, cursor)?;
+                state.publish_state_event();
             }
             DaemonEvent::InteractiveDragEnded { window } => {
                 state.finish_interactive_drag(window);
@@ -621,6 +630,7 @@ fn process_daemon_events(
                 {
                     interactive_drag_tracker = None;
                 }
+                state.publish_state_event();
             }
             DaemonEvent::Shutdown => break,
         }
@@ -702,14 +712,22 @@ fn receive_window_batch_with_timeout(
     while batch.len() < MAX_BATCH_SIZE {
         match receiver.recv_timeout(timeout) {
             Ok(DaemonEvent::Window(event)) => batch.push(event),
-            Ok(DaemonEvent::Hotkey(event)) => state.handle_hotkey_event(event),
-            Ok(DaemonEvent::MouseDrag(event)) => state.handle_mouse_drag(event)?,
+            Ok(DaemonEvent::Hotkey(event)) => {
+                state.handle_hotkey_event(event);
+                state.publish_state_event();
+            }
+            Ok(DaemonEvent::MouseDrag(event)) => {
+                state.handle_mouse_drag(event)?;
+                state.publish_state_event();
+            }
             Ok(DaemonEvent::Ipc(request)) => state.handle_ipc(request),
             Ok(DaemonEvent::InteractiveDragTick { window, cursor }) => {
-                state.handle_interactive_drag_tick(window, cursor)?
+                state.handle_interactive_drag_tick(window, cursor)?;
+                state.publish_state_event();
             }
             Ok(DaemonEvent::InteractiveDragEnded { window }) => {
                 state.finish_interactive_drag(window);
+                state.publish_state_event();
             }
             Ok(DaemonEvent::Shutdown) => return Ok(None),
             Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
@@ -871,6 +889,7 @@ struct DaemonState {
     border_manager: Option<BorderManager>,
     game_mode: GameModeRuntimeState,
     perf: DaemonPerformance,
+    state_subscribers: Vec<Sender<Vec<u8>>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -996,6 +1015,7 @@ impl DaemonState {
             border_manager: None,
             game_mode: GameModeRuntimeState::default(),
             perf: DaemonPerformance::default(),
+            state_subscribers: Vec::new(),
         };
         state.tile_order = state.manageable_handles_sorted();
         state.sync_workspace_state(&monitors);
@@ -1906,26 +1926,84 @@ impl DaemonState {
     }
 
     fn handle_ipc(&mut self, transport: IpcTransportRequest) {
-        let response = match decode_request(&transport.request) {
-            Ok(request) => self.handle_ipc_request(request),
+        let request = match decode_request(&transport.request) {
+            Ok(request) => request,
             Err(error) => {
                 warn!(%error, "rejecting invalid IPC request");
-                IpcResponse::error(error.to_string())
+                self.send_ipc_response(&transport.response, IpcResponse::error(error.to_string()));
+                return;
             }
         };
 
+        if request.command == IpcCommand::SubscribeState {
+            self.add_state_subscription(transport.response);
+            return;
+        }
+
+        let publish_after_response = request.command == IpcCommand::ReloadConfig;
+        let response = self.handle_ipc_request(request);
+        self.send_ipc_response(&transport.response, response);
+
+        if publish_after_response {
+            self.publish_state_event();
+        }
+    }
+
+    fn send_ipc_response(&self, response_sender: &Sender<Vec<u8>>, response: IpcResponse) {
         match encode_response(&response) {
             Ok(encoded) => {
-                let _ = transport.response.send(encoded);
+                let _ = response_sender.send(encoded);
             }
             Err(error) => {
                 warn!(%error, "failed to encode IPC response");
                 let fallback = IpcResponse::error(error.to_string());
                 if let Ok(encoded) = encode_response(&fallback) {
-                    let _ = transport.response.send(encoded);
+                    let _ = response_sender.send(encoded);
                 }
             }
         }
+    }
+
+    fn add_state_subscription(&mut self, response_sender: Sender<Vec<u8>>) {
+        let response = IpcResponse::state(self.state_snapshot());
+        match encode_response(&response) {
+            Ok(encoded) => {
+                if response_sender.send(encoded).is_ok() {
+                    self.state_subscribers.push(response_sender);
+                    debug!(
+                        subscribers = self.state_subscribers.len(),
+                        "added IPC state subscriber"
+                    );
+                } else {
+                    debug!("state subscriber disconnected before initial snapshot");
+                }
+            }
+            Err(error) => {
+                warn!(%error, "failed to encode initial state subscription snapshot");
+            }
+        }
+    }
+
+    fn publish_state_event(&mut self) {
+        if self.state_subscribers.is_empty() {
+            return;
+        }
+
+        let response = IpcResponse::state(self.state_snapshot());
+        let encoded = match encode_response(&response) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                warn!(%error, "failed to encode state subscription snapshot");
+                return;
+            }
+        };
+
+        self.state_subscribers
+            .retain(|subscriber| subscriber.send(encoded.clone()).is_ok());
+        debug!(
+            subscribers = self.state_subscribers.len(),
+            "published IPC state event"
+        );
     }
 
     fn handle_ipc_request(&mut self, request: IpcRequest) -> IpcResponse {
@@ -1938,6 +2016,9 @@ impl DaemonState {
                     IpcResponse::error(error.to_string())
                 }
             },
+            IpcCommand::SubscribeState => IpcResponse::error(
+                "subscribe-state must be handled as an IPC stream request".to_owned(),
+            ),
         }
     }
 
@@ -7579,6 +7660,82 @@ mod tests {
     }
 
     #[test]
+    fn ipc_subscribe_state_sends_initial_snapshot_and_registers_subscriber() {
+        let mut state = daemon_state([window(1, "One", Rect::from_size(0, 0, 100, 100))]);
+        let (sender, receiver) = mpsc::channel();
+
+        state.handle_ipc(IpcTransportRequest {
+            request: winland_ipc::encode_request(&IpcRequest::subscribe_state()).unwrap(),
+            response: sender,
+        });
+
+        let response = winland_ipc::decode_response(&receiver.recv().unwrap()).unwrap();
+        let winland_ipc::IpcResponseResult::State(snapshot) = response.result else {
+            panic!("expected state response");
+        };
+
+        assert_eq!(snapshot.total_windows, 1);
+        assert_eq!(state.state_subscribers.len(), 1);
+    }
+
+    #[test]
+    fn state_publish_removes_disconnected_subscribers() {
+        let mut state = daemon_state([window(1, "One", Rect::from_size(0, 0, 100, 100))]);
+        let (sender, receiver) = mpsc::channel();
+        state.state_subscribers.push(sender);
+        drop(receiver);
+
+        state.publish_state_event();
+
+        assert!(state.state_subscribers.is_empty());
+    }
+
+    #[test]
+    fn hotkey_during_window_debounce_publishes_state_event() {
+        let mut state = daemon_state([window(1, "One", Rect::from_size(0, 0, 100, 100))]);
+        let (subscriber, updates) = mpsc::channel();
+        state.state_subscribers.push(subscriber);
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(DaemonEvent::Hotkey(HotkeyEvent { id: HotkeyId(999) }))
+            .unwrap();
+        drop(sender);
+
+        let batch = receive_window_batch_with_timeout(
+            &receiver,
+            &mut state,
+            event(WindowEventKind::Shown, 1),
+            Duration::from_millis(1),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(batch, vec![event(WindowEventKind::Shown, 1)]);
+        assert!(updates.try_recv().is_ok());
+    }
+
+    #[test]
+    fn workspace_hotkey_publish_reports_new_active_workspace() {
+        let mut state = daemon_state([window(1, "One", Rect::from_size(0, 0, 100, 100))]);
+        state
+            .hotkey_commands
+            .commands
+            .insert(HotkeyId(77), DaemonCommand::SwitchWorkspace(WorkspaceId(2)));
+        let (subscriber, updates) = mpsc::channel();
+        state.state_subscribers.push(subscriber);
+
+        state.handle_hotkey_event(HotkeyEvent { id: HotkeyId(77) });
+        state.publish_state_event();
+
+        let raw = updates.recv_timeout(Duration::from_secs(1)).unwrap();
+        let response = winland_ipc::decode_response(&raw).unwrap();
+        let winland_ipc::IpcResponseResult::State(snapshot) = response.result else {
+            panic!("expected state snapshot");
+        };
+        assert_eq!(snapshot.active_workspace, 2);
+    }
+
+    #[test]
     fn state_snapshot_reports_constrained_floating_and_hidden_workspace_status() {
         let mut constrained = window(1, "Constrained", Rect::from_size(0, 0, 100, 100));
         constrained.size_constraints = WindowSizeConstraints::minimum(500, 300);
@@ -8058,6 +8215,7 @@ mod tests {
             border_manager: None,
             game_mode: GameModeRuntimeState::default(),
             perf: DaemonPerformance::default(),
+            state_subscribers: Vec::new(),
         };
         state.tile_order = state.manageable_handles_sorted();
         state.sync_workspace_state(&[primary_test_monitor()]);

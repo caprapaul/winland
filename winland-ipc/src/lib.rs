@@ -22,6 +22,13 @@ impl IpcRequest {
             command: IpcCommand::ReloadConfig,
         }
     }
+
+    pub fn subscribe_state() -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            command: IpcCommand::SubscribeState,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,6 +36,7 @@ impl IpcRequest {
 pub enum IpcCommand {
     State,
     ReloadConfig,
+    SubscribeState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -319,6 +327,16 @@ mod tests {
         let decoded = decode_response(&encoded).unwrap();
 
         assert_eq!(decoded, IpcResponse::reload_config(report));
+    }
+
+    #[test]
+    fn subscribe_state_request_round_trips() {
+        let encoded = encode_request(&IpcRequest::subscribe_state()).unwrap();
+        let decoded = decode_request(&encoded).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(encoded.trim_ascii_end()).unwrap();
+
+        assert_eq!(decoded, IpcRequest::subscribe_state());
+        assert_eq!(json["command"]["type"], "subscribe-state");
     }
 
     #[test]

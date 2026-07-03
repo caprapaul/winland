@@ -20,7 +20,7 @@ Most desktop commands require Windows because they call `winland-win32`.
 | `tile-once` | No | Tile manageable windows on the primary monitor once. |
 | `config validate [--path <FILE>]` | No | Parse and validate config. |
 | `shell ...` | No IPC | Experimental VM-only shell replacement helpers. |
-| `widget run ...` | No IPC | Run a built-in or user-provided Slint widget. |
+| `widget run ...` | Optional | Run a built-in or user-provided Slint widget. The built-in taskbar subscribes to daemon state IPC. |
 
 If the daemon is not running, IPC commands print:
 
@@ -166,13 +166,33 @@ With no path, validation uses discovery paths or built-in defaults. Success outp
 
 ## Widgets
 
+For a widget authoring guide, including Slint properties and external plugin JSON streams, see [WIDGETS.md](WIDGETS.md).
+
 ```powershell
 cargo run -p winland-cli -- widget run taskbar
 cargo run -p winland-cli -- widget run taskbar --no-topmost
 cargo run -p winland-cli -- widget run --file .\widgets\bar.slint --component MainWindow
+cargo run -p winland-cli -- widget run taskbar --plugin-once "my-status.exe"
+cargo run -p winland-cli -- widget run taskbar --plugin-stream "my-events.exe"
 ```
 
 `widget run taskbar` starts the built-in Slint taskbar widget from `winland-cli/widgets/taskbar.slint`. By default it creates a 40px bottom widget on every monitor. The built-in taskbar declares Slint `no-frame: true` and `always-on-top` so it is created without the normal Windows titlebar/frame and stays above normal app windows, then `winland-win32` keeps it as a no-activate top-level panel. Pass `--no-topmost` to keep the widget in the normal z-order band.
+
+The built-in taskbar subscribes to daemon state events through IPC. It displays workspace rows, active workspace state, open windows, focused window state, external plugin blocks, and local time. Custom Slint widgets can use the same properties:
+
+| Property | Type | Meaning |
+| --- | --- | --- |
+| `workspaces` | `[WorkspaceRow]` | Workspace id/name, active flag, and window count. |
+| `windows` | `[WindowRow]` | HWND, title, workspace id, focused/visible flags, and participation. |
+| `plugin-blocks` | `[PluginBlock]` | Status blocks from external programs. |
+| `time-text` | `string` | Local `HH:MM` clock text. |
+| `label` | `string` | Compatibility summary for simple widgets. |
+
+External widget plugins are ordinary programs. `--plugin-once` runs a command once and reads one JSON object from stdout. `--plugin-stream` runs a command and reads newline-delimited JSON objects from stdout. Objects may contain `label` or `name`, and `text`, `value`, or `status`, for example:
+
+```json
+{"label":"CPU","text":"14%"}
+```
 
 Custom widgets can be authored as `.slint` files and loaded at runtime with `--file`. Put `no-frame: true` on the exported root `Window` when the widget should be frameless from creation. The widget process is separate from tiling; reserve space for it explicitly with `[layout].offset`, and ignore it through normal `window_rules` when needed, for example:
 

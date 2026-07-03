@@ -35,6 +35,7 @@ mod platform {
         ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_MESSAGE,
         PIPE_TYPE_MESSAGE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
     };
+    use windows::Win32::System::SystemInformation::GetLocalTime;
     use windows::Win32::System::Threading::{
         AttachThreadInput, GetCurrentThreadId, OpenProcess, PROCESS_NAME_FORMAT,
         PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
@@ -762,6 +763,52 @@ mod platform {
         read_pipe_message(pipe.0, "ReadFile(IPC response)")
     }
 
+    pub fn spawn_ipc_response_stream(
+        pipe_name: &'static str,
+        request: Vec<u8>,
+        sender: Sender<Vec<u8>>,
+    ) -> Result<JoinHandle<()>> {
+        thread::Builder::new()
+            .name("winland-ipc-response-stream".to_owned())
+            .spawn(move || match open_ipc_client(pipe_name) {
+                Ok(pipe) => {
+                    if let Err(error) =
+                        write_pipe_message(pipe.0, &request, "WriteFile(IPC stream request)")
+                    {
+                        warn!(%error, "failed to write IPC stream request");
+                        return;
+                    }
+
+                    loop {
+                        match read_pipe_message(pipe.0, "ReadFile(IPC stream response)") {
+                            Ok(response) => {
+                                if sender.send(response).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(error) => {
+                                warn!(%error, "failed to read IPC stream response");
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(error) => warn!(%error, "failed to open IPC response stream"),
+            })
+            .map_err(|source| Win32Error::ThreadSpawn {
+                name: "winland-ipc-response-stream",
+                message: source.to_string(),
+            })
+    }
+
+    pub fn local_time_hhmm() -> String {
+        // SAFETY: GetLocalTime returns a SYSTEMTIME value by value and has no
+        // caller-managed pointers or retained references.
+        let time = unsafe { GetLocalTime() };
+
+        format!("{:02}:{:02}", time.wHour, time.wMinute)
+    }
+
     pub struct WindowEventSubscription {
         hooks: Vec<HWINEVENTHOOK>,
     }
@@ -942,6 +989,11 @@ mod platform {
 
     struct OwnedPipe(HANDLE);
 
+    // SAFETY: OwnedPipe has unique ownership of an opaque Win32 pipe HANDLE.
+    // Moving it to the per-client worker thread transfers responsibility for
+    // all reads, writes, disconnect, and CloseHandle to that thread.
+    unsafe impl Send for OwnedPipe {}
+
     impl Drop for OwnedPipe {
         fn drop(&mut self) {
             // SAFETY: OwnedPipe only wraps pipe handles returned by Win32 create/open
@@ -973,44 +1025,77 @@ mod platform {
                 continue;
             }
 
-            let request = match read_pipe_message(pipe.0, "ReadFile(IPC request)") {
-                Ok(request) => request,
-                Err(error) => {
-                    if !running.load(Ordering::Relaxed) {
-                        let _ = disconnect_pipe(pipe.0);
-                        break;
-                    }
-                    warn!(%error, "failed to read IPC request");
-                    let _ = disconnect_pipe(pipe.0);
-                    continue;
-                }
-            };
-
-            let (response_sender, response_receiver) = mpsc::channel();
-            if sender
-                .send(IpcTransportRequest {
-                    request,
-                    response: response_sender,
-                })
-                .is_err()
+            let worker_sender = sender.clone();
+            let worker_running = running.clone();
+            if let Err(error) = thread::Builder::new()
+                .name("winland-ipc-client".to_owned())
+                .spawn(move || ipc_client_worker(pipe, worker_sender, worker_running))
             {
-                let _ = disconnect_pipe(pipe.0);
-                break;
+                warn!(%error, "failed to spawn IPC client worker");
             }
+        }
+    }
 
-            match response_receiver.recv_timeout(Duration::from_secs(5)) {
+    fn ipc_client_worker(
+        pipe: OwnedPipe,
+        sender: Sender<IpcTransportRequest>,
+        running: Arc<AtomicBool>,
+    ) {
+        let pipe_handle = pipe.0;
+        let response_receiver = match read_ipc_transport_request(pipe_handle, sender, &running) {
+            Some(response_receiver) => response_receiver,
+            None => {
+                let _ = disconnect_pipe(pipe_handle);
+                return;
+            }
+        };
+
+        while running.load(Ordering::Relaxed) {
+            match response_receiver.recv_timeout(Duration::from_millis(250)) {
                 Ok(response) => {
                     if let Err(error) =
-                        write_pipe_message(pipe.0, &response, "WriteFile(IPC response)")
+                        write_pipe_message(pipe_handle, &response, "WriteFile(IPC response)")
                     {
                         warn!(%error, "failed to write IPC response");
+                        break;
                     }
                 }
-                Err(error) => warn!(%error, "timed out waiting for daemon IPC response"),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
-
-            let _ = disconnect_pipe(pipe.0);
         }
+
+        let _ = disconnect_pipe(pipe_handle);
+    }
+
+    fn read_ipc_transport_request(
+        pipe: HANDLE,
+        sender: Sender<IpcTransportRequest>,
+        running: &AtomicBool,
+    ) -> Option<Receiver<Vec<u8>>> {
+        let request = match read_pipe_message(pipe, "ReadFile(IPC request)") {
+            Ok(request) => request,
+            Err(error) => {
+                if !running.load(Ordering::Relaxed) {
+                    return None;
+                }
+                warn!(%error, "failed to read IPC request");
+                return None;
+            }
+        };
+
+        let (response_sender, response_receiver) = mpsc::channel();
+        if sender
+            .send(IpcTransportRequest {
+                request,
+                response: response_sender,
+            })
+            .is_err()
+        {
+            return None;
+        }
+
+        Some(response_receiver)
     }
 
     fn wake_ipc_server(pipe_name: &str) {
@@ -2692,6 +2777,18 @@ mod platform {
         Err(Win32Error::UnsupportedPlatform)
     }
 
+    pub fn spawn_ipc_response_stream(
+        _pipe_name: &'static str,
+        _request: Vec<u8>,
+        _sender: Sender<Vec<u8>>,
+    ) -> Result<std::thread::JoinHandle<()>> {
+        Err(Win32Error::UnsupportedPlatform)
+    }
+
+    pub fn local_time_hhmm() -> String {
+        "00:00".to_owned()
+    }
+
     pub struct WindowEventSubscription;
     pub struct HotkeyRegistration;
     pub struct HotkeyOverrideRegistration;
@@ -2721,6 +2818,7 @@ pub use platform::hide_window;
 pub use platform::install_hotkey_override;
 pub use platform::install_modifier_drag;
 pub use platform::left_mouse_button_is_down;
+pub use platform::local_time_hhmm;
 pub use platform::move_resize_window;
 pub use platform::raise_window_no_activate;
 pub use platform::register_hotkeys;
@@ -2729,6 +2827,7 @@ pub use platform::run_message_loop;
 pub use platform::send_ipc_request;
 pub use platform::set_input_hooks_paused;
 pub use platform::show_window_without_activate;
+pub use platform::spawn_ipc_response_stream;
 pub use platform::spawn_ipc_server;
 pub use platform::subscribe_window_events;
 pub use platform::window_rect_for_handle;
@@ -3338,6 +3437,43 @@ mod tests {
 
         assert_eq!(benchmark.iterations, 8);
         assert!(benchmark.total >= benchmark.average);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ipc_response_stream_receives_multiple_server_messages() {
+        let pipe_name = format!(
+            r"\\.\pipe\winland-ipc-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        );
+        let pipe_name: &'static str = Box::leak(pipe_name.into_boxed_str());
+        let (request_sender, request_receiver) = std::sync::mpsc::channel();
+        let _server = platform::spawn_ipc_server(pipe_name, request_sender).unwrap();
+        let (stream_sender, stream_receiver) = std::sync::mpsc::channel();
+        let _client =
+            platform::spawn_ipc_response_stream(pipe_name, b"subscribe\n".to_vec(), stream_sender)
+                .unwrap();
+        let request = request_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+
+        assert_eq!(request.request, b"subscribe\n");
+        request.response.send(b"first\n".to_vec()).unwrap();
+        request.response.send(b"second\n".to_vec()).unwrap();
+
+        assert_eq!(
+            stream_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap(),
+            b"first\n"
+        );
+        assert_eq!(
+            stream_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap(),
+            b"second\n"
+        );
     }
 
     fn test_options() -> HotkeyOverrideOptions {

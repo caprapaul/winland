@@ -42,7 +42,8 @@ startup_commands = ["winland widget run taskbar"]
 Commands are best-effort: failures are logged but do not stop the daemon.
 
 Widgets are separate processes. Reserve screen space with `[layout].offset`, and
-use ordinary `[[window_rules]]` when a widget should be ignored by tiling:
+use ordinary `[[window_rules]]` when a widget should be ignored by tiling. See
+[WIDGETS.md](WIDGETS.md) for the Slint widget API and external plugin protocol.
 
 ```toml
 [[window_rules]]

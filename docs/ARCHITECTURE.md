@@ -35,7 +35,7 @@ At startup, the daemon:
 9. Applies startup retile if enabled.
 10. Enters the Win32 message loop.
 
-Event bridge threads forward Win32/window, hotkey, mouse-drag, and IPC events into one daemon channel. The processor debounces bursty lifecycle events for 50ms, while foreground, move, and move/size events are handled with lower latency.
+Event bridge threads forward Win32/window, hotkey, mouse-drag, and IPC events into one daemon channel. The processor debounces bursty lifecycle events briefly, while foreground, move, and move/size events are handled with lower latency.
 
 ## Layout And State Pipeline
 
@@ -72,6 +72,10 @@ Widgets are separate user processes started from CLI commands such as `winland w
 
 The first widget backend uses Slint for declarative UI. The built-in taskbar is authored as `winland-cli/widgets/taskbar.slint` and embedded by the CLI at compile time. Runtime-loaded `.slint` files are also supported by the CLI. Frameless widgets should use Slint's `no-frame: true` root `Window` property so the titlebar is absent from creation. Topmost behavior is requested through Slint's `always-on-top` property, while Win32-specific panel behavior such as no-activate/tool-window shaping stays in `winland-win32`.
 
+Widget data is source-driven. The CLI can subscribe to daemon state events over IPC, update a local clock source, and run external executable sources. External sources either print one JSON object and exit or print newline-delimited JSON objects as an event stream. The CLI maps those sources into Slint properties such as `workspaces`, `windows`, `plugin-blocks`, and `time-text`; Slint files own layout and presentation.
+
+The user-facing widget authoring API is documented in [WIDGETS.md](WIDGETS.md).
+
 ## Config And Rule Pipeline
 
 Config is parsed with `serde` and `toml` using `deny_unknown_fields`. Validation collects multiple errors before returning.
@@ -91,7 +95,7 @@ Reload is explicit through IPC or hotkey command. Reload validates new config, r
 
 ## IPC And CLI Pipeline
 
-`winland-ipc` defines protocol version `1`. Requests and responses are JSON plus trailing newline.
+`winland-ipc` defines protocol version `1`. Requests and responses are JSON plus trailing newline. `subscribe-state` keeps the IPC pipe open and streams state snapshot responses when daemon state changes.
 
 Current commands:
 

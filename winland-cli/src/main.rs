@@ -1,9 +1,14 @@
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
+use std::process::{Command as ProcessCommand, Stdio};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
+use std::time::Duration;
 
 use anyhow::Result;
 use clap::{ArgAction, Args, Parser, Subcommand};
-use slint::ComponentHandle;
-use slint_interpreter::{ComponentDefinition, ComponentInstance, Value};
+use slint::{ComponentHandle, ModelRc, VecModel};
+use slint_interpreter::{ComponentDefinition, ComponentInstance, Struct, Value};
 use tracing::debug;
 use tracing_subscriber::EnvFilter;
 use winland_core::{
@@ -119,6 +124,12 @@ struct WidgetRunArgs {
     /// Do not keep the widget above normal application windows.
     #[arg(long = "no-topmost", default_value_t = true, action = ArgAction::SetFalse)]
     topmost: bool,
+    /// Run an external widget plugin once and display the JSON object it prints.
+    #[arg(long = "plugin-once")]
+    plugin_once: Vec<String>,
+    /// Run an external widget plugin as a JSON-line event stream.
+    #[arg(long = "plugin-stream")]
+    plugin_stream: Vec<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -445,18 +456,21 @@ fn handle_widget(args: WidgetArgs) -> Result<()> {
 fn run_widget(args: WidgetRunArgs) -> Result<()> {
     configure_default_widget_backend();
 
-    if let Some(file) = args.file {
+    let plugins = WidgetPluginCommands::from_args(&args);
+
+    if let Some(file) = &args.file {
         return run_slint_file_widget(
-            &file,
+            file,
             &args.component,
             args.height,
             args.all_monitors,
             args.topmost,
+            plugins,
         );
     }
 
     match args.widget.as_deref().unwrap_or("taskbar") {
-        "taskbar" => run_taskbar_widget(args.height, args.all_monitors, args.topmost),
+        "taskbar" => run_taskbar_widget(args.height, args.all_monitors, args.topmost, plugins),
         name => Err(anyhow::anyhow!(
             "unknown built-in widget '{name}'; use --file to run a custom .slint widget"
         )),
@@ -476,18 +490,19 @@ fn configure_default_widget_backend() {
     }
 }
 
-fn run_taskbar_widget(height: u32, all_monitors: bool, topmost: bool) -> Result<()> {
+fn run_taskbar_widget(
+    height: u32,
+    all_monitors: bool,
+    topmost: bool,
+    plugins: WidgetPluginCommands,
+) -> Result<()> {
     let definition = compile_slint_source(
         TASKBAR_WIDGET_SOURCE,
         &PathBuf::from(TASKBAR_WIDGET_PATH),
         "TaskbarWidget",
     )?;
 
-    run_slint_widget_instances(definition, height, all_monitors, topmost, |instance| {
-        instance.set_property("label", Value::String("Winland workspace".into()))?;
-        instance.set_property("topmost", Value::Bool(topmost))?;
-        Ok(())
-    })
+    run_slint_widget_instances(definition, height, all_monitors, topmost, plugins)
 }
 
 fn run_slint_file_widget(
@@ -496,13 +511,11 @@ fn run_slint_file_widget(
     height: u32,
     all_monitors: bool,
     topmost: bool,
+    plugins: WidgetPluginCommands,
 ) -> Result<()> {
     let definition = compile_slint_path(path, component)?;
 
-    run_slint_widget_instances(definition, height, all_monitors, topmost, |instance| {
-        instance.set_property("always-on-top", Value::Bool(topmost))?;
-        Ok(())
-    })
+    run_slint_widget_instances(definition, height, all_monitors, topmost, plugins)
 }
 
 fn compile_slint_path(path: &std::path::Path, component: &str) -> Result<ComponentDefinition> {
@@ -556,24 +569,25 @@ fn print_slint_diagnostics(result: &slint_interpreter::CompilationResult) {
     }
 }
 
-fn run_slint_widget_instances<F>(
+fn run_slint_widget_instances(
     definition: ComponentDefinition,
     height: u32,
     all_monitors: bool,
     topmost: bool,
-    configure_instance: F,
-) -> Result<()>
-where
-    F: Fn(&ComponentInstance) -> Result<()>,
-{
+    plugins: WidgetPluginCommands,
+) -> Result<()> {
     let monitors = widget_target_monitors(all_monitors)?;
     let height = height.max(1);
     let mut instances = Vec::new();
+    let workspace_count = winland_config::load_or_default(None)
+        .map(|loaded| loaded.config.workspace_count())
+        .unwrap_or(9);
+    let data = WidgetData::new(workspace_count);
 
     for monitor in monitors {
         let rect = bottom_widget_rect(&monitor, height);
         let instance = definition.create()?;
-        configure_instance(&instance)?;
+        apply_widget_data(&instance, &data, topmost);
         instance
             .window()
             .set_position(slint::PhysicalPosition::new(rect.left, rect.top));
@@ -586,9 +600,531 @@ where
         instances.push(instance);
     }
 
+    let (update_sender, update_receiver) = mpsc::channel();
+    let _sources = start_widget_sources(update_sender, plugins);
+    let shared_data = Arc::new(Mutex::new(data));
+    let weak_instances: Vec<_> = instances.iter().map(ComponentHandle::as_weak).collect();
+    let _dispatcher =
+        start_widget_update_dispatcher(update_receiver, shared_data, weak_instances, topmost);
+
     slint::run_event_loop()?;
-    drop(instances);
     Ok(())
+}
+
+#[derive(Debug, Clone, Default)]
+struct WidgetPluginCommands {
+    once: Vec<String>,
+    stream: Vec<String>,
+}
+
+impl WidgetPluginCommands {
+    fn from_args(args: &WidgetRunArgs) -> Self {
+        Self {
+            once: args.plugin_once.clone(),
+            stream: args.plugin_stream.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WidgetData {
+    workspace_count: u16,
+    workspaces: Vec<WorkspaceWidgetRow>,
+    windows: Vec<WindowWidgetRow>,
+    plugin_blocks: Vec<PluginWidgetBlock>,
+    time_text: String,
+}
+
+impl WidgetData {
+    fn new(workspace_count: u16) -> Self {
+        let workspace_count = workspace_count.max(1);
+        let mut data = Self {
+            workspace_count,
+            workspaces: Vec::new(),
+            windows: Vec::new(),
+            plugin_blocks: Vec::new(),
+            time_text: winland_win32::local_time_hhmm(),
+        };
+        data.rebuild_workspaces(None);
+        data
+    }
+
+    fn apply(&mut self, update: WidgetUpdate) {
+        match update {
+            WidgetUpdate::DaemonState(snapshot) => self.apply_daemon_state(snapshot),
+            WidgetUpdate::Time(time_text) => self.time_text = time_text,
+            WidgetUpdate::PluginBlock(block) => {
+                if let Some(existing) = self
+                    .plugin_blocks
+                    .iter_mut()
+                    .find(|candidate| candidate.source == block.source)
+                {
+                    *existing = block;
+                } else {
+                    self.plugin_blocks.push(block);
+                }
+            }
+        }
+    }
+
+    fn apply_daemon_state(&mut self, snapshot: DaemonStateSnapshot) {
+        let highest_workspace = snapshot
+            .monitors
+            .iter()
+            .map(|monitor| monitor.workspace_id)
+            .chain(
+                snapshot
+                    .windows
+                    .iter()
+                    .filter_map(|window| window.workspace_id),
+            )
+            .chain(std::iter::once(snapshot.active_workspace))
+            .max()
+            .unwrap_or(self.workspace_count);
+        self.workspace_count = self.workspace_count.max(highest_workspace).max(1);
+        self.rebuild_workspaces(Some(&snapshot));
+        self.windows = snapshot
+            .windows
+            .iter()
+            .filter(|window| window.workspace_id.is_some())
+            .map(WindowWidgetRow::from_snapshot)
+            .collect();
+    }
+
+    fn rebuild_workspaces(&mut self, snapshot: Option<&DaemonStateSnapshot>) {
+        self.workspaces = (1..=self.workspace_count)
+            .map(|id| {
+                let active = snapshot.is_some_and(|snapshot| {
+                    snapshot.active_workspace == id
+                        || snapshot
+                            .monitors
+                            .iter()
+                            .any(|monitor| monitor.focused && monitor.workspace_id == id)
+                });
+                let window_count = snapshot
+                    .map(|snapshot| {
+                        snapshot
+                            .windows
+                            .iter()
+                            .filter(|window| window.workspace_id == Some(id))
+                            .count()
+                    })
+                    .unwrap_or(0);
+                WorkspaceWidgetRow {
+                    id,
+                    name: id.to_string(),
+                    active,
+                    window_count,
+                }
+            })
+            .collect();
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkspaceWidgetRow {
+    id: u16,
+    name: String,
+    active: bool,
+    window_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WindowWidgetRow {
+    handle: u64,
+    title: String,
+    workspace_id: u16,
+    focused: bool,
+    visible: bool,
+    participation: String,
+}
+
+impl WindowWidgetRow {
+    fn from_snapshot(window: &winland_ipc::WindowStateSnapshot) -> Self {
+        Self {
+            handle: window.handle,
+            title: window.title.clone(),
+            workspace_id: window.workspace_id.unwrap_or(0),
+            focused: window.focused,
+            visible: window.visible_on_active_workspace,
+            participation: participation_label(window.participation).to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PluginWidgetBlock {
+    source: String,
+    label: String,
+    text: String,
+}
+
+enum WidgetUpdate {
+    DaemonState(DaemonStateSnapshot),
+    Time(String),
+    PluginBlock(PluginWidgetBlock),
+}
+
+fn apply_widget_data(instance: &ComponentInstance, data: &WidgetData, topmost: bool) {
+    set_widget_property(instance, "topmost", Value::Bool(topmost));
+    set_widget_property(instance, "always-on-top", Value::Bool(topmost));
+    set_widget_property(
+        instance,
+        "time-text",
+        Value::String(data.time_text.clone().into()),
+    );
+    set_widget_property(
+        instance,
+        "label",
+        Value::String(widget_summary_label(data).into()),
+    );
+    set_widget_property(instance, "workspaces", rows_model(workspace_values(data)));
+    set_widget_property(instance, "windows", rows_model(window_values(data)));
+    set_widget_property(
+        instance,
+        "plugin-blocks",
+        rows_model(plugin_block_values(data)),
+    );
+}
+
+fn set_widget_property(instance: &ComponentInstance, name: &str, value: Value) {
+    let _ = instance.set_property(name, value);
+}
+
+fn widget_summary_label(data: &WidgetData) -> String {
+    let active_workspace = data
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.active)
+        .map(|workspace| workspace.name.as_str())
+        .unwrap_or("-");
+    let focused_window = data
+        .windows
+        .iter()
+        .find(|window| window.focused)
+        .map(|window| window.title.as_str())
+        .unwrap_or("no focused window");
+
+    format!(
+        "Workspace {active_workspace} | {focused_window} | {}",
+        data.time_text
+    )
+}
+
+fn rows_model(rows: Vec<Value>) -> Value {
+    Value::from(ModelRc::new(VecModel::from(rows)))
+}
+
+fn workspace_values(data: &WidgetData) -> Vec<Value> {
+    data.workspaces
+        .iter()
+        .map(|workspace| {
+            Value::Struct(Struct::from_iter([
+                ("id".to_owned(), Value::Number(f64::from(workspace.id))),
+                (
+                    "name".to_owned(),
+                    Value::String(workspace.name.clone().into()),
+                ),
+                ("active".to_owned(), Value::Bool(workspace.active)),
+                (
+                    "window-count".to_owned(),
+                    Value::Number(workspace.window_count as f64),
+                ),
+            ]))
+        })
+        .collect()
+}
+
+fn window_values(data: &WidgetData) -> Vec<Value> {
+    data.windows
+        .iter()
+        .map(|window| {
+            Value::Struct(Struct::from_iter([
+                ("handle".to_owned(), Value::Number(window.handle as f64)),
+                (
+                    "title".to_owned(),
+                    Value::String(window.title.clone().into()),
+                ),
+                (
+                    "workspace-id".to_owned(),
+                    Value::Number(f64::from(window.workspace_id)),
+                ),
+                ("focused".to_owned(), Value::Bool(window.focused)),
+                ("visible".to_owned(), Value::Bool(window.visible)),
+                (
+                    "participation".to_owned(),
+                    Value::String(window.participation.clone().into()),
+                ),
+            ]))
+        })
+        .collect()
+}
+
+fn plugin_block_values(data: &WidgetData) -> Vec<Value> {
+    data.plugin_blocks
+        .iter()
+        .map(|block| {
+            Value::Struct(Struct::from_iter([
+                (
+                    "source".to_owned(),
+                    Value::String(block.source.clone().into()),
+                ),
+                (
+                    "label".to_owned(),
+                    Value::String(block.label.clone().into()),
+                ),
+                ("text".to_owned(), Value::String(block.text.clone().into())),
+            ]))
+        })
+        .collect()
+}
+
+fn start_widget_sources(
+    update_sender: mpsc::Sender<WidgetUpdate>,
+    plugins: WidgetPluginCommands,
+) -> Vec<thread::JoinHandle<()>> {
+    let mut sources = Vec::new();
+    sources.push(start_clock_source(update_sender.clone()));
+    sources.push(start_daemon_state_source(update_sender.clone()));
+
+    for command in plugins.once {
+        sources.push(start_plugin_once_source(update_sender.clone(), command));
+    }
+
+    for command in plugins.stream {
+        sources.push(start_plugin_stream_source(update_sender.clone(), command));
+    }
+
+    sources
+}
+
+fn start_widget_update_dispatcher(
+    update_receiver: mpsc::Receiver<WidgetUpdate>,
+    data: Arc<Mutex<WidgetData>>,
+    instances: Vec<slint::Weak<ComponentInstance>>,
+    topmost: bool,
+) -> thread::JoinHandle<()> {
+    thread::Builder::new()
+        .name("winland-widget-ui-dispatch".to_owned())
+        .spawn(move || {
+            while let Ok(update) = update_receiver.recv() {
+                let data = Arc::clone(&data);
+                let instances = instances.clone();
+                if slint::invoke_from_event_loop(move || {
+                    let Ok(mut data) = data.lock() else {
+                        return;
+                    };
+                    data.apply(update);
+                    for instance in &instances {
+                        if let Some(instance) = instance.upgrade() {
+                            apply_widget_data(&instance, &data, topmost);
+                        }
+                    }
+                })
+                .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .expect("spawn widget UI update dispatcher")
+}
+
+fn start_clock_source(update_sender: mpsc::Sender<WidgetUpdate>) -> thread::JoinHandle<()> {
+    thread::Builder::new()
+        .name("winland-widget-clock".to_owned())
+        .spawn(move || {
+            loop {
+                if update_sender
+                    .send(WidgetUpdate::Time(winland_win32::local_time_hhmm()))
+                    .is_err()
+                {
+                    break;
+                }
+                thread::sleep(Duration::from_secs(1));
+            }
+        })
+        .expect("spawn widget clock source")
+}
+
+fn start_daemon_state_source(update_sender: mpsc::Sender<WidgetUpdate>) -> thread::JoinHandle<()> {
+    thread::Builder::new()
+        .name("winland-widget-daemon-state".to_owned())
+        .spawn(move || {
+            loop {
+                let request = match encode_request(&IpcRequest::subscribe_state()) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        eprintln!("failed to encode daemon state subscription request: {error}");
+                        thread::sleep(Duration::from_millis(500));
+                        continue;
+                    }
+                };
+                let (raw_sender, raw_receiver) = mpsc::channel();
+                if let Err(error) = winland_win32::spawn_ipc_response_stream(
+                    winland_win32::DEFAULT_IPC_PIPE_NAME,
+                    request,
+                    raw_sender,
+                ) {
+                    eprintln!("failed to subscribe to Winland daemon state: {error}");
+                    thread::sleep(Duration::from_millis(500));
+                    continue;
+                }
+
+                let mut buffer = Vec::new();
+                for raw in raw_receiver {
+                    for response in decode_framed_ipc_responses(&mut buffer, &raw) {
+                        match response {
+                            Ok(response) => {
+                                if let IpcResponseResult::State(snapshot) = response.result
+                                    && update_sender
+                                        .send(WidgetUpdate::DaemonState(snapshot))
+                                        .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            Err(error) => eprintln!("failed to decode daemon state event: {error}"),
+                        }
+                    }
+                }
+
+                thread::sleep(Duration::from_millis(500));
+            }
+        })
+        .expect("spawn widget daemon state source")
+}
+
+fn decode_framed_ipc_responses(
+    buffer: &mut Vec<u8>,
+    chunk: &[u8],
+) -> Vec<Result<winland_ipc::IpcResponse, winland_ipc::ProtocolError>> {
+    buffer.extend_from_slice(chunk);
+    let mut responses = Vec::new();
+
+    while let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
+        let line: Vec<_> = buffer.drain(..=newline).collect();
+        let trimmed = line.trim_ascii_end();
+        if !trimmed.is_empty() {
+            responses.push(decode_response(trimmed));
+        }
+    }
+
+    responses
+}
+
+fn start_plugin_once_source(
+    update_sender: mpsc::Sender<WidgetUpdate>,
+    command: String,
+) -> thread::JoinHandle<()> {
+    thread::Builder::new()
+        .name("winland-widget-plugin-once".to_owned())
+        .spawn(move || {
+            match plugin_shell_command(&command)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .output()
+            {
+                Ok(output) => {
+                    let text = String::from_utf8_lossy(&output.stdout);
+                    if let Some(block) = parse_plugin_block(&command, text.trim()) {
+                        let _ = update_sender.send(WidgetUpdate::PluginBlock(block));
+                    }
+                }
+                Err(error) => eprintln!("failed to run widget plugin '{command}': {error}"),
+            }
+        })
+        .expect("spawn widget plugin once source")
+}
+
+fn start_plugin_stream_source(
+    update_sender: mpsc::Sender<WidgetUpdate>,
+    command: String,
+) -> thread::JoinHandle<()> {
+    thread::Builder::new()
+        .name("winland-widget-plugin-stream".to_owned())
+        .spawn(move || {
+            let mut child = match plugin_shell_command(&command)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(child) => child,
+                Err(error) => {
+                    eprintln!("failed to start widget plugin stream '{command}': {error}");
+                    return;
+                }
+            };
+            let Some(stdout) = child.stdout.take() else {
+                eprintln!("widget plugin stream '{command}' did not expose stdout");
+                return;
+            };
+
+            for line in BufReader::new(stdout).lines() {
+                match line {
+                    Ok(line) => {
+                        if let Some(block) = parse_plugin_block(&command, line.trim())
+                            && update_sender
+                                .send(WidgetUpdate::PluginBlock(block))
+                                .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("failed to read widget plugin stream '{command}': {error}");
+                        break;
+                    }
+                }
+            }
+        })
+        .expect("spawn widget plugin stream source")
+}
+
+fn plugin_shell_command(command: &str) -> ProcessCommand {
+    #[cfg(windows)]
+    {
+        let mut process = ProcessCommand::new("cmd.exe");
+        process.arg("/C").arg(command);
+        process
+    }
+
+    #[cfg(not(windows))]
+    {
+        let mut process = ProcessCommand::new("sh");
+        process.arg("-c").arg(command);
+        process
+    }
+}
+
+fn parse_plugin_block(source: &str, input: &str) -> Option<PluginWidgetBlock> {
+    if input.is_empty() {
+        return None;
+    }
+
+    let value: serde_json::Value = serde_json::from_str(input).ok()?;
+    let label = json_string_field(&value, "label")
+        .or_else(|| json_string_field(&value, "name"))
+        .unwrap_or_else(|| source.to_owned());
+    let text = json_string_field(&value, "text")
+        .or_else(|| json_string_field(&value, "value"))
+        .or_else(|| json_string_field(&value, "status"))
+        .unwrap_or_else(|| value.to_string());
+
+    Some(PluginWidgetBlock {
+        source: source.to_owned(),
+        label,
+        text,
+    })
+}
+
+fn json_string_field(value: &serde_json::Value, field: &str) -> Option<String> {
+    match value.get(field)? {
+        serde_json::Value::String(value) => Some(value.clone()),
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        serde_json::Value::Bool(value) => Some(value.to_string()),
+        _ => None,
+    }
 }
 
 fn widget_target_monitors(all_monitors: bool) -> Result<Vec<MonitorInfo>> {
@@ -1368,6 +1904,88 @@ mod tests {
         assert_eq!(definition.name(), "TaskbarWidget");
     }
 
+    #[test]
+    fn widget_data_maps_daemon_state_to_workspace_and_window_rows() {
+        let mut data = WidgetData::new(2);
+        data.apply(WidgetUpdate::DaemonState(DaemonStateSnapshot {
+            config_path: None,
+            config_version: 1,
+            config_loaded_at_unix_ms: 10,
+            total_windows: 1,
+            manageable_windows: 1,
+            floating_windows: 0,
+            temporary_floating_windows: 0,
+            active_workspace: 2,
+            foreground_window: Some(0xCAFE),
+            monitors: vec![winland_ipc::MonitorStateSnapshot {
+                monitor_id: 1,
+                workspace_id: 2,
+                focused: true,
+            }],
+            windows: vec![winland_ipc::WindowStateSnapshot {
+                handle: 0xCAFE,
+                title: "Editor".to_owned(),
+                monitor_id: Some(1),
+                workspace_id: Some(2),
+                focused: true,
+                participation: WindowParticipationSnapshot::Tiled,
+                constrained: false,
+                visible_on_active_workspace: true,
+            }],
+            performance: test_performance(),
+        }));
+
+        assert_eq!(data.workspaces.len(), 2);
+        assert!(data.workspaces[1].active);
+        assert_eq!(data.workspaces[1].window_count, 1);
+        assert_eq!(data.windows[0].title, "Editor");
+        assert!(data.windows[0].focused);
+    }
+
+    #[test]
+    fn plugin_json_accepts_label_and_text_fields() {
+        let block = parse_plugin_block(
+            "my-plugin",
+            r#"{"label":"CPU","text":"14%","ignored":["nested"]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            block,
+            PluginWidgetBlock {
+                source: "my-plugin".to_owned(),
+                label: "CPU".to_owned(),
+                text: "14%".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn framed_ipc_decoder_handles_combined_and_split_json_lines() {
+        let first =
+            winland_ipc::encode_response(&winland_ipc::IpcResponse::state(test_snapshot(1, "One")))
+                .unwrap();
+        let second =
+            winland_ipc::encode_response(&winland_ipc::IpcResponse::state(test_snapshot(2, "Two")))
+                .unwrap();
+        let mut combined = first.clone();
+        combined.extend_from_slice(&second[..8]);
+
+        let mut buffer = Vec::new();
+        let decoded = decode_framed_ipc_responses(&mut buffer, &combined);
+
+        assert_eq!(decoded.len(), 1);
+        assert!(!buffer.is_empty());
+
+        let decoded = decode_framed_ipc_responses(&mut buffer, &second[8..]);
+        assert_eq!(decoded.len(), 1);
+        let response = decoded.into_iter().next().unwrap().unwrap();
+        let winland_ipc::IpcResponseResult::State(snapshot) = response.result else {
+            panic!("expected state response");
+        };
+        assert_eq!(snapshot.windows[0].title, "Two");
+    }
+
     fn test_performance() -> winland_ipc::DaemonPerformanceSnapshot {
         winland_ipc::DaemonPerformanceSnapshot {
             relayout_count: 0,
@@ -1378,6 +1996,36 @@ mod tests {
             border_window_count: 0,
             game_mode_active: false,
             config_reload_count: 0,
+        }
+    }
+
+    fn test_snapshot(handle: u64, title: &str) -> DaemonStateSnapshot {
+        DaemonStateSnapshot {
+            config_path: None,
+            config_version: 1,
+            config_loaded_at_unix_ms: 10,
+            total_windows: 1,
+            manageable_windows: 1,
+            floating_windows: 0,
+            temporary_floating_windows: 0,
+            active_workspace: 1,
+            foreground_window: Some(handle),
+            monitors: vec![winland_ipc::MonitorStateSnapshot {
+                monitor_id: 1,
+                workspace_id: 1,
+                focused: true,
+            }],
+            windows: vec![winland_ipc::WindowStateSnapshot {
+                handle,
+                title: title.to_owned(),
+                monitor_id: Some(1),
+                workspace_id: Some(1),
+                focused: true,
+                participation: WindowParticipationSnapshot::Tiled,
+                constrained: false,
+                visible_on_active_workspace: true,
+            }],
+            performance: test_performance(),
         }
     }
 }

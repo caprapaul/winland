@@ -1,6 +1,104 @@
+export struct WorkspaceRow {
+    id: int,
+    name: string,
+    active: bool,
+    window-count: int,
+}
+
+export struct WindowRow {
+    handle: float,
+    title: string,
+    workspace-id: int,
+    focused: bool,
+    visible: bool,
+    participation: string,
+}
+
+export struct PluginBlock {
+    source: string,
+    label: string,
+    text: string,
+}
+
+component WorkspacePill inherits Rectangle {
+    in property <WorkspaceRow> item;
+
+    height: 28px;
+    width: 46px;
+    border-radius: 4px;
+    background: item.active ? #3d6fb6 : #2b3038;
+    border-width: item.window-count > 0 && !item.active ? 1px : 0px;
+    border-color: #55606d;
+
+    Text {
+        text: item.name;
+        color: item.active ? #ffffff : #d7dce3;
+        font-size: 13px;
+        font-weight: item.active ? 700 : 500;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+component WindowItem inherits Rectangle {
+    in property <WindowRow> item;
+
+    height: 28px;
+    width: 180px;
+    border-radius: 4px;
+    background: item.focused ? #36544a : (item.visible ? #252b33 : #1c2026);
+    border-width: item.focused ? 1px : 0px;
+    border-color: #72c89b;
+
+    Text {
+        x: 10px;
+        width: parent.width - 20px;
+        height: parent.height;
+        text: item.title;
+        color: item.visible ? #eef2f7 : #9aa3ad;
+        font-size: 12px;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+}
+
+component PluginBadge inherits Rectangle {
+    in property <PluginBlock> block;
+
+    height: 28px;
+    min-width: 72px;
+    border-radius: 4px;
+    background: #2a2f37;
+
+    HorizontalLayout {
+        padding-left: 9px;
+        padding-right: 9px;
+        spacing: 6px;
+
+        Text {
+            text: block.label;
+            color: #aeb7c2;
+            font-size: 11px;
+            vertical-alignment: center;
+        }
+
+        Text {
+            text: block.text;
+            color: #f4f7fb;
+            font-size: 12px;
+            font-weight: 600;
+            vertical-alignment: center;
+        }
+    }
+}
+
 export component TaskbarWidget inherits Window {
-    in property <string> label;
     in property <bool> topmost;
+    in property <string> label;
+    in property <[WorkspaceRow]> workspaces;
+    in property <[WindowRow]> windows;
+    in property <[PluginBlock]> plugin-blocks;
+    in property <string> time-text;
 
     no-frame: true;
     always-on-top: root.topmost;
@@ -13,16 +111,47 @@ export component TaskbarWidget inherits Window {
         width: 100%;
         height: 100%;
         background: #20242a;
-    }
 
-    Text {
-        x: 16px;
-        y: 0px;
-        height: parent.height;
-        text: root.label;
-        color: #f5f7fb;
-        vertical-alignment: center;
-        font-size: 14px;
-        font-weight: 600;
+        HorizontalLayout {
+            padding-left: 10px;
+            padding-right: 10px;
+            spacing: 8px;
+            alignment: start;
+
+            for workspace in root.workspaces: WorkspacePill {
+                item: workspace;
+            }
+
+            Rectangle {
+                width: 1px;
+                height: 24px;
+                background: #3a414c;
+            }
+
+            for window in root.windows: WindowItem {
+                item: window;
+            }
+
+            Rectangle {
+                min-width: 8px;
+                horizontal-stretch: 1;
+                background: transparent;
+            }
+
+            for block in root.plugin-blocks: PluginBadge {
+                block: block;
+            }
+
+            Text {
+                min-width: 54px;
+                height: 28px;
+                text: root.time-text;
+                color: #ffffff;
+                font-size: 13px;
+                font-weight: 700;
+                horizontal-alignment: right;
+                vertical-alignment: center;
+            }
+        }
     }
 }

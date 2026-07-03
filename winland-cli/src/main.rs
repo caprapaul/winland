@@ -1,4 +1,4 @@
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use clap::{ArgAction, Args, Parser, Subcommand};
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use slint::{ComponentHandle, ModelRc, VecModel};
 use slint_interpreter::{ComponentDefinition, ComponentInstance, Struct, Value};
 use tracing::debug;
@@ -16,7 +17,7 @@ use winland_core::{
     detect_game_mode, tile_windows_with_config,
 };
 use winland_ipc::{
-    DaemonStateSnapshot, IpcRequest, IpcResponseResult, ReloadConfigReport,
+    CommandReport, DaemonStateSnapshot, IpcRequest, IpcResponseResult, ReloadConfigReport,
     WindowParticipationSnapshot, decode_response, encode_request,
 };
 
@@ -37,6 +38,9 @@ enum Command {
     State(StateArgs),
     /// Reload the running daemon's config through local IPC.
     ReloadConfig(ReloadConfigArgs),
+    /// Execute a daemon command through local IPC.
+    #[command(name = "command")]
+    Action(CommandArgs),
     /// List discovered desktop windows and explain Winland's conservative filter.
     Windows(WindowsArgs),
     /// List discovered monitors and their stable Winland IDs.
@@ -65,6 +69,13 @@ struct ReloadConfigArgs {
     /// Print the reload report as JSON.
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Debug, Args)]
+struct CommandArgs {
+    /// Command and arguments to route to the running daemon.
+    #[arg(required = true, trailing_var_arg = true)]
+    command: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -227,6 +238,7 @@ fn main() -> Result<()> {
     match cli.command {
         Command::State(args) => daemon_state(args),
         Command::ReloadConfig(args) => reload_config(args),
+        Command::Action(args) => daemon_command(args),
         Command::Windows(args) => list_windows(args),
         Command::Monitors => list_monitors(),
         Command::DiagnoseWindow(args) => diagnose_window(args),
@@ -588,6 +600,7 @@ fn run_slint_widget_instances(
         let rect = bottom_widget_rect(&monitor, height);
         let instance = definition.create()?;
         apply_widget_data(&instance, &data, topmost);
+        register_widget_callbacks(&instance);
         instance
             .window()
             .set_position(slint::PhysicalPosition::new(rect.left, rect.top));
@@ -596,7 +609,7 @@ fn run_slint_widget_instances(
             rect.height() as u32,
         ));
         instance.show()?;
-        configure_slint_widget_window(rect, topmost)?;
+        configure_slint_widget_window(&instance, rect, topmost)?;
         instances.push(instance);
     }
 
@@ -629,6 +642,7 @@ impl WidgetPluginCommands {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WidgetData {
     workspace_count: u16,
+    active_workspace: u16,
     workspaces: Vec<WorkspaceWidgetRow>,
     windows: Vec<WindowWidgetRow>,
     plugin_blocks: Vec<PluginWidgetBlock>,
@@ -640,6 +654,7 @@ impl WidgetData {
         let workspace_count = workspace_count.max(1);
         let mut data = Self {
             workspace_count,
+            active_workspace: 1,
             workspaces: Vec::new(),
             windows: Vec::new(),
             plugin_blocks: Vec::new(),
@@ -682,11 +697,12 @@ impl WidgetData {
             .max()
             .unwrap_or(self.workspace_count);
         self.workspace_count = self.workspace_count.max(highest_workspace).max(1);
+        self.active_workspace = taskbar_active_workspace(&snapshot);
         self.rebuild_workspaces(Some(&snapshot));
         self.windows = snapshot
             .windows
             .iter()
-            .filter(|window| window.workspace_id.is_some())
+            .filter(|window| window.workspace_id == Some(self.active_workspace))
             .map(WindowWidgetRow::from_snapshot)
             .collect();
     }
@@ -713,6 +729,7 @@ impl WidgetData {
                 WorkspaceWidgetRow {
                     id,
                     name: id.to_string(),
+                    command: cli_daemon_command(&format!("switch-workspace {id}")),
                     active,
                     window_count,
                 }
@@ -725,6 +742,7 @@ impl WidgetData {
 struct WorkspaceWidgetRow {
     id: u16,
     name: String,
+    command: String,
     active: bool,
     window_count: usize,
 }
@@ -732,10 +750,13 @@ struct WorkspaceWidgetRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WindowWidgetRow {
     handle: u64,
+    handle_text: String,
+    command: String,
     title: String,
     workspace_id: u16,
     focused: bool,
     visible: bool,
+    is_minimized: bool,
     participation: String,
 }
 
@@ -743,13 +764,37 @@ impl WindowWidgetRow {
     fn from_snapshot(window: &winland_ipc::WindowStateSnapshot) -> Self {
         Self {
             handle: window.handle,
+            handle_text: format_hwnd_like(window.handle),
+            command: cli_daemon_command(&format!(
+                "focus-window {}",
+                format_hwnd_like(window.handle)
+            )),
             title: window.title.clone(),
             workspace_id: window.workspace_id.unwrap_or(0),
             focused: window.focused,
             visible: window.visible_on_active_workspace,
+            is_minimized: window.is_minimized,
             participation: participation_label(window.participation).to_owned(),
         }
     }
+}
+
+fn taskbar_active_workspace(snapshot: &DaemonStateSnapshot) -> u16 {
+    snapshot
+        .monitors
+        .iter()
+        .find(|monitor| monitor.focused)
+        .map(|monitor| monitor.workspace_id)
+        .unwrap_or(snapshot.active_workspace)
+        .max(1)
+}
+
+fn cli_daemon_command(command: &str) -> String {
+    let cli = std::env::current_exe()
+        .ok()
+        .map(|path| winland_win32::quote_windows_arg(&path.display().to_string()))
+        .unwrap_or_else(|| "winland".to_owned());
+    format!("{cli} command {command}")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -791,6 +836,90 @@ fn set_widget_property(instance: &ComponentInstance, name: &str, value: Value) {
     let _ = instance.set_property(name, value);
 }
 
+fn register_widget_callbacks(instance: &ComponentInstance) {
+    if let Err(error) = instance.set_callback("run-command", |args| {
+        if let Some(command) = args.first().and_then(value_as_string) {
+            launch_widget_command(command);
+        }
+        Value::Void
+    }) {
+        debug!(%error, "widget does not expose run-command callback");
+    }
+}
+
+fn value_as_string(value: &Value) -> Option<&str> {
+    match value {
+        Value::String(value) => Some(value.as_str()),
+        _ => None,
+    }
+}
+
+fn launch_widget_command(command: &str) {
+    let command = command.trim();
+    if command.is_empty() {
+        return;
+    }
+
+    debug!(%command, "running widget command");
+    log_widget_command_event(&format!("running widget command: {command}"));
+    let child = plugin_shell_command(command)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+
+    match child {
+        Ok(child) => watch_widget_command(command.to_owned(), child),
+        Err(error) => {
+            log_widget_command_event(&format!(
+                "failed to run widget command '{command}': {error}"
+            ));
+            eprintln!("failed to run widget command '{command}': {error}");
+        }
+    }
+}
+
+fn watch_widget_command(command: String, child: std::process::Child) {
+    let _ = thread::Builder::new()
+        .name("winland-widget-command".to_owned())
+        .spawn(move || match child.wait_with_output() {
+            Ok(output) => {
+                let status = output
+                    .status
+                    .code()
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "terminated".to_owned());
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+
+                log_widget_command_event(&format!(
+                    "widget command exited status={status}: {command}"
+                ));
+                for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
+                    log_widget_command_event(&format!("widget command stdout: {line}"));
+                }
+                for line in stderr.lines().filter(|line| !line.trim().is_empty()) {
+                    log_widget_command_event(&format!("widget command stderr: {line}"));
+                }
+            }
+            Err(error) => log_widget_command_event(&format!(
+                "failed to wait for widget command '{command}': {error}"
+            )),
+        });
+}
+
+fn log_widget_command_event(message: &str) {
+    let path = std::env::temp_dir().join("winland-widget-commands.log");
+    let timestamp = winland_win32::local_time_hhmm();
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{timestamp} {message}");
+    }
+}
+
 fn widget_summary_label(data: &WidgetData) -> String {
     let active_workspace = data
         .workspaces
@@ -825,6 +954,10 @@ fn workspace_values(data: &WidgetData) -> Vec<Value> {
                     "name".to_owned(),
                     Value::String(workspace.name.clone().into()),
                 ),
+                (
+                    "command".to_owned(),
+                    Value::String(workspace.command.clone().into()),
+                ),
                 ("active".to_owned(), Value::Bool(workspace.active)),
                 (
                     "window-count".to_owned(),
@@ -846,11 +979,20 @@ fn window_values(data: &WidgetData) -> Vec<Value> {
                     Value::String(window.title.clone().into()),
                 ),
                 (
+                    "handle-text".to_owned(),
+                    Value::String(window.handle_text.clone().into()),
+                ),
+                (
+                    "command".to_owned(),
+                    Value::String(window.command.clone().into()),
+                ),
+                (
                     "workspace-id".to_owned(),
                     Value::Number(f64::from(window.workspace_id)),
                 ),
                 ("focused".to_owned(), Value::Bool(window.focused)),
                 ("visible".to_owned(), Value::Bool(window.visible)),
+                ("is-minimized".to_owned(), Value::Bool(window.is_minimized)),
                 (
                     "participation".to_owned(),
                     Value::String(window.participation.clone().into()),
@@ -1084,8 +1226,10 @@ fn start_plugin_stream_source(
 fn plugin_shell_command(command: &str) -> ProcessCommand {
     #[cfg(windows)]
     {
+        use std::os::windows::process::CommandExt;
+
         let mut process = ProcessCommand::new("cmd.exe");
-        process.arg("/C").arg(command);
+        process.arg("/C").raw_arg(command);
         process
     }
 
@@ -1153,10 +1297,29 @@ fn bottom_widget_rect(monitor: &MonitorInfo, height: u32) -> Rect {
     }
 }
 
-fn configure_slint_widget_window(rect: Rect, topmost: bool) -> Result<()> {
-    let handle = widget_window_for_current_process(rect)?;
+fn configure_slint_widget_window(
+    instance: &ComponentInstance,
+    rect: Rect,
+    topmost: bool,
+) -> Result<()> {
+    let handle =
+        widget_window_handle(instance).or_else(|_| widget_window_for_current_process(rect))?;
     winland_win32::configure_widget_window(handle, rect, topmost)?;
     Ok(())
+}
+
+fn widget_window_handle(instance: &ComponentInstance) -> Result<WindowHandle> {
+    let slint_window_handle = instance.window().window_handle();
+    let handle = slint_window_handle
+        .window_handle()
+        .map_err(|error| anyhow::anyhow!("could not get Slint widget window handle: {error}"))?;
+
+    match handle.as_raw() {
+        RawWindowHandle::Win32(handle) => Ok(WindowHandle(handle.hwnd.get() as usize as u64)),
+        _ => Err(anyhow::anyhow!(
+            "Slint widget did not expose a Win32 window handle"
+        )),
+    }
 }
 
 fn widget_window_for_current_process(target: Rect) -> Result<WindowHandle> {
@@ -1404,6 +1567,11 @@ fn daemon_state(args: StateArgs) -> Result<()> {
                 "daemon returned reload-config response to state request"
             ));
         }
+        IpcResponseResult::Command(_) => {
+            return Err(anyhow::anyhow!(
+                "daemon returned command response to state request"
+            ));
+        }
     }
 
     Ok(())
@@ -1438,9 +1606,50 @@ fn reload_config(args: ReloadConfigArgs) -> Result<()> {
                 "daemon returned state response to reload-config request"
             ));
         }
+        IpcResponseResult::Command(_) => {
+            return Err(anyhow::anyhow!(
+                "daemon returned command response to reload-config request"
+            ));
+        }
     }
 
     Ok(())
+}
+
+fn daemon_command(args: CommandArgs) -> Result<()> {
+    let command = args.command.join(" ");
+    let request = encode_request(&IpcRequest::command(command.clone()))?;
+    let response =
+        match winland_win32::send_ipc_request(winland_win32::DEFAULT_IPC_PIPE_NAME, &request) {
+            Ok(response) => response,
+            Err(winland_win32::Win32Error::DaemonNotRunning { .. }) => {
+                eprintln!(
+                    "Winland daemon is not running. Start winland-daemon before using IPC commands."
+                );
+                std::process::exit(2);
+            }
+            Err(error) => return Err(error.into()),
+        };
+
+    match decode_response(&response)?.result {
+        IpcResponseResult::Command(report) => {
+            println!("{}", format_command_report(&report));
+        }
+        IpcResponseResult::Error(error) => {
+            return Err(anyhow::anyhow!("daemon IPC error: {}", error.message));
+        }
+        other => {
+            return Err(anyhow::anyhow!(
+                "daemon returned unexpected response to command request: {other:?}"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn format_command_report(report: &CommandReport) -> String {
+    format!("Command executed: {}", report.command)
 }
 
 fn tile_once() -> Result<()> {
@@ -1843,6 +2052,7 @@ mod tests {
                 monitor_id: Some(1),
                 workspace_id: Some(4),
                 focused: true,
+                is_minimized: false,
                 participation: WindowParticipationSnapshot::Floating,
                 constrained: true,
                 visible_on_active_workspace: true,
@@ -1928,6 +2138,7 @@ mod tests {
                 monitor_id: Some(1),
                 workspace_id: Some(2),
                 focused: true,
+                is_minimized: false,
                 participation: WindowParticipationSnapshot::Tiled,
                 constrained: false,
                 visible_on_active_workspace: true,
@@ -1940,6 +2151,67 @@ mod tests {
         assert_eq!(data.workspaces[1].window_count, 1);
         assert_eq!(data.windows[0].title, "Editor");
         assert!(data.windows[0].focused);
+        assert!(
+            data.windows[0]
+                .command
+                .ends_with(" command focus-window 0xCAFE")
+        );
+    }
+
+    #[test]
+    fn widget_data_shows_current_workspace_windows_and_keeps_minimized_rows() {
+        let mut data = WidgetData::new(3);
+        data.apply(WidgetUpdate::DaemonState(DaemonStateSnapshot {
+            config_path: None,
+            config_version: 1,
+            config_loaded_at_unix_ms: 10,
+            total_windows: 2,
+            manageable_windows: 1,
+            floating_windows: 0,
+            temporary_floating_windows: 0,
+            active_workspace: 1,
+            foreground_window: Some(0xBEEF),
+            monitors: vec![winland_ipc::MonitorStateSnapshot {
+                monitor_id: 1,
+                workspace_id: 2,
+                focused: true,
+            }],
+            windows: vec![
+                winland_ipc::WindowStateSnapshot {
+                    handle: 0xCAFE,
+                    title: "Other Workspace".to_owned(),
+                    monitor_id: Some(1),
+                    workspace_id: Some(1),
+                    focused: false,
+                    is_minimized: false,
+                    participation: WindowParticipationSnapshot::Tiled,
+                    constrained: false,
+                    visible_on_active_workspace: false,
+                },
+                winland_ipc::WindowStateSnapshot {
+                    handle: 0xBEEF,
+                    title: "Minimized Editor".to_owned(),
+                    monitor_id: Some(1),
+                    workspace_id: Some(2),
+                    focused: true,
+                    is_minimized: true,
+                    participation: WindowParticipationSnapshot::Tiled,
+                    constrained: false,
+                    visible_on_active_workspace: true,
+                },
+            ],
+            performance: test_performance(),
+        }));
+
+        assert_eq!(
+            data.windows
+                .iter()
+                .map(|window| window.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Minimized Editor"]
+        );
+        assert!(data.windows[0].is_minimized);
+        assert_eq!(data.active_workspace, 2);
     }
 
     #[test]
@@ -2021,6 +2293,7 @@ mod tests {
                 monitor_id: Some(1),
                 workspace_id: Some(1),
                 focused: true,
+                is_minimized: false,
                 participation: WindowParticipationSnapshot::Tiled,
                 constrained: false,
                 visible_on_active_workspace: true,

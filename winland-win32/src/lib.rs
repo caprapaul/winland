@@ -57,14 +57,14 @@ mod platform {
         GetWindowThreadProcessId, HC_ACTION, HHOOK, HTCAPTION, HTSYSMENU, HTTRANSPARENT,
         HWND_NOTOPMOST, HWND_TOPMOST, IsIconic, IsWindowVisible, KBDLLHOOKSTRUCT, MINMAXINFO,
         MONITORINFOF_PRIMARY, MSG, MSLLHOOKSTRUCT, OBJID_WINDOW, PM_NOREMOVE, PeekMessageW,
-        PostThreadMessageW, RegisterClassW, SMTO_ABORTIFHUNG, SW_HIDE, SW_SHOWNOACTIVATE,
-        SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
-        SWP_SHOWWINDOW, SendMessageTimeoutW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
-        SetWindowsHookExW, ShowWindow, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL,
-        WH_MOUSE_LL, WINEVENT_OUTOFCONTEXT, WM_APP, WM_GETMINMAXINFO, WM_HOTKEY, WM_KEYDOWN,
-        WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WM_QUIT, WM_SYSKEYDOWN,
-        WNDCLASSW, WS_CAPTION, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
-        WS_THICKFRAME, WindowFromPoint,
+        PostThreadMessageW, RegisterClassW, SMTO_ABORTIFHUNG, SW_HIDE, SW_RESTORE,
+        SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
+        SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SendMessageTimeoutW, SetForegroundWindow,
+        SetWindowLongPtrW, SetWindowPos, SetWindowsHookExW, ShowWindow, TranslateMessage,
+        UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WINEVENT_OUTOFCONTEXT, WM_APP,
+        WM_GETMINMAXINFO, WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+        WM_NCHITTEST, WM_PAINT, WM_QUIT, WM_SYSKEYDOWN, WNDCLASSW, WS_CAPTION, WS_EX_NOACTIVATE,
+        WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP, WS_THICKFRAME, WindowFromPoint,
     };
     use windows::core::{PCWSTR, PWSTR};
     use winland_core::{
@@ -216,17 +216,16 @@ mod platform {
         let hwnd = hwnd_from_handle(handle);
 
         // SAFETY: hwnd belongs to a window created by the current widget process.
-        // Slint is responsible for creating frameless widget windows. These
-        // documented style bits keep the window panel-like and out of Alt-Tab;
-        // SetWindowPos applies the requested z-order and geometry.
+        // Slint is responsible for creating frameless widget windows. Keep the
+        // window an ordinary click target; widget interactivity belongs to the
+        // widget process, not to Winland's input hooks.
         unsafe {
             let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
             let next_style = style & !(WS_CAPTION.0 as isize) & !(WS_THICKFRAME.0 as isize);
             SetWindowLongPtrW(hwnd, GWL_STYLE, next_style);
 
             let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-            let next_ex_style =
-                ex_style | WS_EX_TOOLWINDOW.0 as isize | WS_EX_NOACTIVATE.0 as isize;
+            let next_ex_style = widget_extended_style(ex_style);
             SetWindowLongPtrW(hwnd, GWL_EXSTYLE, next_ex_style);
 
             SetWindowPos(
@@ -247,6 +246,11 @@ mod platform {
                 source,
             })
         }
+    }
+
+    pub(super) fn widget_extended_style(ex_style: isize) -> isize {
+        (ex_style & !(WS_EX_TRANSPARENT.0 as isize) & !(WS_EX_NOACTIVATE.0 as isize))
+            | WS_EX_TOOLWINDOW.0 as isize
     }
 
     fn set_window_outer_rect(hwnd: HWND, rect: Rect) -> Result<()> {
@@ -382,6 +386,19 @@ mod platform {
         // without stealing focus from the user's current foreground window.
         unsafe {
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
+
+        Ok(())
+    }
+
+    pub fn restore_window(handle: WindowHandle) -> Result<()> {
+        let hwnd = hwnd_from_handle(handle);
+
+        // SAFETY: hwnd is a top-level window handle tracked from documented
+        // enumeration. SW_RESTORE asks Windows to restore a minimized or
+        // maximized window through the normal window manager path.
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
         }
 
         Ok(())
@@ -787,7 +804,7 @@ mod platform {
                                 }
                             }
                             Err(error) => {
-                                warn!(%error, "failed to read IPC stream response");
+                                debug!(%error, "IPC response stream closed");
                                 break;
                             }
                         }
@@ -2713,6 +2730,10 @@ mod platform {
         Err(Win32Error::UnsupportedPlatform)
     }
 
+    pub fn restore_window(_handle: WindowHandle) -> Result<()> {
+        Err(Win32Error::UnsupportedPlatform)
+    }
+
     #[derive(Debug)]
     pub struct BorderManager;
 
@@ -2823,6 +2844,7 @@ pub use platform::move_resize_window;
 pub use platform::raise_window_no_activate;
 pub use platform::register_hotkeys;
 pub use platform::request_message_loop_stop;
+pub use platform::restore_window;
 pub use platform::run_message_loop;
 pub use platform::send_ipc_request;
 pub use platform::set_input_hooks_paused;
@@ -3425,6 +3447,22 @@ mod tests {
         ));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn widget_extended_style_keeps_widgets_interactive_and_activatable() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
+        };
+
+        let style = platform::widget_extended_style(
+            (WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE).0 as isize,
+        );
+
+        assert_eq!(style & WS_EX_TRANSPARENT.0 as isize, 0);
+        assert_eq!(style & WS_EX_NOACTIVATE.0 as isize, 0);
+        assert_ne!(style & WS_EX_TOOLWINDOW.0 as isize, 0);
+    }
+
     #[test]
     fn hotkey_decision_benchmark_records_iterations() {
         let options = test_options();
@@ -3450,6 +3488,7 @@ mod tests {
         let pipe_name: &'static str = Box::leak(pipe_name.into_boxed_str());
         let (request_sender, request_receiver) = std::sync::mpsc::channel();
         let _server = platform::spawn_ipc_server(pipe_name, request_sender).unwrap();
+        std::thread::sleep(Duration::from_millis(25));
         let (stream_sender, stream_receiver) = std::sync::mpsc::channel();
         let _client =
             platform::spawn_ipc_response_stream(pipe_name, b"subscribe\n".to_vec(), stream_sender)

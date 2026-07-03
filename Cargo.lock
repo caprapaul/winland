@@ -5484,6 +5484,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "raw-window-handle",
  "serde_json",
  "slint",
  "slint-interpreter",

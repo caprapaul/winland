@@ -1,16 +1,20 @@
 export struct WorkspaceRow {
     id: int,
     name: string,
+    command: string,
     active: bool,
     window-count: int,
 }
 
 export struct WindowRow {
     handle: float,
+    handle-text: string,
+    command: string,
     title: string,
     workspace-id: int,
     focused: bool,
     visible: bool,
+    is-minimized: bool,
     participation: string,
 }
 
@@ -22,6 +26,7 @@ export struct PluginBlock {
 
 component WorkspacePill inherits Rectangle {
     in property <WorkspaceRow> item;
+    callback activated(string);
 
     height: 28px;
     width: 46px;
@@ -38,10 +43,19 @@ component WorkspacePill inherits Rectangle {
         horizontal-alignment: center;
         vertical-alignment: center;
     }
+
+    TouchArea {
+        width: 100%;
+        height: 100%;
+        clicked => {
+            root.activated(item.command);
+        }
+    }
 }
 
 component WindowItem inherits Rectangle {
     in property <WindowRow> item;
+    callback activated(string);
 
     height: 28px;
     width: 180px;
@@ -54,11 +68,19 @@ component WindowItem inherits Rectangle {
         x: 10px;
         width: parent.width - 20px;
         height: parent.height;
-        text: item.title;
+        text: item.is-minimized ? "[min] " + item.title : item.title;
         color: item.visible ? #eef2f7 : #9aa3ad;
         font-size: 12px;
         vertical-alignment: center;
         overflow: elide;
+    }
+
+    TouchArea {
+        width: 100%;
+        height: 100%;
+        clicked => {
+            root.activated(item.command);
+        }
     }
 }
 
@@ -99,6 +121,7 @@ export component TaskbarWidget inherits Window {
     in property <[WindowRow]> windows;
     in property <[PluginBlock]> plugin-blocks;
     in property <string> time-text;
+    callback run-command(string);
 
     no-frame: true;
     always-on-top: root.topmost;
@@ -120,6 +143,9 @@ export component TaskbarWidget inherits Window {
 
             for workspace in root.workspaces: WorkspacePill {
                 item: workspace;
+                activated(command) => {
+                    root.run-command(command);
+                }
             }
 
             Rectangle {
@@ -130,6 +156,9 @@ export component TaskbarWidget inherits Window {
 
             for window in root.windows: WindowItem {
                 item: window;
+                activated(command) => {
+                    root.run-command(command);
+                }
             }
 
             Rectangle {

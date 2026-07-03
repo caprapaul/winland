@@ -29,6 +29,15 @@ impl IpcRequest {
             command: IpcCommand::SubscribeState,
         }
     }
+
+    pub fn command(command: impl Into<String>) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            command: IpcCommand::Command {
+                command: command.into(),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,6 +46,7 @@ pub enum IpcCommand {
     State,
     ReloadConfig,
     SubscribeState,
+    Command { command: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +70,13 @@ impl IpcResponse {
         }
     }
 
+    pub fn command(report: CommandReport) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            result: IpcResponseResult::Command(report),
+        }
+    }
+
     pub fn error(message: impl Into<String>) -> Self {
         Self {
             protocol_version: PROTOCOL_VERSION,
@@ -75,12 +92,18 @@ impl IpcResponse {
 pub enum IpcResponseResult {
     State(DaemonStateSnapshot),
     ReloadConfig(ReloadConfigReport),
+    Command(CommandReport),
     Error(IpcError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IpcError {
     pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandReport {
+    pub command: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,6 +157,7 @@ pub struct WindowStateSnapshot {
     pub monitor_id: Option<u64>,
     pub workspace_id: Option<u16>,
     pub focused: bool,
+    pub is_minimized: bool,
     pub participation: WindowParticipationSnapshot,
     pub constrained: bool,
     pub visible_on_active_workspace: bool,
@@ -235,6 +259,7 @@ mod tests {
                 monitor_id: Some(1),
                 workspace_id: Some(2),
                 focused: true,
+                is_minimized: false,
                 participation: WindowParticipationSnapshot::Tiled,
                 constrained: false,
                 visible_on_active_workspace: true,
@@ -271,6 +296,7 @@ mod tests {
                 monitor_id: Some(7),
                 workspace_id: Some(1),
                 focused: true,
+                is_minimized: true,
                 participation: WindowParticipationSnapshot::TemporarilyFloating,
                 constrained: true,
                 visible_on_active_workspace: false,
@@ -292,6 +318,7 @@ mod tests {
             json["result"]["windows"][0]["visible_on_active_workspace"],
             false
         );
+        assert_eq!(json["result"]["windows"][0]["is_minimized"], true);
     }
 
     #[test]
@@ -337,6 +364,25 @@ mod tests {
 
         assert_eq!(decoded, IpcRequest::subscribe_state());
         assert_eq!(json["command"]["type"], "subscribe-state");
+    }
+
+    #[test]
+    fn command_request_and_response_round_trip() {
+        let encoded = encode_request(&IpcRequest::command("switch-workspace 2")).unwrap();
+        let decoded = decode_request(&encoded).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(encoded.trim_ascii_end()).unwrap();
+
+        assert_eq!(decoded, IpcRequest::command("switch-workspace 2"));
+        assert_eq!(json["command"]["type"], "command");
+        assert_eq!(json["command"]["command"], "switch-workspace 2");
+
+        let report = CommandReport {
+            command: "switch-workspace 2".to_owned(),
+        };
+        let encoded = encode_response(&IpcResponse::command(report.clone())).unwrap();
+        let decoded = decode_response(&encoded).unwrap();
+
+        assert_eq!(decoded, IpcResponse::command(report));
     }
 
     #[test]

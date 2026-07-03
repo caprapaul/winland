@@ -68,11 +68,13 @@ For a retile:
 
 ## Widget Runner
 
-Widgets are separate user processes started from CLI commands such as `winland widget run taskbar`. They do not participate in layout state or workspace state. Tiling cooperates with widgets only through explicit user configuration: `[layout].offset` reserves screen-edge space, and normal `[[window_rules]]` entries can ignore widget windows.
+Widgets are separate user processes started from CLI commands such as `winland widget run taskbar`. They do not participate in layout state or workspace state, and widget pointer input is handled by the widget process like any other app window. Tiling cooperates with widgets only through explicit user configuration: `[layout].offset` reserves screen-edge space, and normal `[[window_rules]]` entries can ignore widget windows.
 
-The first widget backend uses Slint for declarative UI. The built-in taskbar is authored as `winland-cli/widgets/taskbar.slint` and embedded by the CLI at compile time. Runtime-loaded `.slint` files are also supported by the CLI. Frameless widgets should use Slint's `no-frame: true` root `Window` property so the titlebar is absent from creation. Topmost behavior is requested through Slint's `always-on-top` property, while Win32-specific panel behavior such as no-activate/tool-window shaping stays in `winland-win32`.
+The first widget backend uses Slint for declarative UI. The built-in taskbar is authored as `winland-cli/widgets/taskbar.slint` and embedded by the CLI at compile time. Runtime-loaded `.slint` files are also supported by the CLI. Frameless widgets should use Slint's `no-frame: true` root `Window` property so the titlebar is absent from creation. Topmost behavior is requested through Slint's `always-on-top` property, while Win32-specific panel shaping such as tool-window styling stays in `winland-win32`.
 
 Widget data is source-driven. The CLI can subscribe to daemon state events over IPC, update a local clock source, and run external executable sources. External sources either print one JSON object and exit or print newline-delimited JSON objects as an event stream. The CLI maps those sources into Slint properties such as `workspaces`, `windows`, `plugin-blocks`, and `time-text`; Slint files own layout and presentation.
+
+Widget interactivity is generic. A root Slint component can declare `callback run-command(string);`; the CLI runner registers it and launches the supplied command line as an ordinary child process. The built-in taskbar uses this generic callback to invoke `winland command ...`, but custom widgets do not need to know daemon IPC or Winland action types.
 
 The user-facing widget authoring API is documented in [WIDGETS.md](WIDGETS.md).
 

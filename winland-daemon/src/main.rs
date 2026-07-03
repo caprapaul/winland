@@ -26,9 +26,9 @@ use winland_core::{
     tile_layout_windows_with_config, tile_layout_windows_with_state,
 };
 use winland_ipc::{
-    DaemonPerformanceSnapshot, DaemonStateSnapshot, IpcCommand, IpcRequest, IpcResponse,
-    MonitorStateSnapshot, ReloadConfigReport, WindowParticipationSnapshot, WindowStateSnapshot,
-    decode_request, encode_response,
+    CommandReport, DaemonPerformanceSnapshot, DaemonStateSnapshot, IpcCommand, IpcRequest,
+    IpcResponse, MonitorStateSnapshot, ReloadConfigReport, WindowParticipationSnapshot,
+    WindowStateSnapshot, decode_request, encode_response,
 };
 use winland_win32::{
     BorderColor, BorderManager, BorderUpdate, HotkeyBinding, HotkeyBypassRules, HotkeyEvent,
@@ -1940,7 +1940,10 @@ impl DaemonState {
             return;
         }
 
-        let publish_after_response = request.command == IpcCommand::ReloadConfig;
+        let publish_after_response = matches!(
+            request.command,
+            IpcCommand::ReloadConfig | IpcCommand::Command { .. }
+        );
         let response = self.handle_ipc_request(request);
         self.send_ipc_response(&transport.response, response);
 
@@ -2016,6 +2019,16 @@ impl DaemonState {
                     IpcResponse::error(error.to_string())
                 }
             },
+            IpcCommand::Command { command } => {
+                let command = command.trim().to_owned();
+                match self.execute_command_from_name(&command) {
+                    Ok(()) => IpcResponse::command(CommandReport { command }),
+                    Err(error) => {
+                        warn!(command, %error, "daemon command failed");
+                        IpcResponse::error(error.to_string())
+                    }
+                }
+            }
             IpcCommand::SubscribeState => IpcResponse::error(
                 "subscribe-state must be handled as an IPC stream request".to_owned(),
             ),
@@ -2076,6 +2089,7 @@ impl DaemonState {
                     monitor_id: monitor.map(|monitor| monitor.0),
                     workspace_id: workspace.map(|workspace| workspace.0),
                     focused: self.foreground == Some(*handle),
+                    is_minimized: window.is_minimized,
                     participation: self.window_snapshot_participation(*handle),
                     constrained: !merge_size_constraints(
                         window.size_constraints,
@@ -2270,6 +2284,9 @@ impl DaemonState {
         } else {
             Vec::new()
         };
+        if let DaemonCommand::FocusWindow(window) = &command {
+            self.ensure_focus_window_command_target(*window)?;
+        }
         let plan = self.plan_command(command, &monitors);
 
         for window in &plan.hide {
@@ -2301,6 +2318,12 @@ impl DaemonState {
 
         self.apply_tile_assignments_with_feedback(&plan.moves, &monitors, "hotkey command");
 
+        for window in &plan.restore {
+            if let Err(error) = winland_win32::restore_window(*window) {
+                warn!(window = %window, %error, "failed to restore window from daemon command");
+            }
+        }
+
         if let Some(target) = plan.focus
             && let Err(error) = winland_win32::focus_window(target)
         {
@@ -2315,6 +2338,12 @@ impl DaemonState {
         }
 
         Ok(())
+    }
+
+    fn execute_command_from_name(&mut self, command: &str) -> Result<()> {
+        let command = daemon_command_from_name(command)
+            .with_context(|| format!("unknown daemon command '{command}'"))?;
+        self.execute_command(command)
     }
 
     fn plan_command(&mut self, command: DaemonCommand, monitors: &[MonitorInfo]) -> CommandPlan {
@@ -2338,6 +2367,7 @@ impl DaemonState {
                     ..CommandPlan::default()
                 }
             }
+            DaemonCommand::FocusWindow(window) => self.focus_window_command(window, monitors),
             DaemonCommand::Swap(direction) => {
                 self.swap_focused_with(direction, monitors);
                 CommandPlan {
@@ -2456,6 +2486,71 @@ impl DaemonState {
             .min_by_key(|(key, _)| *key)
             .map(|(_, handle)| handle)
             .or_else(|| self.wrapping_focus_target(current, direction, monitors))
+    }
+
+    fn focus_window_command(
+        &mut self,
+        window: WindowHandle,
+        monitors: &[MonitorInfo],
+    ) -> CommandPlan {
+        self.sync_workspace_state(monitors);
+
+        let mut hide = Vec::new();
+        let mut show = Vec::new();
+        if let Some(workspace) = self
+            .workspaces
+            .window_state(window)
+            .map(|state| state.workspace)
+        {
+            let monitor = self
+                .window_owner_monitor(window, monitors)
+                .or_else(|| self.command_monitor(monitors));
+            let workspace_plan = if let Some(monitor) = monitor {
+                self.workspaces.switch_monitor_to(monitor, workspace)
+            } else {
+                self.workspaces.switch_to(workspace)
+            };
+            hide = workspace_plan
+                .hide
+                .into_iter()
+                .filter(|candidate| *candidate != window)
+                .filter(|candidate| {
+                    self.should_hide_for_workspace(*candidate, monitors)
+                        && monitor.is_none_or(|monitor| {
+                            self.window_belongs_to_monitor(*candidate, monitor, monitors)
+                        })
+                })
+                .collect();
+            show = workspace_plan
+                .show
+                .into_iter()
+                .filter(|change| {
+                    change.window != window
+                        && monitor.is_none_or(|monitor| {
+                            self.window_belongs_to_monitor(change.window, monitor, monitors)
+                        })
+                })
+                .collect();
+            self.focus_monitor_for_window(window, monitors);
+        }
+
+        self.foreground = Some(window);
+        let restore = self
+            .windows
+            .get(&window)
+            .is_some_and(|info| info.is_minimized)
+            .then_some(window)
+            .into_iter()
+            .collect();
+
+        CommandPlan {
+            focus: Some(window),
+            restore,
+            hide,
+            show,
+            moves: self.tile_assignments(monitors),
+            ..CommandPlan::default()
+        }
     }
 
     fn wrapping_focus_target(
@@ -4217,7 +4312,7 @@ impl DaemonState {
 
         for (handle, window) in windows {
             let decision = self.rule_decision(&window);
-            let manageable = self.is_workspace_manageable_by_rules(&window, &decision)
+            let manageable = self.is_workspace_trackable_by_rules(&window, &decision)
                 && !is_fullscreen_window(
                     &window,
                     monitors,
@@ -4477,6 +4572,21 @@ impl DaemonState {
             })
     }
 
+    fn ensure_focus_window_command_target(&self, handle: WindowHandle) -> Result<()> {
+        let window = self
+            .windows
+            .get(&handle)
+            .ok_or_else(|| anyhow!("window {handle} is not tracked by Winland"))?;
+        let decision = self.rule_decision(window);
+        if self.workspaces.window_state(handle).is_some()
+            && self.is_workspace_trackable_by_rules(window, &decision)
+        {
+            Ok(())
+        } else {
+            Err(anyhow!("window {handle} is not a tracked app window"))
+        }
+    }
+
     fn is_safe_to_move_window(&self, handle: WindowHandle, monitors: &[MonitorInfo]) -> bool {
         self.windows.get(&handle).is_some_and(|window| {
             self.is_workspace_manageable_by_rules(window, &self.rule_decision(window))
@@ -4508,6 +4618,22 @@ impl DaemonState {
         decision: &WindowRuleDecision,
     ) -> bool {
         window.is_workspace_manageable()
+            && decision.manage != Some(false)
+            && !matches!(
+                decision.mode,
+                Some(WindowRuleMode::Ignore | WindowRuleMode::Game | WindowRuleMode::Fullscreen)
+            )
+            && !game_mode_executable_matches(window, &self.config.game_mode.policy)
+    }
+
+    fn is_workspace_trackable_by_rules(
+        &self,
+        window: &WindowInfo,
+        decision: &WindowRuleDecision,
+    ) -> bool {
+        let mut candidate = window.clone();
+        candidate.is_minimized = false;
+        candidate.workspace_manageable_reason().is_manageable()
             && decision.manage != Some(false)
             && !matches!(
                 decision.mode,
@@ -4822,6 +4948,7 @@ struct SnapshotDiff {
 enum DaemonCommand {
     Focus(FocusDirection),
     FocusMonitor(MonitorSelector),
+    FocusWindow(WindowHandle),
     Swap(FocusDirection),
     Retile,
     ToggleFloat,
@@ -4841,13 +4968,18 @@ enum DaemonCommand {
 
 impl DaemonCommand {
     fn needs_monitors(&self) -> bool {
-        self.needs_layout() || matches!(self, Self::Focus(_) | Self::FocusMonitor(_))
+        self.needs_layout()
+            || matches!(
+                self,
+                Self::Focus(_) | Self::FocusMonitor(_) | Self::FocusWindow(_)
+            )
     }
 
     fn needs_layout(&self) -> bool {
         matches!(
             self,
             Self::FocusMonitor(_)
+                | Self::FocusWindow(_)
                 | Self::Swap(_)
                 | Self::Retile
                 | Self::ToggleFloat
@@ -4865,6 +4997,7 @@ impl DaemonCommand {
             self,
             Self::Focus(_)
                 | Self::FocusMonitor(_)
+                | Self::FocusWindow(_)
                 | Self::Swap(_)
                 | Self::Retile
                 | Self::ToggleFloat
@@ -4903,6 +5036,7 @@ enum MonitorSelector {
 #[derive(Debug, Default, PartialEq, Eq)]
 struct CommandPlan {
     focus: Option<WindowHandle>,
+    restore: Vec<WindowHandle>,
     hide: Vec<WindowHandle>,
     show: Vec<WorkspaceVisibilityChange>,
     moves: Vec<TileAssignment>,
@@ -5330,6 +5464,7 @@ fn daemon_command_from_words(command: &str) -> Option<DaemonCommand> {
         ["focus-monitor", selector] => {
             parse_monitor_selector(selector).map(DaemonCommand::FocusMonitor)
         }
+        ["focus-window", handle] => parse_window_handle(handle).map(DaemonCommand::FocusWindow),
         ["move-window-to-monitor", selector] => {
             parse_monitor_selector(selector).map(DaemonCommand::MoveFocusedToMonitor)
         }
@@ -5344,6 +5479,18 @@ fn daemon_command_from_words(command: &str) -> Option<DaemonCommand> {
 
 fn parse_workspace(input: &str) -> Option<u16> {
     input.parse::<u16>().ok().filter(|workspace| *workspace > 0)
+}
+
+fn parse_window_handle(input: &str) -> Option<WindowHandle> {
+    let trimmed = input.trim();
+    if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        u64::from_str_radix(hex, 16).ok().map(WindowHandle)
+    } else {
+        trimmed.parse::<u64>().ok().map(WindowHandle)
+    }
 }
 
 fn parse_monitor_selector(input: &str) -> Option<MonitorSelector> {
@@ -5821,6 +5968,10 @@ mod tests {
         assert_eq!(
             daemon_command_from_name("focus-monitor prev"),
             Some(DaemonCommand::FocusMonitor(MonitorSelector::Prev))
+        );
+        assert_eq!(
+            daemon_command_from_name("focus-window 0xCAFE"),
+            Some(DaemonCommand::FocusWindow(WindowHandle(0xCAFE)))
         );
         assert_eq!(
             daemon_command_from_name("move-window-to-monitor 2"),
@@ -7657,6 +7808,60 @@ mod tests {
             WindowParticipationSnapshot::Floating
         );
         assert!(snapshot.windows[1].focused);
+        assert!(!snapshot.windows[1].is_minimized);
+    }
+
+    #[test]
+    fn ipc_command_routes_workspace_switch_without_hotkeys() {
+        let mut state = daemon_state([]);
+
+        let response = state.handle_ipc_request(IpcRequest::command("switch-workspace 2"));
+
+        let winland_ipc::IpcResponseResult::Command(report) = response.result else {
+            panic!("expected command response");
+        };
+        assert_eq!(report.command, "switch-workspace 2");
+        assert_eq!(state.workspaces.active_workspace(), WorkspaceId(2));
+    }
+
+    #[test]
+    fn ipc_focus_window_command_rejects_untracked_handles() {
+        let mut state = daemon_state([window(1, "One", Rect::from_size(0, 0, 100, 100))]);
+
+        let response = state.handle_ipc_request(IpcRequest::command("focus-window 0xBEEF"));
+
+        let winland_ipc::IpcResponseResult::Error(error) = response.result else {
+            panic!("expected error response");
+        };
+        assert!(error.message.contains("not tracked"));
+    }
+
+    #[test]
+    fn focus_window_command_restores_minimized_tracked_window_without_tiling_it() {
+        let mut minimized = window(1, "Minimized", Rect::from_size(0, 0, 100, 100));
+        minimized.is_minimized = true;
+        let mut state = daemon_state([
+            minimized,
+            window(2, "Two", Rect::from_size(200, 0, 100, 100)),
+        ]);
+        state
+            .workspaces
+            .track_window(WindowHandle(1), Rect::from_size(0, 0, 100, 100));
+
+        let plan = state.plan_command(
+            DaemonCommand::FocusWindow(WindowHandle(1)),
+            &[primary_test_monitor()],
+        );
+
+        assert_eq!(plan.restore, vec![WindowHandle(1)]);
+        assert_eq!(plan.focus, Some(WindowHandle(1)));
+        assert_eq!(
+            plan.moves,
+            vec![TileAssignment {
+                window: WindowHandle(2),
+                rect: primary_test_monitor().work_area,
+            }]
+        );
     }
 
     #[test]

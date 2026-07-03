@@ -14,6 +14,7 @@ Most desktop commands require Windows because they call `winland-win32`.
 | --- | --- | --- |
 | `state [--json]` | Yes | Query the running daemon. |
 | `reload-config [--json]` | Yes | Ask the running daemon to reload config from disk. |
+| `command <COMMAND...>` | Yes | Execute a daemon command through IPC. |
 | `windows [--manageable-only]` | No | Enumerate top-level windows and explain the conservative filter. |
 | `monitors` | No | List monitor IDs, rectangles, and work areas. |
 | `diagnose-window [--hwnd <HWND>]` | No | Explain manageability, fullscreen detection, and game mode for one window. |
@@ -72,6 +73,7 @@ JSON output matches the current IPC snapshot shape:
       "monitor_id": 1,
       "workspace_id": 1,
       "focused": true,
+      "is_minimized": false,
       "participation": "tiled",
       "constrained": false,
       "visible_on_active_workspace": true
@@ -81,6 +83,17 @@ JSON output matches the current IPC snapshot shape:
 ```
 
 `participation` is normally `tiled`, `floating`, or `temporary-floating`. The IPC schema still accepts `overflow-floating` for compatibility, but overflow promotion now reports as normal `floating`.
+
+## Command IPC
+
+```powershell
+cargo run -p winland-cli -- command switch-workspace 2
+cargo run -p winland-cli -- command focus-window 0x123456
+```
+
+`command` sends a named daemon command through IPC and prints a short success line when the daemon accepts it. It reuses the same command names as hotkey bindings where possible. `focus-window <HWND>` focuses a tracked app window; if the tracked window is minimized, the daemon restores it first with documented Win32 restore APIs. Invalid, unsafe, or untracked handles are rejected by the daemon.
+
+The built-in taskbar uses this command surface for workspace pills and window buttons. Widgets still launch ordinary command lines; they do not talk named-pipe IPC directly unless they choose to.
 
 ## Reload Config
 
@@ -176,17 +189,21 @@ cargo run -p winland-cli -- widget run taskbar --plugin-once "my-status.exe"
 cargo run -p winland-cli -- widget run taskbar --plugin-stream "my-events.exe"
 ```
 
-`widget run taskbar` starts the built-in Slint taskbar widget from `winland-cli/widgets/taskbar.slint`. By default it creates a 40px bottom widget on every monitor. The built-in taskbar declares Slint `no-frame: true` and `always-on-top` so it is created without the normal Windows titlebar/frame and stays above normal app windows, then `winland-win32` keeps it as a no-activate top-level panel. Pass `--no-topmost` to keep the widget in the normal z-order band.
+`widget run taskbar` starts the built-in Slint taskbar widget from `winland-cli/widgets/taskbar.slint`. By default it creates a 40px bottom widget on every monitor. The built-in taskbar declares Slint `no-frame: true` and `always-on-top` so it is created without the normal Windows titlebar/frame and stays above normal app windows. Pass `--no-topmost` to keep the widget in the normal z-order band.
 
-The built-in taskbar subscribes to daemon state events through IPC. It displays workspace rows, active workspace state, open windows, focused window state, external plugin blocks, and local time. Custom Slint widgets can use the same properties:
+The built-in taskbar subscribes to daemon state events through IPC. It displays workspace rows, active workspace state, tracked windows on the active workspace, minimized tracked windows from that workspace, focused window state, external plugin blocks, and local time. Custom Slint widgets can use the same properties:
 
 | Property | Type | Meaning |
 | --- | --- | --- |
-| `workspaces` | `[WorkspaceRow]` | Workspace id/name, active flag, and window count. |
-| `windows` | `[WindowRow]` | HWND, title, workspace id, focused/visible flags, and participation. |
+| `workspaces` | `[WorkspaceRow]` | Workspace id/name, active flag, window count, and command string. |
+| `windows` | `[WindowRow]` | HWND, title, workspace id, focused/visible/minimized flags, participation, and command string. |
 | `plugin-blocks` | `[PluginBlock]` | Status blocks from external programs. |
 | `time-text` | `string` | Local `HH:MM` clock text. |
 | `label` | `string` | Compatibility summary for simple widgets. |
+
+Widgets may declare `callback run-command(string);`. The CLI runner registers it and launches the supplied command line as a normal child process. The callback is generic; custom widgets can run any CLI or program. The built-in taskbar happens to use it for `winland command switch-workspace ...` and `winland command focus-window ...`.
+
+Widget command attempts, exit status, stdout, and stderr are logged to `%TEMP%\winland-widget-commands.log`. This is useful when a widget was launched by daemon startup commands and has no visible console.
 
 External widget plugins are ordinary programs. `--plugin-once` runs a command once and reads one JSON object from stdout. `--plugin-stream` runs a command and reads newline-delimited JSON objects from stdout. Objects may contain `label` or `name`, and `text`, `value`, or `status`, for example:
 
